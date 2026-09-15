@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<!DOCTYPE gsmarkup>
+<gsmarkup>
+    <objects>
+        <sortDescriptor id="by_pseudonym" key="pseudonym"/>
+        <sortDescriptor id="by_name" key="name"/>
+        <sortDescriptor id="by_timestamp" key="timestamp" ascending="NO"/>
+        
+        <arrayController id="trials_controller" entity="trials" autoFetchSync="YES" sortDescriptor="by_name"/>
+        <arrayController id="candidates_controller" entity="candidates" autoFetchSync="YES" sortDescriptor="by_pseudonym"/>
+        <arrayController id="matches_controller" entity="matches" autoFetchSync="YES" sortDescriptor="by_timestamp"/>
+    </objects>
+    <entities>
+        <entity id="trials" store="#CPOwner.store">
+            <column name="id" primaryKey="YES"/>
+            <column name="name"/>
+            <column name="narrative_inex_criteria"/>
+            <column name="fhir_group_json"/>
+        </entity>
+
+        <entity id="candidates" store="#CPOwner.store">
+            <column name="id" primaryKey="YES"/>
+            <column name="pseudonym"/>
+            <column name="narrative_report"/>
+            <column name="phenopacket_json"/>
+            <column name="reference_date"/>
+            <column name="tags"/>
+        </entity>
+
+        <entity id="matches" store="#CPOwner.store">
+            <column name="id" primaryKey="YES"/>
+            <column name="trial_id"/>
+            <column name="candidate_id"/>
+            <column name="eligible"/>
+            <column name="potentially_eligible"/>
+            <column name="criteria_matches"/>
+            <column name="summary"/>
+            <column name="timestamp"/>
+            <column name="trial_name"/>
+            <column name="candidate_pseudonym"/>
+            <column name="status_text"/>
+        </entity>
+    </entities>
+
+    <connectors>
+        <outlet source="#CPOwner" target="trials_controller" label="trialsController"/>
+        <outlet source="#CPOwner" target="candidates_controller" label="candidatesController"/>
+        <outlet source="#CPOwner" target="matches_controller" label="matchesController"/>
+    </connectors>
+</gsmarkup>

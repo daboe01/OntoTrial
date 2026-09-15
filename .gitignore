@@ -1,0 +1,10 @@
+# Cappuccino build files
+# public/Frontend/Frameworks/
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+
+# OS X files
+.DS_Store
+._*

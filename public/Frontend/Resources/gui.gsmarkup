@@ -1,0 +1,441 @@
+<?xml version="1.0"?>
+<!DOCTYPE gsmarkup>
+<gsmarkup>
+<objects>
+    <!-- Main Window Bridge to AppController -->
+    <window bridge="YES" id="mainwindow" delegate="#CPOwner">
+        <vbox>
+            <hbox backgroundColor="#F5F7F8" height="50">
+                <label valign="center" font="bold" size="15" margin="12">Clinical Trial Eligibility Framework</label>
+                <hspace/>
+                <label valign="center">LLM Model</label>
+                <comboBox valign="center" editable="NO" halign="min" width="150" id="model_pop_up" valueBinding="#CPOwner.selectedModel">
+                    <popUpButtonItem title="gpt-oss-120b"/>
+                    <popUpButtonItem title="gemma4:26b-mlx"/>
+                    <popUpButtonItem title="gemma4:31b-mlx"/>
+                    <popUpButtonItem title="qwen3.6:35b-mlx"/>
+                    <popUpButtonItem title="muse-glimmer:30b-mlx"/>
+                    <popUpButtonItem title="qwen3.8:27b-mlx"/>
+                    <popUpButtonItem title="nemotron-3.5-lightning:30b-mlx"/>
+                </comboBox>
+                <switchButton id="deep_mode_switch" title="Deep Mode" valueBinding="#CPOwner.deepModeEnabled" valign="center" margin="12"/>
+            </hbox>
+
+            <!-- Outer split view: divides main TabView and right-side Sidebar Browser -->
+            <splitView vertical="YES" autosaveName="outer_split_hpo1">
+                <tabView type="topBezel" delegate="#CPOwner" id="main_workspace_tab" width="600">
+
+                    <!-- Tab 2: Candidates -->
+                    <tabViewItem title="Candidates">
+                        <splitView vertical="YES" autosaveName="pheno_extractor_split">
+
+                            <!-- Master-Detail Panel (Left) for Candidates -->
+                            <vbox>
+                                <searchField placeholder="Search PIZ / Tag / Candidate..." valueBinding="#CPOwner.candidateFilterString" target="#CPOwner" action="candidateSearchFieldChanged:"/>
+                                <scrollView hasHorizontalScroller="NO">
+                                    <tableView zebra="yes" valueBinding="#CPOwner.candidatesController" allowsEmptySelection="NO">
+                                        <tableColumn identifier="id" title="ID" width="40" editable="NO"/>
+                                        <tableColumn identifier="pseudonym" title="Pseudonym" width="75" editable="YES"/>
+                                        <tableColumn identifier="tags" title="Tags" width="80" editable="YES"/>
+                                        <tableColumn identifier="reference_date" title="Date" width="75" editable="YES"/>
+                                    </tableView>
+                                </scrollView>
+                                <hbox height="26">
+                                    <ButtonBar target="#CPOwner.candidatesController" minusButtonAction="remove:" plusButtonAction="insert:" actionsButton="YES">
+                                        <popUpButtonItem title="Tagging..." target="#CPOwner" action="showTaggingWindowAction:"/>
+                                        <popUpButtonItem title="Match tag against trials" target="#CPOwner" action="matchTagAgainstTrialsAction:"/>
+                                    </ButtonBar>
+                                    <hspace/>
+                                </hbox>
+
+                                <label stringValue="Narrative Medical Record:" font="bold" margin="5"/>
+                                <scrollView hasHorizontalScroller="NO" height="250">
+                                    <textView id="report_text_view" valueBinding="#CPOwner.candidatesController.selection.narrative_report" editable="YES"/>
+                                </scrollView>
+                                <hbox height="30">
+                                    <button title="Extract Phenopacket" target="#CPOwner" action="extractPhenopacketAction:"/>
+                                    <button title="Match against trials" target="#CPOwner" action="matchCandidateAgainstTrialsAction:"/>
+                                </hbox>
+                            </vbox>
+
+                            <vbox>
+                                <tabView type="topBezel" delegate="#CPOwner">
+                                    <tabViewItem title="Visual Profile">
+                                        <vbox>
+                                            <scrollView>
+                                                <NoCibTableView id="pheno_visual_tv" zebra="yes" delegate="#CPOwner" target="#CPOwner" doubleAction="doubleClickPhenoVisual:">
+                                                    <tableColumn identifier="category" title="Category" width="100"/>
+                                                    <tableColumn identifier="code" title="Code" width="90"/>
+                                                    <tableColumn identifier="label" title="Description &amp; Modifiers" width="800"/>
+                                                    <tableColumn identifier="status" title="Status" width="100"/>
+                                                </NoCibTableView>
+                                            </scrollView>
+                                            <ButtonBar target="#CPOwner" plusButtonAction="addPhenotypeItem:" minusButtonAction="removePhenotypeItem:"/>
+                                        </vbox>
+                                    </tabViewItem>
+                                    <tabViewItem title="JSON Source">
+                                        <scrollView>
+                                            <textView id="pheno_json_tv" editable="YES"/>
+                                        </scrollView>
+                                    </tabViewItem>
+                                </tabView>
+                            </vbox>
+                        </splitView>
+                    </tabViewItem>
+                    <tabViewItem title="Suchprogramm">
+                        <vbox margin="10">
+                            
+                            <!-- 1. Oben: Kompaktes Query-Eingabefeld -->
+                            <label stringValue="Ihre Kohorten-Anfrage:" font="bold" margin="2"/>
+                            <scrollView hasHorizontalScroller="NO" height="45" valign="min">
+                                <textView id="chat_input_tv" editable="YES"/>
+                            </scrollView>
+                            
+                            <!-- Aktionsleiste mit manuellem SQL-Button -->
+                            <hbox >
+                                <button title="Senden" id="chat_send_btn" target="#CPOwner" action="sendChatQueryAction:" width="85"/>
+                                <hspace/>
+                                <label id="chat_status_label" stringValue="Bereit. Stellen Sie eine Kohorten-Anfrage oder führen Sie SQL direkt aus." valign="center"/>
+                            </hbox>
+
+                            <!-- 2. Darunter: SplitView mit SQL oben (hoch) und Tabelle unten -->
+                            <splitView vertical="NO" autosaveName="feasibility_chat_vertical_split_v3">
+                                
+                                <!-- Oberer Bereich: Hohes, editierbares SQL/JSONB-Feld -->
+                                <vbox valign="min" height="240">
+                                    <label stringValue="PostgreSQL / JSONB Code (editierbar &amp; direkt ausführbar):" font="bold" margin="2"/>
+                                    <scrollView hasHorizontalScroller="YES" hasVerticalScroller="YES">
+                                        <textView id="chat_sql_tv" editable="YES"/>
+                                    </scrollView>
+                                    <hbox valign="min" height="30" margin="4">
+                                        <button title="SQL ausführen" id="chat_run_sql_btn" target="#CPOwner" action="runManualSqlAction:" width="115"/>
+                                        <hspace/>
+                                    </hbox>
+                                </vbox>
+
+                                <!-- Unterer Bereich: Gefundene Patienten & Tagging -->
+                                <vbox>
+                                    <label stringValue="Gefundene Patienten (Kohorte):" font="bold" margin="2"/>
+                                    <scrollView hasHorizontalScroller="NO">
+                                        <NoCibTableView id="chat_patients_tv" zebra="yes" allowsEmptySelection="YES">
+                                            <tableColumn identifier="index" title="IDX" width="45" editable="NO"/>
+                                            <tableColumn identifier="pseudonym" title="Pseudonym / PIZ" width="360" editable="NO"/>
+                                        </NoCibTableView>
+                                    </scrollView>
+
+                                    <!-- Tagging-Leiste -->
+                                    <hbox height="30" margin="4">
+                                        <textField id="chat_tag_text_field" placeholder="Tag für Kohorte (z. B. Kohorte_AMD_2026)..." width="280"/>
+                                        <button title="Kohorte taggen" target="#CPOwner" action="tagChatCohortAction:" width="120"/>
+                                        <button title="Pseudonyme kopieren" target="#CPOwner" action="copyChatPseudonymsAction:" width="150"/>
+                                        <hspace/>
+                                        <label id="chat_cohort_count_label" stringValue="0 Patienten" valign="center"/>
+                                    </hbox>
+                                </vbox>
+
+                            </splitView>
+                        </vbox>
+                    </tabViewItem>
+                    
+                    <!-- Tab 1: Clinical Trial Eligibility (FHIR) -->
+                    <tabViewItem title="Clinical Trials">
+                        <splitView vertical="YES" autosaveName="trial_workspace_split0">
+                            <vbox>
+                                <scrollView hasHorizontalScroller="NO">
+                                    <tableView zebra="yes" valueBinding="#CPOwner.trialsController" allowsEmptySelection="NO">
+                                        <tableColumn identifier="id" title="ID" width="50" editable="NO"/>
+                                        <tableColumn identifier="name" title="Trial Name" width="210" editable="YES"/>
+                                    </tableView>
+                                </scrollView>
+                                <ButtonBar target="#CPOwner.trialsController" minusButtonAction="remove:" plusButtonAction="insert:"/>
+
+                                <label stringValue="Study Synopsis / Protocol Context:" font="bold" margin="5"/>
+                                <scrollView hasHorizontalScroller="NO" height="250">
+                                    <textView id="synopsis_text_view" valueBinding="#CPOwner.trialsController.selection.narrative_inex_criteria" editable="YES"/>
+                                </scrollView>
+                                <button title="Extract FHIR Group" target="#CPOwner" action="extractFHIRCriteriaAction:"/>
+                            </vbox>
+
+                            <vbox>
+                                <scrollView hasHorizontalScroller="YES" hasVerticalScroller="YES">
+                                    <ruleEditor width="1200" id="rule_editor" delegate="#CPOwner._ruleDelegate" target="#CPOwner" action="ruleEditorDidChange:"/>
+                                </scrollView>
+                                <hbox height="30">
+                                    <button title="Add Criterion" target="#CPOwner" action="addSimpleRule:"/>
+                                    <button title="Add Group" target="#CPOwner" action="addGroupRule:"/>
+                                    <button title="Delete Criterion" target="#CPOwner" action="removeRule:"/>
+                                    <button title="Reset" target="#CPOwner" action="resetEditor:"/>
+                                    <hspace/>
+                                    <button title="View FHIR R6 JSON" target="#CPOwner" action="showJSONPopover:"/>
+                                </hbox>
+                            </vbox>
+                        </splitView>
+                    </tabViewItem>
+
+                    <!-- Tab 3: Matching (with Sub-Tabs Per Study / Per Patient) -->
+                    <tabViewItem title="Matching">
+                        <tabView type="topBezel" delegate="#CPOwner" id="matching_sub_tab">
+                            
+                            <!-- Sub-Tab A: Per Study -->
+                            <tabViewItem title="Per Study">
+                                <splitView vertical="YES" autosaveName="matching_study_split">
+                                    <vbox width="240">
+                                        <label stringValue="1. Target Clinical Trial:" font="bold" margin="6"/>
+                                        <scrollView hasHorizontalScroller="NO">
+                                            <tableView zebra="yes" valueBinding="#CPOwner.trialsController" allowsEmptySelection="NO">
+                                                <tableColumn identifier="id" title="ID" width="45" editable="NO"/>
+                                                <tableColumn identifier="name" title="Study Protocol" width="180" editable="NO"/>
+                                            </tableView>
+                                        </scrollView>
+                                    </vbox>
+
+                                    <vbox margin="10">
+                                        <hbox height="35">
+                                            <button title="Run Matching for Selected Trial" target="#CPOwner" action="runPatientMatchingAction:"/>
+                                            <hspace/>
+                                            <label valign="center">Filter Candidate:</label>
+                                            <searchField width="200" placeholder="Search PIZ / Candidate..." valueBinding="#CPOwner.studyMatchFilterString" target="#CPOwner" action="studyMatchSearchFieldChanged:"/>
+                                            <hspace/>
+                                            <label id="match_status_label" stringValue="Select match row below to review criteria details." valign="center"/>
+                                        </hbox>
+
+                                        <splitView vertical="NO" autosaveName="matching_study_master_detail_split">
+                                            <!-- Master: Matches der ausgewählten Studie -->
+                                            <vbox height="190">
+                                                <scrollView>
+                                                    <tableView zebra="yes" valueBinding="#CPOwner.matchesController" allowsEmptySelection="NO">
+                                                        <tableColumn identifier="trial_name" title="Trial Context" width="180" editable="NO"/>
+                                                        <tableColumn identifier="candidate_pseudonym" title="Candidate (PIZ)" width="130" editable="NO"/>
+                                                        <tableColumn identifier="status_text" title="Eligibility Status" width="160" editable="NO"/>
+                                                        <tableColumn identifier="timestamp" title="Matched At" width="140" editable="NO"/>
+                                                    </tableView>
+                                                </scrollView>
+                                            </vbox>
+
+                                            <!-- Detail: Kriterien-Trace & LLM Zusammenfassung -->
+                                            <vbox>
+                                                <scrollView height="170">
+                                                    <NoCibTableView id="crossmatch_tv" zebra="yes">
+                                                        <tableColumn identifier="status" title="Match Status" width="150"/>
+                                                        <tableColumn identifier="type" title="Type" width="90"/>
+                                                        <tableColumn identifier="criterion" title="Study Eligibility Criterion" width="280"/>
+                                                        <tableColumn identifier="evidence" title="Patient Phenotype / Diagnosis Evidence" width="300"/>
+                                                    </NoCibTableView>
+                                                </scrollView>
+                                                <hbox height="30">
+                                                    <button title="Create Narrative Summary" target="#CPOwner" action="generateNarrativeSummaryAction:"/>
+                                                </hbox>
+                                                <scrollView>
+                                                    <textView id="narrative_text_view" editable="NO"/>
+                                                </scrollView>
+                                            </vbox>
+                                        </splitView>
+                                    </vbox>
+                                </splitView>
+                            </tabViewItem>
+
+                            <!-- Sub-Tab B: Per Patient -->
+                            <tabViewItem title="Per Patient">
+                                <splitView vertical="YES" autosaveName="matching_patient_split">
+                                    <vbox width="240">
+                                        <label stringValue="1. Target Candidate (Patient):" font="bold" margin="6"/>
+                                        <searchField placeholder="Search PIZ / Tag / Candidate..." valueBinding="#CPOwner.candidateFilterString" target="#CPOwner" action="candidateSearchFieldChanged:"/>
+                                        <scrollView hasHorizontalScroller="NO">
+                                            <tableView zebra="yes" valueBinding="#CPOwner.candidatesController" allowsEmptySelection="NO">
+                                                <tableColumn identifier="id" title="ID" width="40" editable="NO"/>
+                                                <tableColumn identifier="pseudonym" title="Pseudonym" width="75" editable="NO"/>
+                                                <tableColumn identifier="tags" title="Tags" width="75" editable="NO"/>
+                                                <tableColumn identifier="reference_date" title="Date" width="50" editable="NO"/>
+                                            </tableView>
+                                        </scrollView>
+                                    </vbox>
+
+                                    <vbox margin="10">
+                                        <hbox height="35">
+                                            <button title="Match Selected Patient against Trials" target="#CPOwner" action="matchCandidateAgainstTrialsAction:"/>
+                                            <hspace/>
+                                            <label valign="center">Filter Study:</label>
+                                            <searchField width="200" placeholder="Search Study Name..." valueBinding="#CPOwner.patientMatchFilterString" target="#CPOwner" action="patientMatchSearchFieldChanged:"/>
+                                            <hspace/>
+                                            <label stringValue="Select trial match below to review criteria details." valign="center"/>
+                                        </hbox>
+
+                                        <splitView vertical="NO" autosaveName="matching_patient_master_detail_split">
+                                            <!-- Master: Matches des ausgewählten Patienten über alle Studien -->
+                                            <vbox height="190">
+                                                <scrollView>
+                                                    <tableView zebra="yes" valueBinding="#CPOwner.patientMatchesController" allowsEmptySelection="NO">
+                                                        <tableColumn identifier="trial_name" title="Trial Context" width="180" editable="NO"/>
+                                                        <tableColumn identifier="candidate_pseudonym" title="Candidate (PIZ)" width="130" editable="NO"/>
+                                                        <tableColumn identifier="status_text" title="Eligibility Status" width="160" editable="NO"/>
+                                                        <tableColumn identifier="timestamp" title="Matched At" width="140" editable="NO"/>
+                                                    </tableView>
+                                                </scrollView>
+                                            </vbox>
+
+                                            <!-- Detail: Kriterien-Trace & LLM Zusammenfassung -->
+                                            <vbox>
+                                                <scrollView height="170">
+                                                    <NoCibTableView id="patient_crossmatch_tv" zebra="yes">
+                                                        <tableColumn identifier="status" title="Match Status" width="150"/>
+                                                        <tableColumn identifier="type" title="Type" width="90"/>
+                                                        <tableColumn identifier="criterion" title="Study Eligibility Criterion" width="280"/>
+                                                        <tableColumn identifier="evidence" title="Patient Phenotype / Diagnosis Evidence" width="300"/>
+                                                    </NoCibTableView>
+                                                </scrollView>
+                                                <hbox height="30">
+                                                    <button title="Create Narrative Summary" target="#CPOwner" action="generatePatientNarrativeSummaryAction:"/>
+                                                </hbox>
+                                                <scrollView>
+                                                    <textView id="patient_narrative_text_view" editable="NO"/>
+                                                </scrollView>
+                                            </vbox>
+                                        </splitView>
+                                    </vbox>
+                                </splitView>
+                            </tabViewItem>
+                        </tabView>
+                    </tabViewItem>
+
+                    <!-- Tab 4: Time-to-Event (Longitudinal) -->
+                    <tabViewItem title="Time-to-Event">
+                        <splitView vertical="YES" autosaveName="tte_top_split">
+                            <vbox width="240">
+                                <label stringValue="Target Clinical Trial:" font="bold" margin="6"/>
+                                <scrollView hasHorizontalScroller="NO">
+                                    <tableView zebra="yes" valueBinding="#CPOwner.trialsController" allowsEmptySelection="NO">
+                                        <tableColumn identifier="id" title="ID" width="45" editable="NO"/>
+                                        <tableColumn identifier="name" title="Study Protocol" width="180" editable="NO"/>
+                                    </tableView>
+                                </scrollView>
+                            </vbox>
+
+                            <vbox margin="10">
+                                <hbox height="35">
+                                    <button title="Calculate Time to Eligibility" target="#CPOwner" action="calculateTimeToEventAction:"/>
+                                    <button title="Export CSV for R" target="#CPOwner" action="exportTimeToEventCSVAction:"/>
+                                    <hspace/>
+                                    <label id="tte_summary_label" stringValue="No calculation performed yet." valign="center"/>
+                                </hbox>
+                                
+                                <scrollView>
+                                    <NoCibTableView id="tte_tv" zebra="yes">
+                                        <tableColumn identifier="piz" title="Pseudonym (PIZ)" width="110"/>
+                                        <tableColumn identifier="status" title="Status" width="100"/>
+                                        <tableColumn identifier="event" title="Event (0/1)" width="75"/>
+                                        <tableColumn identifier="time_days" title="Time (Days)" width="85"/>
+                                        <tableColumn identifier="study_eye" title="Study Eye" width="85"/>
+                                        <tableColumn identifier="baseline_date" title="Baseline Date" width="95"/>
+                                        <tableColumn identifier="event_date" title="Event Date" width="95"/>
+                                        <tableColumn identifier="total_briefe_evaluated" title="Letters Evaluated" width="110"/>
+                                    </NoCibTableView>
+                                </scrollView>
+                            </vbox>
+                        </splitView>
+                    </tabViewItem>
+
+                </tabView>
+
+                <!-- Right Sidebar Browser -->
+                <vbox>
+                    <hbox height="30">
+                        <segmentedControl target="#CPOwner" id="picker_control" action="pickerTypeChanged:" type="toggle">
+                            <segmentedControlItem title="HPO" tag="0" selected="YES"/>
+                            <segmentedControlItem title="ICD10" tag="1"/>
+                            <segmentedControlItem title="OPS" tag="2"/>
+                            <segmentedControlItem title="ATC" tag="3"/>
+                            <segmentedControlItem title="LOINC" tag="4"/>
+                        </segmentedControl>
+                        <hspace/>
+                    </hbox>
+                    <hbox height="33">
+                        <searchField id="search_field" valign="center" target="#CPOwner" action="searchAction:"/>
+                        <switchButton id="name_only_checkbox" title="Name only" />
+                        <button title="&lt;" target="#CPOwner" action="prevMatch:"/>
+                        <label id="search_status_label" stringValue="" valign="center"/>
+                        <button title="&gt;" target="#CPOwner" action="nextMatch:"/>
+                    </hbox>
+                    <hbox>
+                        <tokenField id="sidebar_token_field" editable="NO" width="200" placeholder="Drag from here" />
+                        <hspace/>
+                    </hbox>
+                    <scrollView height="250">
+                        <HPOOutlineView id="hpo_outline_view" delegate="#CPOwner"/>
+                    </scrollView>
+
+                    <tabView type="topBezel" height="200">
+                        <tabViewItem title="Definition">
+                            <scrollView>
+                                <textView id="definition_tv" editable="NO"/>
+                            </scrollView>
+                        </tabViewItem>
+                        <tabViewItem title="Synonyms">
+                            <scrollView>
+                                <tableView id="synonyms_tv" zebra="yes">
+                                    <tableColumn identifier="label" title="Synonym" width="160"/>
+                                </tableView>
+                            </scrollView>
+                        </tabViewItem>
+                        <tabViewItem title="Cross References">
+                            <scrollView>
+                                <tableView id="xrefs_tv" zebra="yes">
+                                    <tableColumn identifier="label" title="Label" width="160"/>
+                                </tableView>
+                            </scrollView>
+                        </tabViewItem>
+                        <tabViewItem title="Downstream">
+                            <vbox>
+                                <scrollView>
+                                    <tableView id="downstream_tv" zebra="yes" target="#CPOwner" doubleAction="doubleClickDownstream:">
+                                        <tableColumn identifier="id" title="Code" width="160"/>
+                                    </tableView>
+                                </scrollView>
+                                <button title="Export IDs" target="#CPOwner" action="exportDownstream:"/>
+                            </vbox>
+                        </tabViewItem>
+                    </tabView>
+                </vbox>
+
+            </splitView>
+        </vbox>
+    </window>
+</objects>
+
+<connectors>
+    <outlet source="CPOwner" target="mainwindow" label="mainWindow"/>
+
+    <outlet source="CPOwner" target="main_workspace_tab" label="mainWorkspaceTab"/>
+    <outlet source="CPOwner" target="matching_sub_tab" label="_matchingSubTabView"/>
+
+    <outlet source="CPOwner" target="synopsis_text_view" label="_synopsisInputTextView"/>
+    <outlet source="CPOwner" target="rule_editor" label="_ruleEditor"/>
+    <outlet source="CPOwner" target="report_text_view" label="_reportInputTextView"/>
+    <outlet source="CPOwner" target="pheno_visual_tv" label="_phenoVisualTableView"/>
+    <outlet source="CPOwner" target="pheno_json_tv" label="_phenopacketOutputTextView"/>
+    <outlet source="CPOwner" target="crossmatch_tv" label="_crossmatchTableView"/>
+    <outlet source="CPOwner" target="narrative_text_view" label="_narrativeTextView"/>
+
+    <outlet source="CPOwner" target="patient_crossmatch_tv" label="_patientCrossmatchTableView"/>
+    <outlet source="CPOwner" target="patient_narrative_text_view" label="_patientNarrativeTextView"/>
+
+    <outlet source="CPOwner" target="hpo_outline_view" label="outlineView"/>
+    <outlet source="CPOwner" target="picker_control" label="_pickerControl"/>
+    <outlet source="CPOwner" target="name_only_checkbox" label="_nameOnlyCheckbox"/>
+    <outlet source="CPOwner" target="search_field" label="_searchField"/>
+    <outlet source="CPOwner" target="search_status_label" label="_searchStatusLabel"/>
+    <outlet source="CPOwner" target="sidebar_token_field" label="_searchTokenField"/>
+    <outlet source="CPOwner" target="definition_tv" label="definitionTextView"/>
+    <outlet source="CPOwner" target="synonyms_tv" label="synonymsTableView"/>
+    <outlet source="CPOwner" target="xrefs_tv" label="xrefsTableView"/>
+    <outlet source="CPOwner" target="downstream_tv" label="downstreamTableView"/>
+    <outlet source="CPOwner" target="tte_tv" label="_timeToEventTableView"/>
+    <outlet source="CPOwner" target="tte_summary_label" label="_tteSummaryLabel"/>
+    <outlet source="CPOwner" target="deep_mode_switch" label="_deepModeSwitch"/>
+    <outlet source="CPOwner" target="chat_patients_tv" label="_chatPatientsTableView"/>
+    <outlet source="CPOwner" target="chat_tag_text_field" label="_chatTagTextField"/>
+    <outlet source="CPOwner" target="chat_send_btn" label="_chatSendButton"/>
+    <outlet source="CPOwner" target="chat_cohort_count_label" label="_chatCohortCountLabel"/>
+    <outlet source="CPOwner" target="chat_input_tv" label="_chatInputTextView"/>
+    <outlet source="CPOwner" target="chat_sql_tv" label="_chatSqlTextView"/>
+    <outlet source="CPOwner" target="chat_status_label" label="_chatStatusLabel"/></connectors>
+</gsmarkup>
