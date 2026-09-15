@@ -2,14 +2,14 @@
 
 An integrated, full-stack environment for structured clinical trial eligibility definition, cohort feasibility analysis, and longitudinal patient matching. The platform bridges unstructured clinical trial protocols and medical narrative reports with standardized ontologies and interoperable health data standards.
 
-Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology semantic extraction, normalization, and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC**, **LOINC**, and **SNOMED CT**.
+Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology semantic extraction, normalization, and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC** and **LOINC**
 
 <img width="1865" height="1019" alt="OntoTrial Rules Editor" src="https://github.com/user-attachments/assets/0dbc4eb2-4d9a-4172-a41e-cef7defa13cd" />
 <img width="1860" height="1028" alt="OntoTrial Phenotype Tree Browser" src="https://github.com/user-attachments/assets/f7c86a01-2ce4-4fbc-83fa-633d0b4c1e6d" />
 
 ---
 
-## What’s New: Multi-Ontology & Advanced Clinical Features
+## Multi-Ontology & Advanced Clinical Features
 
 OntoTrial has evolved beyond phenotype-only extraction into a multi-terminology clinical intelligence engine:
 
