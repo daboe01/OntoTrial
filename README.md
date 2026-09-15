@@ -189,9 +189,16 @@ API Summary (Key Endpoints)
   - POST /BBB/resolve_term – Standalone high-speed mapping endpoint for
     arbitrary clinical text phrases.
 
-License & Attribution
+## License
 
-Developed for clinical research, phenotyping, and trial eligibility automation.
-Built with Mojolicious, Cappuccino, PostgreSQL, and open medical ontologies
-(HPO, BfArM ICD-10/OPS, WHO ATC, Regenstrief LOINC, SNOMED CT).
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+### Third-Party Data & Ontology Attributions
+OntoTrial interfaces with open medical ontologies and terminologies that retain their respective copyright notices and terms of use:
+- **HPO**: Human Phenotype Ontology (CC BY 4.0).
+- **ICD-10 / OPS**: © Bundesinstitut für Arzneimittel und Medizinprodukte (BfArM).
+- **ATC**: WHO Collaborating Centre for Drug Statistics Methodology.
+- **LOINC**: © Regenstrief Institute, Inc.
+- **SNOMED CT**: © International Health Terminology Standards Development Organisation (SNOMED International).
