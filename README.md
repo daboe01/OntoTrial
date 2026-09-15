@@ -127,7 +127,7 @@ cpanm Mojolicious \
       DateTime \
       Text::CSV \
       Apache::Session::File
-
+```
 3. Environment Configuration
 
 Configure database and LLM endpoints via environment variables:
