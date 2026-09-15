@@ -127,7 +127,7 @@ cpanm Mojolicious \
       DateTime \
       Text::CSV \
       Apache::Session::File
-```
+
 3. Environment Configuration
 
 Configure database and LLM endpoints via environment variables:
@@ -188,6 +188,7 @@ API Summary (Key Endpoints)
     ontology tool-calling.
   - POST /BBB/resolve_term – Standalone high-speed mapping endpoint for
     arbitrary clinical text phrases.
+```
 
 ## License
 
