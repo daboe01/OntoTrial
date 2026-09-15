@@ -4,7 +4,7 @@ An integrated, full-stack environment for structured clinical trial eligibility 
 
 Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology semantic extraction, normalization, and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC** and **LOINC**
 
-<img width="1865" height="1019" alt="OntoTrial Rules Editor" src="https://github.com/user-attachments/assets/0dbc4eb2-4d9a-4172-a41e-cef7defa13cd" />
+<img width="2033" height="1022" alt="Bildschirmfoto 2026-09-15 um 15 29 21" src="https://github.com/user-attachments/assets/421e4515-8eb7-4c70-9790-1d21a1f340d0" />
 <img width="1860" height="1028" alt="OntoTrial Phenotype Tree Browser" src="https://github.com/user-attachments/assets/f7c86a01-2ce4-4fbc-83fa-633d0b4c1e6d" />
 
 ---
