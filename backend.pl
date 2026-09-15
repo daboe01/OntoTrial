@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-
+# Copyright 2026 Daniel Böhringer
 # OntoTrial Backend - Step-by-Step Extraction & Deduplicated Disjunctive Assembly Engine
 # + FHIR Eye Normalization (Study Eye -> Right Eye, Fellow Eye -> Left Eye)
 # TODO: use a BERT model to validate idems after union ensemble (idea)
