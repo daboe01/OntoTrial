@@ -1,4 +1,4 @@
-# Clinical Trial Eligibility Framework & HPO Browser
+# Clinical Trial Eligibility Framework
 
 An integrated, full-stack environment designed for structured clinical trial eligibility definition. The platform connects a visual logical rules editor with semantic phenotype extraction powered by Large Language Models (LLMs) and the Human Phenotype Ontology (HPO).
 
