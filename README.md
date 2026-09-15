@@ -29,29 +29,23 @@ OntoTrial has evolved beyond phenotype-only extraction into a multi-terminology 
 
 OntoTrial uses an asynchronous, decoupled architecture designed for high throughput, strict schema validation, and real-time frontend updates:
 
-                  ┌──────────────────────────────────────────────┐
-                  │    Cappuccino / Objective-J Web Frontend    │
-                  │  (CPRuleEditor, Multi-Ontology Tree Browser) │
-                  └──────────────────────┬───────────────────────┘
-                                         │ REST / WebSockets
-                                         ▼
-                  ┌──────────────────────────────────────────────┐
-                  │           OntoTrial Mojolicious Core         │
-                  │   - Dynamic Regex Database Intercepts        │
-                  │   - Ophthalmology Normalization Engine       │
-                  │   - Recursive Subsumption / Hierarchy Kernel │
-                  │   - Minion Worker Task Queue                 │
-                  └──────┬────────────────┬───────────────┬──────┘
-                         │                │               │
-        ┌────────────────┴───┐    ┌───────┴───────┐    ┌──┴────────────────┐
-        ▼                    ▼    ▼               ▼    ▼                   ▼
-┌───────────────┐   ┌───────────────┐   ┌───────────────────┐   ┌──────────────────┐
-│  Local LLM    │   │ Dense Vector  │   │ PostgreSQL 16+    │   │ Patchbay Proxy / │
-│ (vLLM/Ollama) │   │ Retrieval API │   │ (Hierarchies,     │   │ Rate-Throttled   │
-│  JSON Schema  │   │  (Patchbay)   │   │  Candidates,      │   │ Queue            │
-│  Grammar Mode │   │               │   │  Trials, Matches) │   │                  │
-└───────────────┘   └───────────────┘   └───────────────────┘   └──────────────────┘
+```mermaid
+flowchart TD
+    UI["<b>Cappuccino / Objective-J Web Frontend</b><br/><i>(CPRuleEditor, Multi-Ontology Tree Browser)</i>"]
+    
+    CORE["<b>OntoTrial Mojolicious Core</b><br/>• Dynamic Regex Database Intercepts<br/>• Ophthalmology Normalization Engine<br/>• Recursive Subsumption / Hierarchy Kernel<br/>• Minion Background Worker Queue"]
 
+    DB[("<b>PostgreSQL 16+</b><br/>• Terms & Hierarchies (HPO, ICD10, OPS, ATC, LOINC)<br/>• Candidates & Phenopackets<br/>• Trials & Matches")]
+    
+    LLM["<b>LLM Inference Engine</b><br/>• vLLM / Ollama<br/>• JSON Schema Grammar Constraints<br/>• Clinical Reasoning Trace"]
+    
+    VEC["<b>Dense Vector Retrieval</b><br/>• Patchbay Stateless API<br/>• Concurrency-Throttled Queue"]
+
+    UI <==>|REST API & WebSockets| CORE
+    CORE <==>|Query & PubSub| DB
+    CORE -->|Structured Extraction| LLM
+    CORE -->|Ontology Vector Search| VEC
+```
 
 1. **Frontend (Objective-J / Cappuccino):**
    - Desktop-grade web GUI implementing a Cocoa-derived MVC architecture.
