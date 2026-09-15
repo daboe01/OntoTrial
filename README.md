@@ -1,59 +1,203 @@
-# Clinical Trial Eligibility Framework
+# OntoTrial – Clinical Trial Eligibility & Phenotyping Framework
 
-An integrated, full-stack environment designed for structured clinical trial eligibility definition. The platform connects a visual logical rules editor with semantic phenotype extraction powered by Large Language Models (LLMs) and the Human Phenotype Ontology (HPO).
+An integrated, full-stack environment for structured clinical trial eligibility definition, cohort feasibility analysis, and longitudinal patient matching. The platform bridges unstructured clinical trial protocols and medical narrative reports with standardized ontologies and interoperable health data standards.
 
-This system bridges the gap between unstructured clinical study protocol narratives and the structured, codifiable FHIR R6 `Group` resource standards.
+Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology semantic extraction, normalization, and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC**, **LOINC**, and **SNOMED CT**.
 
-<img width="1865" height="1019" alt="Bildschirmfoto 2026-09-15 um 14 44 23" src="https://github.com/user-attachments/assets/0dbc4eb2-4d9a-4172-a41e-cef7defa13cd" />
-<img width="1860" height="1028" alt="Bildschirmfoto 2026-09-15 um 14 51 54" src="https://github.com/user-attachments/assets/f7c86a01-2ce4-4fbc-83fa-633d0b4c1e6d" />
+<img width="1865" height="1019" alt="OntoTrial Rules Editor" src="https://github.com/user-attachments/assets/0dbc4eb2-4d9a-4172-a41e-cef7defa13cd" />
+<img width="1860" height="1028" alt="OntoTrial Phenotype Tree Browser" src="https://github.com/user-attachments/assets/f7c86a01-2ce4-4fbc-83fa-633d0b4c1e6d" />
+
+---
+
+## What’s New: Multi-Ontology & Advanced Clinical Features
+
+OntoTrial has evolved beyond phenotype-only extraction into a multi-terminology clinical intelligence engine:
+
+| Domain | Ontology / Standard | Scope & Implementation |
+| :--- | :--- | :--- |
+| **Phenotypes & Symptoms** | **HPO** (*Human Phenotype Ontology*) | Recursive `isas` hierarchy traversal, synonym matching, xref lookup, and subsumption testing. |
+| **Diagnoses & Conditions** | **ICD-10 / ICD-10-GM** | Formal diagnostic codes, German modification hierarchy, automated drug allergy mapping (`Z88.8` + ATC). |
+| **Procedures & Surgeries** | **OPS** (*Operationen- und Prozedurenschlüssel*) | Surgical and diagnostic interventions, BfArM hierarchy with lateral body-site tracking. |
+| **Medications & Substances** | **ATC** (*Anatomical Therapeutic Chemical*) | Active agents, ophthalmologic drops, anti-VEGF injections, dosage-pattern stripping, and WHO ATC mapping. |
+| **Lab & Clinical Measurements** | **LOINC** | Quantitative assays, clinical scoring scales, blood pressure, lab panels, and bulk-import tooling (`public.loinc_terms`). |
+| **Anatomy & Laterality** | **SNOMED CT** | Laterality qualifiers (left/right/bilateral), ocular body structures (`SNOMED:18944008`, `8966001`, `40638003`). |
+| **Dual Standards** | **FHIR R6 `Group` & GA4GH Phenopacket v2** | Output trial criteria as definitional/conceptual nested FHIR groups or patient charts as Phenopackets v2.0. |
 
 ---
 
 ## Architecture Overview
 
-The application is built upon a decoupled full-stack architecture:
+OntoTrial uses an asynchronous, decoupled architecture designed for high throughput, strict schema validation, and real-time frontend updates:
 
-1. **Frontend (Cappuccino / Objective-J):** 
-   - Uses a Cocoa-derived MVC pattern running directly in the browser.
-   - Features a visual nesting `CPRuleEditor` to display and modify logical operators (`all-of`, `any-of`) and exclusion criteria.
-   - Includes a recursive `CPOutlineView` tree component to browse the HPO hierarchy.
+                  ┌──────────────────────────────────────────────┐
+                  │    Cappuccino / Objective-J Web Frontend    │
+                  │  (CPRuleEditor, Multi-Ontology Tree Browser) │
+                  └──────────────────────┬───────────────────────┘
+                                         │ REST / WebSockets
+                                         ▼
+                  ┌──────────────────────────────────────────────┐
+                  │           OntoTrial Mojolicious Core         │
+                  │   - Dynamic Regex Database Intercepts        │
+                  │   - Ophthalmology Normalization Engine       │
+                  │   - Recursive Subsumption / Hierarchy Kernel │
+                  │   - Minion Worker Task Queue                 │
+                  └──────┬────────────────┬───────────────┬──────┘
+                         │                │               │
+        ┌────────────────┴───┐    ┌───────┴───────┐    ┌──┴────────────────┐
+        ▼                    ▼    ▼               ▼    ▼                   ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────────┐   ┌──────────────────┐
+│  Local LLM    │   │ Dense Vector  │   │ PostgreSQL 16+    │   │ Patchbay Proxy / │
+│ (vLLM/Ollama) │   │ Retrieval API │   │ (Hierarchies,     │   │ Rate-Throttled   │
+│  JSON Schema  │   │  (Patchbay)   │   │  Candidates,      │   │ Queue            │
+│  Grammar Mode │   │               │   │  Trials, Matches) │   │                  │
+└───────────────┘   └───────────────┘   └───────────────────┘   └──────────────────┘
 
-2. **Backend (Mojolicious / Perl):**
-   - High-throughput asynchronous REST API managing local PostgreSQL-backed HPO database lookups.
-   - Handles structured clinical extraction tasks by routing chunks of text to deep learning LLM endpoints using JSON schema constraints.
-   - Features defensive logical post-processing to ensure exclusion subgroups are structured cleanly before mapping to the UI.
+
+1. **Frontend (Objective-J / Cappuccino):**
+   - Desktop-grade web GUI implementing a Cocoa-derived MVC architecture.
+   - Dynamic `CPRuleEditor` for visual nesting of criteria (`all-of`, `any-of`, `neither-of`).
+   - Multi-terminology tree navigator (`CPOutlineView`) for HPO, ICD-10, OPS, ATC, and LOINC.
+   - Real-time updates via WebSocket subscriptions (`/BBB/socket`).
+
+2. **Backend Engine (Mojolicious / Perl):**
+   - High-performance asynchronous REST and WebSocket API.
+   - Two-step LLM extraction pipeline: Clinical chunk atomization followed by target-domain dense vector mapping and deterministic database regex intercepts.
+   - Asynchronous worker queue powered by **Mojo::Pg / Minion** for background document extraction.
 
 ---
 
-## Key Features
+## Key Modules & Capabilities
 
-- **FHIR R6 Group Alignment:** Generates definitional and conceptual nested group representations complying with FHIR R6 standards.
-- **Hierarchical Phenotypic Extraction:** Uses system-guided LLM pipelines to parse protocol synopses into nested logical blocks.
-- **Automatic HPO Semantic Mapping:** Resolves extracted clinical descriptors to standardized HPO identifiers (e.g., `HP:0000118`) via backend mapping services.
-- **Robust Logical Validation:** Protects nested exclusion structures from losing their hierarchical boundaries when logical combination methods are changed.
-- **Dynamic HPO Tree Browser:** Asynchronously loads down-tree child classes, cross-references (xrefs), and associated standard synonyms.
+### 1. Dual-Standard Interoperability
+- **HL7® FHIR® R6 `Group`:** Generates nested, definitional, and conceptual criteria blocks with `combinationMethod` (`all-of`, `any-of`, `neither-of`), `#subgroup-X` contained groups, UCUM-typed `valueQuantity`, and temporal constraints (`relativeTime`).
+- **GA4GH Phenopacket v2.0.0:** Transforms free-text clinical discharge summaries into structured Phenopackets containing `phenotypicFeatures`, `measurements`, `diseases`, `procedures`, `medicalActions`, and patient metadata.
+
+### 2. Ophthalmology & Clinical Measurement Engine
+- **Visual Acuity (Visus) & Refraction Normalization:**
+  - Extracts and standardizes decimal and Snellen visual acuity (e.g., `1/20`, `0.05`).
+  - Converts low-vision qualitative descriptions to the Schulze-Bonsel standard (*Handbewegungen* = `0.005`, *Lichtschein* = `0.002`, *Fingerzählen* = `0.013`, *Amaurose/No LP* = `0.000`).
+  - Differentiates uncorrected (`sc`), own-glasses (`eB`), and best-corrected (`cc`) visual acuity.
+  - Parses spherical diopters, cylinder diopters, axis, and calculates spherical equivalents.
+- **Tonometry & OCT Structural Biomarkers:**
+  - Bilateral intraocular pressure (IOP/Tensio), central corneal thickness (Pachymetry/CCT), Hertel exophthalmometry, and corneal endothelial cell density (ECD).
+  - Retinal nerve fiber layer (RNFL) thickness, Ganglion Cell Layer / Inner Plexiform Layer volume (GCL/IPL), and Bruch’s Membrane Opening (BMO) area.
+- **Section & Anatomical Context Enrichment:**
+  - Resolves ambiguous clinical jargon based on note section (e.g., distinguishing *retinal neovascularization* from *corneal neovascularization*, or *chorioretinal scar* from *corneal scar*).
+
+### 3. Dual-Hypothesis Eye Matching Kernel
+Clinical trials often define rules for a "study eye" while placing safety restrictions on the "fellow eye". OntoTrial evaluates each patient under dual hypotheses:
+- **Hypothesis A:** Right eye (OD) is the Study Eye, Left eye (OS) is the Fellow Eye.
+- **Hypothesis B:** Left eye (OS) is the Study Eye, Right eye (OD) is the Fellow Eye (using an on-the-fly mirrored Phenopacket).
+- Determines whether a patient qualifies via OD, OS, or both.
+
+### 4. Longitudinal Time-to-Eligibility & Kaplan-Meier Survival Data
+- Evaluates sequential medical letters over time for a given patient pseudonym (PIZ).
+- Identifies the exact encounter date when study criteria are first met.
+- Generates censored survival-time records (`time_days`, `event`, `study_eye`, `baseline_date`, `event_date`) exported via JSON or directly downloadable as a CSV (`/BBB/trials/:id/time_to_eligibility.csv`) for analysis in R, Python, or SPSS.
+
+### 5. Feasibility Cohort Chat Assistant
+- An integrated natural language assistant that enables clinical researchers to query patient databases.
+- Uses a tool-calling / ReAct loop (`lookup_ontology_code`, `execute_sql`) with automated hierarchical ontology queries (`is_subclass_of()`) to count eligible patients, verify inclusion/exclusion feasibility, and return patient pseudonym cohorts.
 
 ---
 
-## Repository Structure
+## Terminology Tree Endpoints
 
-- `AppController.j` – The core frontend application delegate, view controllers, and rule editors written in Objective-J.
-- `backend.pl` – The Mojolicious backend microservice managing NLP pipelines, HPO search database queries, and concept mapping.
+OntoTrial provides recursive tree and search endpoints for all supported terminologies:
+
+| Ontology | Hierarchy Roots | Children Endpoint | Ancestor Path Search |
+| :--- | :--- | :--- | :--- |
+| **HPO** | `GET /BBB/hpo/roots` | `GET /BBB/hpo/children/:id` | `GET /BBB/hpo/search/:query` |
+| **ICD-10** | `GET /BBB/icd10/roots` | `GET /BBB/icd10/children/:id` | `GET /BBB/icd10/search/:query` |
+| **OPS** | `GET /BBB/ops/roots` | `GET /BBB/ops/children/:id` | `GET /BBB/ops/search/:query` |
+| **ATC** | `GET /BBB/atc/roots` | `GET /BBB/atc/children/:id` | `GET /BBB/atc/search/:query` |
+| **LOINC** | `GET /BBB/loinc/roots` | `GET /BBB/loinc/children/:id` | `GET /BBB/loinc/search/:query` |
 
 ---
 
 ## Prerequisites & Installation
 
-### Backend Setup
+### 1. System Requirements
+- **Perl 5.26+**
+- **PostgreSQL 14+** (with loaded schemas for HPO, ICD-10, OPS, ATC, and LOINC)
+- **Local or Remote LLM Provider:**
+  - OpenAI-compatible vLLM server (e.g., `gpt-oss-120b`), OR
+  - Ollama instance (e.g., `gemma4:31b-mlx`)
 
-The backend service requires Perl 5 (version 5.20+ recommended) and a PostgreSQL database containing loaded HPO datasets.
+### 2. Perl Dependencies
+Install the required CPAN modules:
+```bash
+cpanm Mojolicious \
+      Mojo::Pg \
+      Minion \
+      DateTime \
+      Text::CSV \
+      Apache::Session::File
 
-1. **Install Perl Dependencies:**
-   ```bash
-   cpanm Mojolicious
-      ```
-2. **Running the Service:**
-   You can run the Mojolicious development server directly:
-   ```bash
-   perl app.pl daemon -l http://*:3026
-   ```
+3. Environment Configuration
+
+Configure database and LLM endpoints via environment variables:
+
+# Database
+export MOJO_PG_URL="postgresql://postgres:postgres@localhost/hpo"
+
+# LLM Backend (vLLM or Ollama)
+export LLM_PROVIDER="vllm"                      # 'vllm' or 'ollama'
+export VLLM_ENDPOINT="https://your-vllm-host/v1/chat/completions"
+export VLLM_API_KEY="your-api-key"
+export VLLM_MODEL="gpt-oss-120b"
+
+# Optional: Ollama settings
+# export LLM_PROVIDER="ollama"
+# export OLLAMA_ENDPOINT="http://localhost:11434/api/chat"
+# export OLLAMA_MODEL="gemma4:31b-mlx"
+
+# Dense Vector Retrieval (Patchbay)
+export PATCHBAY_URL="http://localhost:3036"
+
+4. Running the Backend
+
+Development Server:
+
+perl backend.pl daemon -l http://*:4007
+
+Production Daemon (Hypnotoad):
+
+hypnotoad backend.pl
+
+Background Minion Worker: To process asynchronous clinical letter ingestion
+(/BBB/import_and_extract_letter):
+
+perl backend.pl minion worker
+
+5. LOINC Bulk Import
+
+To populate or refresh the LOINC database from official CSV distributions:
+
+curl -X POST http://localhost:4007/_import_loinc
+
+API Summary (Key Endpoints)
+
+  - POST /BBB/extract_fhir_inex_criteria – Extracts trial criteria and returns a
+    FHIR R6 Group JSON.
+  - POST /BBB/extract_phenopacket – Extracts an individualized patient
+    Phenopacket v2 from clinical notes.
+  - POST /BBB/import_and_extract_letter – Queues background medical letter
+    ingestion and phenopacket creation via Minion.
+  - POST /BBB/run_all_matches – Runs matching evaluation across trials and
+    candidates.
+  - POST /BBB/trials/:id/time_to_eligibility – Calculates longitudinal
+    Kaplan-Meier eligibility intervals.
+  - GET /BBB/trials/:id/time_to_eligibility.csv – Exports cohort
+    time-to-eligibility tables as CSV.
+  - POST /BBB/chat/query – Conversational feasibility assistant with SQL and
+    ontology tool-calling.
+  - POST /BBB/resolve_term – Standalone high-speed mapping endpoint for
+    arbitrary clinical text phrases.
+
+License & Attribution
+
+Developed for clinical research, phenotyping, and trial eligibility automation.
+Built with Mojolicious, Cappuccino, PostgreSQL, and open medical ontologies
+(HPO, BfArM ICD-10/OPS, WHO ATC, Regenstrief LOINC, SNOMED CT).
+
