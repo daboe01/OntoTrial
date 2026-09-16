@@ -19,7 +19,7 @@ OntoTrial has evolved beyond phenotype-only extraction into a multi-terminology 
 | **Diagnoses & Conditions** | **ICD-10 / ICD-10-GM** | Formal diagnostic codes, German modification hierarchy, automated drug allergy mapping (`Z88.8` + ATC). |
 | **Procedures & Surgeries** | **OPS** (*Operationen- und Prozedurenschlüssel*) | Surgical and diagnostic interventions, BfArM hierarchy with lateral body-site tracking. |
 | **Medications & Substances** | **ATC** (*Anatomical Therapeutic Chemical*) | Active agents, ophthalmologic drops, anti-VEGF injections, dosage-pattern stripping, and WHO ATC mapping. |
-| **Lab & Clinical Measurements** | **LOINC** | Quantitative assays, clinical scoring scales, blood pressure, lab panels, and bulk-import tooling (`public.loinc_terms`). |
+| **Lab & Clinical Measurements** | **LOINC** | Quantitative assays (including clinical chemistry, hematology...), clinical scoring scales (including patient reported outcome measures), blood pressure, and most quantitiative ophthalmologic measurements (e.g. OCT segmentation, Hertel, tear film break up time) |
 | **Anatomy & Laterality** | **SNOMED CT** | Laterality qualifiers (left/right/bilateral), ocular body structures (`SNOMED:18944008`, `8966001`, `40638003`). |
 | **Dual Standards** | **FHIR R6 `Group` & GA4GH Phenopacket v2** | Output trial criteria as definitional/conceptual nested FHIR groups or patient charts as Phenopackets v2.0. |
 
