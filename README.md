@@ -164,11 +164,6 @@ Background Minion Worker: To process asynchronous clinical letter ingestion
 
 perl backend.pl minion worker
 
-5. LOINC Bulk Import
-
-To populate or refresh the LOINC database from official CSV distributions:
-
-curl -X POST http://localhost:4007/_import_loinc
 
 API Summary (Key Endpoints)
 
