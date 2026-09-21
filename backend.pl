@@ -4,6 +4,7 @@
 # + FHIR Eye Normalization (Study Eye -> Right Eye, Fellow Eye -> Left Eye)
 # TODO: use a BERT model to validate idems after union ensemble (idea)
 # TODO: backport of event date (or use observed date) for PhenoViewer to work properly
+# TODO: support orphacodes
 
 use utf8;
 use Mojolicious::Lite;
@@ -984,6 +985,9 @@ sub parse_quantitative_constraint {
             $unit = $unit_raw;
             $unit =~ s/^\s+|\s+$//g;
         }
+        elsif ($unit_raw =~ /\b(?:db|dezibel|decibels?)\b/i || $clean_text =~ /\b(?:md|psd|ms|sensitivit[äa]t|defizit)\b/i) {
+            $unit = 'dB';
+        }
         # Fallback-Einheiten
         unless ($unit) {
             if ($clean_text =~ /\b__HBA1C__\b/i) {
@@ -1299,9 +1303,9 @@ helper check_database_intercept => sub {
     return undef;
 };
 
-# =========================================================
-# ASYNCHRONOUS DENSE VECTOR MAPPING HELPERS (UTF-8 ENCODED)
-# =========================================================
+# ===========================================
+# ASYNCHRONOUS DENSE VECTOR MAPPING HELPERS
+# ===========================================
 
 sub enrich_term_with_section_context {
     my ($term, $local_context, $full_report) = @_;
@@ -1309,278 +1313,382 @@ sub enrich_term_with_section_context {
 
     my $combined = lc(($local_context // '') . ' ' . $term);
 
-    # -------------------------------------------------------------
-    # 1. PRÜFEN: STAMMT DER BEGRIFF AUS NETZHAUT / MAKULA / OCT / FAG?
-    # -------------------------------------------------------------
-    my $is_retina = 0;
-
-    # Regex für relevante Sektionen/Modalitäten (jetzt inkl. FAG, FLA, Angio)
-    my $retina_sections = qr/(?:nh[- ]?oct|oct|fundus|makula|macula|retina|netzhaut|fovea|fag|fla|angio)/i;
-
-    # Regex für typische Begleitbefunde im selben Satz (z.B. in der Vorgeschichte)
-    my $retina_context_words = qr/(?:fag|cotton[\s-]wool|fleckblutung\w*|blutung\w*|uhr\b|netzhaut|retina|gef[äa][ßs]anomalie|drusen)/i;
-
-    # A. Direkter Match im übergebenen Begriff/Kontext
-    if ($combined =~ /\b(?:nh[- ]?oct|oct|fundus|makula|macula|retina|netzhaut|fovea|fag|fla|angiograph\w*|pe[- ]?verklumpung|cotton[\s-]wool|fleckblutung\w*|pr[äa]retinal\w*|subretinal\w*|intraretinal\w*)\b/i) {
-        $is_retina = 1;
-    }
-    # B. Suche im Gesamtbericht
-    elsif (defined $full_report && length($full_report)) {
-        my $quoted = quotemeta($term);
-
-        # B1. Direkter Match des Begriffs in einer Netzhaut/FAG-Sektion oder im gleichen Satz wie Netzhautbefunde
-        if ($full_report =~ /$retina_sections[^\n\r]*$quoted/i
-            || $full_report =~ /[^.\n\r]*$retina_context_words[^.\n\r]*$quoted/i
-            || $full_report =~ /$quoted[^.\n\r]*$retina_context_words/i) {
-            $is_retina = 1;
-        }
-        else {
-            # B2. FOR-SCHLEIFE (WICHTIG für englische canonical_terms wie "Glial scarring"):
-            # Prüfe die signifikanten deutschen Wörter aus dem Originaltext ($local_context)
-            my @test_words = grep { length($_) >= 4 && $_ !~ /^(?:kein|ohne|links|rechts|auge|grad|beidseits)$/i } split(/[^\p{L}\p{N}]+/, lc($local_context // ''));
-            for my $w (@test_words) {
-                my $qw = quotemeta($w);
-                if ($full_report =~ /$retina_sections[^\n\r]*$qw/i
-                    || $full_report =~ /[^.\n\r]*$retina_context_words[^.\n\r]*$qw/i
-                    || $full_report =~ /$qw[^.\n\r]*$retina_context_words/i) {
-                    $is_retina = 1;
-                    last;
-                }
-            }
-        }
-    }
-
-    # C. Ophthalmo-Sicherheitsnetz:
-    # "Neovaskularisation" im Augenbericht ist IMMER retinal, solange NICHT die Hornhaut genannt ist:
-    if ($term =~ /\b(?:neovaskularisation|neovascularization|neovask)\b/i && $combined !~ /\b(?:cornea|hornhaut|limbus|pannus)\b/i) {
-        $is_retina = 1;
-    }
-
-    if ($is_retina) {
-        # -------------------------------------------------------------
-        # GLIOSE-ENRICHMENT (DEUTSCH & ENGLISCH)
-        # -------------------------------------------------------------
-        if ($combined =~ /\b(?:glios\w*|glial\s*scarring)\b/i) {
-            # Bei Traktion, Makulapucker oder explizit epiretinaler Lage:
-            if ($combined =~ /\b(?:traktion|traction|epiretinal|pucker|makula|macula|fovea)\b/i) {
-                return "epiretinal membrane"; # HP:0100014 (Epiretinale Gliose / Membran)
-            }
-            # Bei dezentem oder isoliertem Befund im NH-OCT / Fundus:
-            return "retinal gliosis";         # HP:6001301 (Retinale Gliose statt ZNS-Gliose!)
-        }
-        if ($combined =~ /\b(?:cnv|chorioid\w*\s+neovask\w*|choroidal\s+neovasc\w*)\b/i) {
-            return "choroidal neovascularization"; # mappt präzise auf HP:0011506
-        }
-        if ($term =~ /\binfiltrat\w*\b/i) {
-            return "retinal infiltrate"; # Mappt auf HP:0031527 statt Keratitis!
-        }
-        # Nur wenn explizit von der Netzhaut ausgehend (z.B. PDR, Venenverschluss):
-        if ($combined =~ /\b(?:retinale\s+neovask\w*|retinal\s+neovasc\w*|rnv)\b/i) {
-            return "retinal neovascularization";   # mappt auf HP:0030666
-        }
-        # Verhindert Fehlmapping auf "Corneal scarring" (HP:0000559)
-        if ($term =~ /\b(?:zentrale\s+)?narbe\b/i && $term !~ /\b(?:cornea|hornhaut)\b/i) {
-            return "chorioretinal macular scar";
-        }
-
-        if ($term =~ /^(?:effusion|exudation|exsudation)$/i) {
-            return "retinal exudate";
-        }
-        if ($term =~ /\b(?:effusion|exsudation|exudation)\b/i && $term !~ /\b(?:retina|macula|retinal|macular)\b/i) {
-            return "macular exudate";
-        }
-        if ($term =~ /\b(?:kristallin\w*|crystalline)\b/i) {
-            return "retinal refractile deposits";
-        }
-        # ZUERST subretinale Flüssigkeit (SRF) abfangen:
-        if ($term =~ /\b(?:subretinal\w*\s+fl[üu]ssigkeit|subretinal\s+fluid|srf)\b/i) {
-            return "subretinal fluid";
-        }
-
-        # 2. Erst danach intraretinale Flüssigkeit (IRF) / allgemeines Netzhautödem:
-        if ($term =~ /\b(?:intraretinale\s+fl[üu]ssigkeit|fl[üu]ssigkeit|ödem)\b/i && $term !~ /\bcornea\b/i && $term !~ /\bsubretin/i) {
-            return "retinal edema intraretinal fluid";
-        }
-
-        if ($term =~ /\b(?:blutung(?:en)?|bleeding|hemorrhage)\b/i && $term !~ /\bnachblutung\b/i) {
-            return "retinal hemorrhage";
-        }
-
-        # Retinale Mikroaneurysmen
-        if ($term =~ /\bmikroaneurysm\w*\b/i) {
-            return "retinal microaneurysm";
-        }
-        if ($term =~ /\bauflockerung\b/i) {
-            return "retinal pigment epithelium alteration";
-        }
-        if ($term =~ /\b(?:temporal\w*|nasal\w*|periphere?)\s+(?:retinal\s+)?atroph\w*/i
-            || $term =~ /\batrophieareal\w*\b/i) {
-            return "chorioretinal atrophy";
-        }
-
-        # A. Explizite Netzhautblutung:
-        if ($term =~ /\b(?:netzhaut|retina|fundus)\w*\s*blutung\b|\bretinal\s+(?:hemorrhage|bleeding)\b/i) {
-            return "retinal hemorrhage";
-        }
-
-        # B. Glaskörperblutung oder isoliertes "keine Blutung":
-        if ($term =~ /\b(?:glask[öo]rper|gk|vitre\w*)\s*blutung\b|\bvitreous\s+(?:hemorrhage|bleeding)\b/i
-            || ($term =~ /\b(?:blutung(?:en)?|bleeding|hemorrhage)\b/i && $term !~ /\bnachblutung\b/i)) {
-            return "vitreous hemorrhage";
-        }
-
-        if ($term =~ /\b(?:temporal\w*|nasal\w*|periphere?|generalisierte?|diffuse?|generalized|diffuse)\s+(?:retinal\s+)?atroph\w*/i
-            || $term =~ /\batrophieareal\w*\b/i
-            || $term =~ /^(?:atrophie|atrophy)$/i) {
-            return "chorioretinal atrophy";
-        }
-        if ($term =~ /\bdurchgreifend\w*\s*(?:defekt\w*|foramen)?\b/i || $combined =~ /\bfull[- ]?thickness\b/i) {
-            if ($combined =~ /\b(?:peripher\w*|äquator\w*|foramen)\b/i && $combined !~ /\bmakula|fovea\b/i) {
-                return "Retinal hole"; # HP:0011530 / ICD-10 H33.3
-            }
-            return "Macular hole";     # HP:0000603 / ICD-10 H35.3 (FTMH)
-        }
-
-        if ($term =~ /\b(?:gef[äa][ßs]verschluss|vascular\s*occlusion|verschluss)\b/i && $term !~ /\b(?:retin\w*|netzhaut|ast|zentral)\b/i) {
-            return "retinal vascular occlusion";
-        }
-
-        if ($term =~ /\bproliferation\w*\b/i && $term !~ /\b(?:retin\w*|neovask|sea[\s-]*fan)\b/i) {
-            return "retinal neovascularization";
-        }
-        if ($term =~ /^(?:zentrale\s+|alte\s+|pigmentierte\s+)?narbe$/i || $term =~ /^(?:scar|retinal\s+scar)$/i) {
-            return "chorioretinale Narbe"; # Mappt deterministisch auf ICD-10 H31.0
-        }
-        if ($term =~ /\b(?:postentz[üu]ndliche?\s+)?fibros\w*\b/i || $term =~ /\bpost[\s-]*inflammatory\s*fibrosis\b/i) {
-            return "chorioretinal scar"; # Mappt deterministisch auf HP:0007777 und ICD-10 H31.0
-        }
-
-        #  Neovaskularisation im Netzhaut/FAG-Bereich vor Hornhaut-Fehlmatch schützen:
-        if ($term =~ /\b(?:neovaskularisation|neovascularization|neovask)\b/i && $term !~ /\bcornea\b/i) {
-            return "retinal neovascularization"; # Mappt auf HP:0007799 statt HP:0011496!
-        }
-
-        #  Exsudate differenzieren:
-        if ($term =~ /\b(?:effusion|exsudat\w*|exudat\w*)\b/i) {
-            # Wenn Makula/Fovea/Zentrum explizit erwähnt -> Macular exudate
-            if ($combined =~ /\b(?:makula|macula|fovea|zentrum)\b/i) {
-                return "macular exudate"; # HP:0030496
-            }
-            # Ansonsten (Peripherie, Uhrzeiten wie 5 Uhr, FAG) -> Retinal exudate
-            return "retinal exudate";     # HP:0000488
-        }
-        # In sub enrich_term_with_section_context (Bereich: if ($is_retina))
-        if ($term =~ /\b(?:zentrale\s+|alte\s+|pigmentierte\s+)?narbe\w*\b/i && $term !~ /\b(?:cornea|hornhaut)\b/i) {
-            return "chorioretinal macular scar"; # Mappt deterministisch auf HP:0007777 / ICD-10 H31.0
-        }
-    }
-
     # ---------------------------------------------------------------------
-    # 2. PRÜFEN: STAMMT DER BEGRIFF AUS VORDERABSCHNITT / BINDEHAUT / VAA?
+    # A. VORAB-ERKENNUNG: STAMMT DER BEGRIFF AUS VAA / BINDEHAUT / LID / WUNDE?
     # ---------------------------------------------------------------------
     my $is_vaa = 0;
-    if ($combined =~ /\b(?:vaa|vorderabschnitt|spaltlampe|hornhaut|cornea|bindehaut|conjunctiv\w*|lid|skler\w*)\b/i) {
+    my $vaa_sections = qr/(?:vaa|vorderabschnitt|spaltlampe|hornhaut|cornea|bindehaut|conjunctiv\w*|lid|unterlid|oberlid|kanthus|tarsus|orbicularis|skler\w*|vorderkammer|wund\w*|naht|f[äa]den)/i;
+
+    if ($combined =~ /\b$vaa_sections\b/i) {
         $is_vaa = 1;
     } elsif (defined $full_report && length($full_report)) {
-        my $quoted = quotemeta($term);
-        if ($full_report =~ /(?:vaa|vorderabschnitt|spaltlampe|bindehaut|conjunctiv)[^\n\r]*$quoted/i) {
+        my $target = (defined $local_context && length($local_context) > 2) ? quotemeta($local_context) : quotemeta($term);
+        if ($full_report =~ /(?:vaa|vorderabschnitt|spaltlampe|bindehaut|conjunctiv|lid|hornhaut|cornea)[^\n\r]*$target/i) {
             $is_vaa = 1;
         }
     }
 
+    # ---------------------------------------------------------------------
+    # B. VORAB-ERKENNUNG: STAMMT DER BEGRIFF AUS NETZHAUT / MAKULA / OCT / FAG?
+    # ---------------------------------------------------------------------
+    my $is_retina = 0;
+    my $retina_sections = qr/(?:nh[- ]?oct|oct|fundus|makula|macula|retina|netzhaut|fovea|fag|fla|angio)/i;
+    my $retina_context_words = qr/(?:fag|cotton[\s-]wool|fleckblutung\w*|uhr\b|netzhaut|retina|gef[äa][ßs]anomalie|drusen)/i;
+
+    # Schutz: Wenn ein Befund aus VAA/Lid/Wunde stammt, darf er NICHT zur Netzhaut werden,
+    # es sei denn, im Kriterium selbst steht explizit Netzhaut/Fundus/Makula/OCT.
+    if (!$is_vaa || $combined =~ /\b(?:fundus|retina|netzhaut|makula|macula|fovea|oct|fag)\b/i) {
+        if ($combined =~ /\b(?:nh[- ]?oct|oct|fundus|makula|macula|retina|netzhaut|fovea|fag|fla|angiograph\w*|pe[- ]?verklumpung|cotton[\s-]wool|fleckblutung\w*|pr[äa]retinal\w*|subretinal\w*|intraretinal\w*)\b/i) {
+            $is_retina = 1;
+        }
+        elsif (defined $full_report && length($full_report)) {
+            my $quoted = quotemeta($term);
+
+            if ($full_report =~ /$retina_sections[^\n\r]*$quoted/i
+                || $full_report =~ /[^.\n\r]*$retina_context_words[^.\n\r]*$quoted/i
+                || $full_report =~ /$quoted[^.\n\r]*$retina_context_words/i) {
+                $is_retina = 1;
+            }
+            else {
+                # Signifikante Wörter aus dem Originaltext prüfen
+                my @test_words = grep { length($_) >= 4 && $_ !~ /^(?:kein|ohne|links|rechts|auge|grad|beidseits)$/i } split(/[^\p{L}\p{N}]+/, lc($local_context // ''));
+                for my $w (@test_words) {
+                    my $qw = quotemeta($w);
+                    if ($full_report =~ /$retina_sections[^\n\r]*$qw/i
+                        || $full_report =~ /[^.\n\r]*$retina_context_words[^.\n\r]*$qw/i
+                        || $full_report =~ /$qw[^.\n\r]*$retina_context_words/i) {
+                        $is_retina = 1;
+                        last;
+                    }
+                }
+            }
+        }
+
+        # Ophthalmo-Sicherheitsnetz:
+        # "Neovaskularisation" im Augenbericht ist IMMER retinal, solange NICHT die Hornhaut/Limbus genannt ist:
+        if ($term =~ /\b(?:neovaskularisation|neovascularization|neovask)\b/i && $combined !~ /\b(?:cornea|hornhaut|limbus|pannus)\b/i) {
+            $is_retina = 1;
+        }
+    }
+
+    # ---------------------------------------------------------------------
+    # 1. AUSWERTUNG: VORDERABSCHNITT / BINDEHAUT / LID / WUNDE (VAA)
+    # ---------------------------------------------------------------------
     if ($is_vaa) {
+        # -------------------------------------------------------------
+        #  ÜBEREFFEKT (PTOSIS, EKTROPIUM, ENTROPIUM)
+        # -------------------------------------------------------------
+        if ($term =~ /\b[üu]bereffekt\b/i || $combined =~ /\b[üu]bereffekt\b/i) {
+            # 1. Entropium-Kontext: Überkorrektur klappt das Lid nach außen -> Ektropium
+            if ($combined =~ /\bentropi\w*\b/i
+                || (defined $full_report && $full_report =~ /\bentropi\w*\b/i && $full_report !~ /\be[kx]tropi\w*\b/i)) {
+                return "ectropion";
+            }
+
+            # 2. Ektropium-Kontext: Überkorrektur rollt das Lid nach innen -> Entropium
+            if ($combined =~ /\be[kx]tropi\w*\b/i
+                || (defined $full_report && $full_report =~ /\be[kx]tropi\w*\b/i && $full_report !~ /\bentropi\w*\b/i)) {
+                return "entropion";
+            }
+
+            # 3. Ptosis- / Blepharoplastik- / Standard-Lid-Kontext: Überkorrektur überhebt das Lid -> Lidretraktion
+            if ($combined =~ /\b(?:ptosis|blepharo\w*|levator\w*|oberlid|lid\w*)\b/i
+                || (defined $full_report && $full_report =~ /\b(?:ptosis|blepharo\w*|levator\w*)\b/i)) {
+                return "eyelid retraction";
+            }
+
+            # Fallback für Lid-VAA:
+            return "eyelid retraction";
+        }
+
+        # Wundsekretion / Wundaustritt am Lid (schützt vor "Retinal exudate")
+        if ($term =~ /\b(?:wundsekret\w*|sekret\w*|austritt|wundaustritt)\b/i) {
+            return "eye discharge"; # Mappt deterministisch auf HP:0034427
+        }
+
+        # Schwellung / Ödem am Lid / Periorbital
+        if ($term =~ /\b(?:lidschwellung|lid[öo]dem|periorbital\w*\s+schwellung)\b/i) {
+            return "eyelid edema"; # Mappt auf HP:0100540
+        }
+
+        # Rötung am Lid / Periorbital
+        if ($term =~ /\b(?:periorbital\w*\s+r[öo]tung|lidr[öo]tung|hautr[öo]tung)\b/i) {
+            return "eyelid erythema"; # Mappt auf HP:0040323
+        }
+
+        # Krustenbildung / Wundverkrustung
+        if ($term =~ /\b(?:kruste\w*|verkrust\w*)\b/i) {
+            return "crusted cutaneous lesion"; # Mappt auf HP:0025550
+        }
+
+        # Blutungen im VAA / Lidbereich (schützt vor "Retinal hemorrhage")
+        if ($term =~ /\b(?:temporal\w*\s+)?(?:h[äa]morrhag\w*|blutung\w*|hemorrhage|bleeding)\b/i) {
+            if ($combined =~ /\b(?:lid|unterlid|oberlid|haut|subkutis|wunde)\b/i) {
+                return "eyelid hematoma";
+            }
+            return "subconjunctival hemorrhage";
+        }
+
         # Hornhautnarbe / Fremdkörpernarbe (schützt vor H31.0 Netzhautnarbe)
         if ($term =~ /\bfremdk(?:[öo]|oe|\?)rper[\s\-]*(?:narbe\w*|scar\w*)?\b/i
             || $combined =~ /\bfremdk(?:[öo]|oe|\?)rper[\s\-]*(?:narbe\w*|scar\w*)\b/i) {
-            
-            # Bei ICD-10-Suchanfragen (deutsch) -> Hornhautnarbe (H17)
-            # Bei HPO-Suchanfragen (englisch) -> corneal scar (HP:0000559)
             return "corneal foreign body scar";
         }
         if ($term =~ /\b(?:parazentrale\s+|zentrale\s+|alte\s+)?narbe\b/i && $term !~ /\b(?:retina|makula|aderhaut)\b/i) {
             return "corneal scar";
         }
-        # Bindehautblutung / Hyposphagma (auch "temporal hämorrhagisch" im VAA)
-        if ($term =~ /\b(?:temporal\w*\s+)?(?:h[äa]morrhag\w*|blutung\w*|hemorrhage|bleeding)\b/i) {
-            return "subconjunctival hemorrhage";
+        if ($term =~ /^(?:alte\s+|parazentrale\s+|zentrale\s+)?narbe$/i || $term =~ /^(?:corneal\s+scar|scar)$/i) {
+            return "Hornhautnarbe"; # ICD-10 H17.9
+        }
+        if ($term =~ /\b(?:postentz[üu]ndliche?\s+)?fibros\w*\b/i || $term =~ /\bpost[\s-]*inflammatory\s*fibrosis\b/i) {
+            return "corneal scar"; # HP:0000559 und ICD-10 H17.9
+        }
+
+        # Infiltrat im Hornhautbereich
+        if ($term =~ /\binfiltrat\w*\b/i) {
+            return "corneal infiltrate";
         }
 
         # Pigmentierungen im Lid-/VAA-Bereich schützen
         if ($term =~ /\b(?:lidpigment\w*|pigmentierung\s*am\s*unterlid)\b/i) {
             return "eyelid hyperpigmentation";
         }
+
+        # Hornhautperforation
         if ($term =~ /\bdurchgreifend\w*\s*defekt\w*\b/i) {
             return "Corneal perforation"; # HP:0000558
         }
-        if ($term =~ /^(?:alte\s+|parazentrale\s+|zentrale\s+)?narbe$/i || $term =~ /^(?:corneal\s+scar|scar)$/i) {
-            return "Hornhautnarbe"; # Mappt deterministisch auf ICD-10 H17.9
-        }
-        if ($term =~ /\b(?:postentz[üu]ndliche?\s+)?fibros\w*\b/i || $term =~ /\bpost[\s-]*inflammatory\s*fibrosis\b/i) {
-            return "corneal scar";       # Mappt deterministisch auf HP:0000559 und ICD-10 H17.9
-        }
+
+        # Fadengranulom
         if ($term =~ /\bfadengranulom\w*\b/i || $term =~ /\bsuture\s*granuloma\b/i) {
             if ($combined =~ /\b(?:hornhaut|cornea|transplantat)\b/i) {
-                return "corneal suture granuloma";      # Führt zu ICD-10 H18.8
+                return "corneal suture granuloma";      # ICD-10 H18.8
             } elsif ($combined =~ /\b(?:lid|unterlid|oberlid)\b/i) {
-                return "eyelid suture granuloma";       # Führt zu ICD-10 H02.8
+                return "eyelid suture granuloma";       # ICD-10 H02.8
             } else {
-                return "conjunctival suture granuloma"; # Führt zu ICD-10 H11.8 (Standard im VAA)
+                return "conjunctival suture granuloma"; # ICD-10 H11.8
             }
         }
-        # Verhindert, dass eine Transplantat-Dehiszenz der Hornhaut zum Netzhautriss wird:
+
+        # Hornhaut-Transplantat Dehiszenz
         if ($term =~ /\b(?:dehiszenz|dehiscence|abhebung|teilabhebung|stufenbildung)\b/i) {
             return "corneal graft detachment";
         }
-        
-        # In sub enrich_term_with_section_context unter Vorderabschnitt / Hornhaut:
+
+        # Keratitis superficialis punctata
+        if ($term =~ /\b(?:unruhig\w*\s+hornhaut|unruhiges?\s+epithel|epithel\s+unruhig)\b/i) {
+            return "superficial punctate keratitis"; # HP:0011859
+        }
+
+        # Hornhautfäden
         if ($term =~ /\b(?:hornhaut[- ]?f[äa]den|corneal\s+sutures?)\b/i || $combined =~ /\b(?:hornhaut[- ]?f[äa]den|corneal\s+sutures?)\b/i) {
-            return "History of ocular surgery"; # Führt deterministisch zu HP:6001448
+            return "History of ocular surgery"; # HP:6001448
+        }
+        if ($combined =~ /\b(?:rectus|obliquus|augenmuskel|musculus|m\.\s*rectus)\b/i) {
+            if ($term =~ /\b(?:verdickung|hypertrophi\w*|schwellung|ödem)\b/i) {
+                return "extraocular muscle hypertrophy";
+            }
         }
     }
 
+    # ---------------------------------------------------------------------
+    # 2. AUSWERTUNG: NETZHAUT / MAKULA / OCT / FAG (RETINA)
+    # ---------------------------------------------------------------------
+    if ($is_retina) {
+        # Gliose
+        if ($combined =~ /\b(?:glios\w*|glial\s*scarring)\b/i) {
+            if ($combined =~ /\b(?:traktion|traction|epiretinal|pucker|makula|macula|fovea)\b/i) {
+                return "epiretinal membrane";
+            }
+            return "retinal gliosis";
+        }
+
+        # CNV
+        if ($combined =~ /\b(?:cnv|chorioid\w*\s+neovask\w*|choroidal\s+neovasc\w*)\b/i) {
+            return "choroidal neovascularization";
+        }
+
+        # Infiltrat
+        if ($term =~ /\binfiltrat\w*\b/i) {
+            if ($combined =~ /\b(?:hornhaut|cornea|transplantat|graft|pkp|kerat\w*|vaa|spaltlampe|stroma|endothel|epithel)\b/i
+                || $term =~ /\b(?:hornhaut|cornea|transplantat)\b/i) {
+                return "corneal infiltrate";
+            }
+            return "retinal infiltrate";
+        }
+
+        # Retinale Neovaskularisation
+        if ($combined =~ /\b(?:retinale\s+neovask\w*|retinal\s+neovasc\w*|rnv)\b/i) {
+            return "retinal neovascularization";
+        }
+        if ($term =~ /\b(?:neovaskularisation|neovascularization|neovask)\b/i && $term !~ /\bcornea\b/i) {
+            return "retinal neovascularization";
+        }
+        if ($term =~ /\bproliferation\w*\b/i && $term !~ /\b(?:retin\w*|neovask|sea[\s-]*fan)\b/i) {
+            return "retinal neovascularization";
+        }
+
+        # Narben (inkl. Narbenbildung)
+        if ($term =~ /\b(?:zentrale\s+|alte\s+|pigmentierte\s+)?narbe\w*\b/i && $combined !~ /\b(?:cornea|hornhaut|lid|bindehaut)\b/i) {
+            return "chorioretinal macular scar";
+        }
+        if ($term =~ /^(?:scar|retinal\s+scar)$/i) {
+            return "chorioretinale Narbe";
+        }
+        if ($term =~ /\b(?:postentz[üu]ndliche?\s+)?fibros\w*\b/i || $term =~ /\bpost[\s-]*inflammatory\s*fibrosis\b/i) {
+            return "chorioretinal scar";
+        }
+
+        # Flüssigkeit & Ödem
+        if ($term =~ /\b(?:subretinal\w*\s+fl[üu]ssigkeit|subretinal\s+fluid|srf)\b/i) {
+            return "subretinal fluid";
+        }
+        if ($term =~ /\b(?:intraretinale\s+fl[üu]ssigkeit|fl[üu]ssigkeit|ödem)\b/i && $term !~ /\bcornea\b/i && $term !~ /\bsubretin/i) {
+            return "retinal edema intraretinal fluid";
+        }
+
+        # Exsudate
+        if ($term =~ /\b(?:effusion|exsudat\w*|exudat\w*)\b/i) {
+            if ($combined =~ /\b(?:makula|macula|fovea|zentrum)\b/i) {
+                return "macular exudate";
+            }
+            return "retinal exudate";
+        }
+        if ($term =~ /\b(?:kristallin\w*|crystalline)\b/i) {
+            return "retinal refractile deposits";
+        }
+
+        # Papillenrandblutung
+        if ($term =~ /\b(?:papillenrand|papillen|dis[ck]|optic\s*disc)\w*\s*(?:rand)?blutung\b/i
+            || $combined =~ /\b(?:papillenrand|optic\s*disc\s*margin)\s*blutung\b/i) {
+            return "optic disc hemorrhage";
+        }
+
+        # Blutungen im Netzhaut/Glaskörperbereich
+        if ($term =~ /\b(?:glask[öo]rper|gk|vitre\w*)\s*blutung\b|\bvitreous\s+(?:hemorrhage|bleeding)\b/i) {
+            return "vitreous hemorrhage";
+        }
+        if ($term =~ /\b(?:netzhaut|retina|fundus)\w*\s*blutung\b|\bretinal\s+(?:hemorrhage|bleeding)\b/i
+            || ($term =~ /\b(?:blutung(?:en)?|bleeding|hemorrhage)\b/i && $term !~ /\bnachblutung\b/i)) {
+            return "retinal hemorrhage";
+        }
+
+        # Mikroaneurysmen & RPE-Veränderungen
+        if ($term =~ /\bmikroaneurysm\w*\b/i) {
+            return "retinal microaneurysm";
+        }
+        if ($term =~ /\bauflockerung\b/i) {
+            return "retinal pigment epithelium alteration";
+        }
+
+        # Atrophiekonus (Peripapilläre Atrophie)
+        if ($term =~ /\batrophiekonus\b/i) {
+            return "chorioretinal atrophy concentrated around the optic papilla";
+        }
+
+        # Chorioretinale Atrophie
+        if ($term =~ /\b(?:temporal\w*|nasal\w*|periphere?|generalisierte?|diffuse?|generalized|diffuse)\s+(?:retinal\s+)?atroph\w*/i
+            || $term =~ /\batrophieareal\w*\b/i
+            || $term =~ /^(?:atrophie|atrophy)$/i) {
+            return "chorioretinal atrophy";
+        }
+
+        # Foramen / Defekt
+        if ($term =~ /\bdurchgreifend\w*\s*(?:defekt\w*|foramen)?\b/i || $combined =~ /\bfull[- ]?thickness\b/i) {
+            if ($combined =~ /\b(?:peripher\w*|äquator\w*|foramen)\b/i && $combined !~ /\b(?:makula|fovea)\b/i) {
+                return "Retinal hole";
+            }
+            return "Macular hole";
+        }
+
+        # Gefäßverschluss
+        if ($term =~ /\b(?:gef[äa][ßs]verschluss|vascular\s*occlusion|verschluss)\b/i && $term !~ /\b(?:retin\w*|netzhaut|ast|zentral)\b/i) {
+            return "retinal vascular occlusion";
+        }
+    }
+
+    # ---------------------------------------------------------------------
+    # 3. AUSWERTUNG: NÄVUS (LOKALISATIONSSPEZIFISCH)
+    # ---------------------------------------------------------------------
     my $is_nevus = ($combined =~ /\b(?:n[äa]vus|nevi|nevus)\b/i) ? 1 : 0;
 
     if ($is_nevus) {
-        # 1. Fall: Stammt aus Netzhaut / Fundus / Makula / OCT
         if ($is_retina || $combined =~ /\b(?:mittelperipher|papillennah|hinterpol|peripher|fundus|retina|aderhaut|choroid)\b/i) {
-            return "choroidal nevus"; # Führt zu ICD-10 D31.3 und HP:0025314
+            return "choroidal nevus";
         }
-
-        # 2. Fall: Stammt aus VAA / Spaltlampe
         if ($is_vaa) {
-            # A. Iris / Regenbogenhaut
             if ($combined =~ /\b(?:iris|regenbogenhaut|pupill\w*|stroma)\b/i) {
-                return "iris nevus"; # Führt zu ICD-10 D31.4 und HP:0011525
+                return "iris nevus";
             }
-            # B. Lid / Kanthus / Tränenkarunkel
             if ($combined =~ /\b(?:lid|unterlid|oberlid|lidrand|lidkante|kanthus)\b/i) {
-                return "eyelid melanocytic nevus"; # Führt zu ICD-10 D22.1 und HP:0000995
+                return "eyelid melanocytic nevus";
             }
-            # C. Bindehaut / Limbus
             if ($combined =~ /\b(?:bindehaut|konjunktiv\w*|limbus|skler\w*)\b/i) {
-                return "conjunctival nevus"; # Führt zu ICD-10 D31.0
+                return "conjunctival nevus";
             }
         }
     }
 
+    # ---------------------------------------------------------------------
+    # 4. AUSWERTUNG: VERKLEBUNGEN / SYNECHIEN
+    # ---------------------------------------------------------------------
     if ($term =~ /\bverkleb\w*\b/i || $combined =~ /\bverkleb\w*\b/i) {
-        # Fall A: Iris / Pupille -> Synechien
         if ($combined =~ /\b(?:iris|pupill\w*|hintere|vordere|linse|kapsel)\b/i) {
-            return "iris synechiae"; # Mappt auf HP:0001093
-        }
-        # Fall B: Bindehaut / Trauma / Verätzung -> Symblepharon
-        elsif ($combined =~ /\b(?:symblepharon|fornix|bulbusbindehaut|tarsal)\b/i) {
-            return "symblepharon";   # Mappt auf HP:0000561
-        }
-        # Fall C (Standard bei Blepharitis / Sicca / Beschwerden): Verklebte Lider / Sekret
-        else {
+            return "iris synechiae";
+        } elsif ($combined =~ /\b(?:symblepharon|fornix|bulbusbindehaut|tarsal)\b/i) {
+            return "symblepharon";
+        } else {
             return "eyelid crusting";
+        }
+    }
+
+    # ---------------------------------------------------------------------
+    # 5. AUSWERTUNG: GESICHTSFELD / PERIMETRIE
+    # ---------------------------------------------------------------------
+    if ($combined =~ /\b(?:gf\b|perimetr\w*|gesichtsfeld|bjerrum|octopus|humphrey)\b/i) {
+        if ($term =~ /\b(?:nasal|inferior|superior|temporal|bogenskotom|skotom|ausfall|sensibilit[äa]tsminderung)\b/i) {
+            if ($term =~ /\b(?:bjerrum|bogen)\b/i) {
+                return "arcuate scotoma";
+            }
+            if ($term =~ /\bnasal\b/i) {
+                return "nasal step visual field defect"; # HP:0012513
+            }
+            if ($term =~ /\bsensibilit[äa]tsminderung\b/i) {
+                return "visual field loss";
+            }
+            if ($term =~ /\bperipher\w*\s*defekt\w*\b/i) {
+                return "peripheral visual field loss";
+            }
+            return "visual field defect";
+        }
+    }
+    if ($combined =~ /\b(?:gf\b|perimetr\w*|gesichtsfeld|octopus|humphrey)\b/i) {
+        # Wenn im Gesamtbericht oder Kriterium Dermatochalasis / Ptosis vorherrscht und "oben" steht:
+        if ($term =~ /\b(?:oben|superior)\b/i && ($combined =~ /\b(?:dermatochalasis|ptosis|oberlid)\b/i || (defined $full_report && $full_report =~ /dermatochalasis/i))) {
+            return "constriction of peripheral visual field"; # Zielt auf HP:0030528 / HP:0001123 ab
+        }
+        if ($term =~ /\b(?:bjerrum|bogen)\b/i) {
+            return "arcuate scotoma";
+        }
+        if ($term =~ /\bnasal\b/i) {
+            return "nasal step visual field defect";
+        }
+        return "visual field defect"; # Fallback auf HP:0001123
+    }
+    # ---------------------------------------------------------------------
+    # 6. AUSWERTUNG: OCT-SEKTOREN (T, TI, TS, N, NS, NI)
+    # ---------------------------------------------------------------------
+    if ($combined =~ /\b(?:oct|bmo|rnfl|gcl|ganglien\w*)\b/i) {
+        if ($term =~ /\b(?:t|ti|ts|ns|ni|n)[\s\-_]?grenzwertig\b/i) {
+            return "borderline retinal nerve fiber layer";
+        }
+        if ($term =~ /\b(?:t|ti|ts|ns|ni|n)[\s\-_]?verd[üu]nnt\b/i || $term =~ /\b(?:temporal|superior|inferior|nasal)verd[üu]nnung\b/i) {
+            return "retinal thinning on OCT";
         }
     }
 
     return $term;
 }
-
 helper map_to_hpo_async => sub {
     my ($self, $term, $is_modifier, $doc_lang) = @_;
     return Mojo::Promise->resolve(undef) unless defined $term && length($term);
@@ -1660,7 +1768,7 @@ sub _extract_vector_dist_str {
 }
 
 # =========================================================================
-# ICD-10 ASYNCHRONOUS MAPPING ENGINE MIT DB-INTERCEPT-VORRANG & CUT-OFF
+# ICD-10 ASYNCHRONOUS MAPPING ENGINE MIT DB-INTERCEPT & ATC-ALLERGIE-FIX
 # =========================================================================
 helper map_to_icd10_async => sub {
     my ($self, $verbatim_term, $canonical_term, $doc_lang) = @_;
@@ -1678,94 +1786,19 @@ helper map_to_icd10_async => sub {
     my $is_allergy = (($verbatim_term =~ /allerg|unvertr|intoler/i) ||
                       (defined $canonical_term && $canonical_term =~ /allerg|unvertr|intoler/i)) ? 1 : 0;
 
-    # Bei Allergien ist der canonical_term oft präziser (z.B. "Allergie gegen Latex"),
-    # bei regulären Diagnosen hat der verbatim_term Vorrang, um LLM-Verwechslungen zu verhindern.
     my $primary_term  = ($is_allergy && defined $canonical_term && length($canonical_term) > 1)
                       ? $canonical_term
                       : $verbatim_term;
     my $fallback_term = ($primary_term eq $verbatim_term) ? $canonical_term : $verbatim_term;
 
-    # 2. DB-Intercepts haben immer 100% Vorrang:
-    # Zuerst Verbatim-Prüfung (verhindert, dass halluzinierte Canonical Terms fälschlich greifen)
-    for my $cand ($verbatim_term, $primary_term, $canonical_term) {
-        next unless defined $cand && length($cand);
-        my $clean = lc(clean_term_for_vector_mapping($cand));
-        if (my $hit = $self->check_database_intercept('icd10', $clean) || $self->check_database_intercept('icd10', $cand)) {
-            $self->app->log->info("[ICD10 DB INTERCEPT] '$cand' -> $hit->{id} ($hit->{label})");
-            return Mojo::Promise->resolve($hit);
-        }
-    }
+    # --- HILFSFUNKTION: ATC-ANREICHERUNG FÜR Z88.8 ALLERGIEN ---
+    my $apply_allergy_atc_override = sub {
+        my ($res) = @_;
+        return Mojo::Promise->resolve($res) unless $res && $res->{id};
 
-    # 3. Sprachnormalisierung & Patchbay-Aufruf vorbereiten
-    my $normalize = sub {
-        my ($t) = @_;
-        return ($doc_lang eq 'de')
-            ? Mojo::Promise->resolve(clean_term_for_vector_mapping($t))
-            : $self->normalize_criterion_for_retrieval_async($t, 'icd10');
-    };
-
-    my $fetch_match = sub {
-        my ($q) = @_;
-        my $call = sub {
-            my $url = "$patchbay_url/LLM/run_stateless/" . LLM_ICD10_RETRIEVAL_PROMPT_ID;
-            my $payload = Encode::encode('UTF-8', $q);
-            return $ua_fast->post_p(
-                $url => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => $payload
-            )->then(sub {
-                my $tx = shift;
-                if ($tx->result && $tx->result->is_success) {
-                    my $body = $tx->result->body;
-                    my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
-                    return $matches->[0] if ref $matches eq 'ARRAY' && @$matches;
-                }
-                return undef;
-            });
-        };
-        return $self->enqueue_patchbay_call($call, $q);
-    };
-
-    # 4. Vektorsuche mit Fallback und Cut-Off-Filterung
-    return $normalize->($primary_term)->then(sub {
-        my $clean_query = shift;
-
-        return $fetch_match->($clean_query)->then(sub {
-            my $top_match = shift;
-            my $sim  = $top_match ? ($top_match->{similarity} // $top_match->{sim}) : 0;
-            my $dist = defined $sim ? (1.0 - $sim) : ($top_match->{distance} // 1.0);
-
-            my $fb_clean = defined $fallback_term ? clean_term_for_vector_mapping($fallback_term) : '';
-
-            # Wenn Primärtreffer ungenau (> 0.035) und Fallback vorhanden ist:
-            if ($dist > 0.035 && length($fb_clean) > 1 && lc($fb_clean) ne lc($clean_query)) {
-                $self->app->log->info("[ICD10 FALLBACK TRIGGERED] Dist $dist > 0.035 für '$clean_query'. Prüfe Fallback: '$fb_clean'");
-
-                return $fetch_match->($fb_clean)->then(sub {
-                    my $fb_match = shift;
-                    if ($fb_match && defined $fb_match->{label}) {
-                        my $fb_sim  = $fb_match->{similarity} // $fb_match->{sim};
-                        my $fb_dist = defined $fb_sim ? (1.0 - $fb_sim) : ($fb_match->{distance} // 1.0);
-
-                        # Fallback erzielt besseren Score als Primärtreffer
-                        if (!defined $top_match || $fb_dist < $dist) {
-                            return $self->_build_icd10_res($fb_match, $fb_clean);
-                        }
-                    }
-                    # Primärtreffer war besser oder Fallback brachte keinen Treffer
-                    return $self->_build_icd10_res($top_match, $clean_query);
-                });
-            }
-
-            return $self->_build_icd10_res($top_match, $clean_query);
-        });
-    })->then(sub {
-        my $res = shift;
-        return $res unless $res && $res->{id};
-
-        # Arzneimittelallergien ohne spezifischen ICD-10-Code mit Z88.8 + ATC abbilden
         if ($is_allergy) {
             my $is_specific_code = ($res->{id} =~ /^ICD10:Z88\.0/i); # Z88.0 = Penicillin hat eigenen Code
 
-            # Unspezifische Codes wie T88.7, T78.4, Z88.8, Z88.9, Z88 abfangen
             my $is_unspecific = (!$is_specific_code) && (
                 $res->{id} =~ /^ICD10:(?:T88|T78|Z88\.8|Z88\.9|Z88$)/i ||
                 $res->{id} =~ /^ICD10:Z88\.[1-9]/i
@@ -1812,8 +1845,81 @@ helper map_to_icd10_async => sub {
                 }
             }
         }
+        return Mojo::Promise->resolve($res);
+    };
 
-        return $res;
+    # 2. DB-Intercepts prüfen (JETZT MIT ATC-ANREICHERUNG BEI ALLERGIEN!)
+    for my $cand ($verbatim_term, $primary_term, $canonical_term) {
+        next unless defined $cand && length($cand);
+        my $clean = lc(clean_term_for_vector_mapping($cand));
+        if (my $hit = $self->check_database_intercept('icd10', $clean) || $self->check_database_intercept('icd10', $cand)) {
+            $self->app->log->info("[ICD10 DB INTERCEPT] '$cand' -> $hit->{id} ($hit->{label})");
+            # Wenn es eine Allergie ist, nicht blind abbrechen, sondern ATC-Code anhängen!
+            return $apply_allergy_atc_override->($hit);
+        }
+    }
+
+    # 3. Sprachnormalisierung & Patchbay-Aufruf vorbereiten
+    my $normalize = sub {
+        my ($t) = @_;
+        return ($doc_lang eq 'de')
+            ? Mojo::Promise->resolve(clean_term_for_vector_mapping($t))
+            : $self->normalize_criterion_for_retrieval_async($t, 'icd10');
+    };
+
+    my $fetch_match = sub {
+        my ($q) = @_;
+        my $call = sub {
+            my $url = "$patchbay_url/LLM/run_stateless/" . LLM_ICD10_RETRIEVAL_PROMPT_ID;
+            my $payload = Encode::encode('UTF-8', $q);
+            return $ua_fast->post_p(
+                $url => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => $payload
+            )->then(sub {
+                my $tx = shift;
+                if ($tx->result && $tx->result->is_success) {
+                    my $body = $tx->result->body;
+                    my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
+                    return $matches->[0] if ref $matches eq 'ARRAY' && @$matches;
+                }
+                return undef;
+            });
+        };
+        return $self->enqueue_patchbay_call($call, $q);
+    };
+
+    # 4. Vektorsuche mit Fallback und abschließender Allergie-Anreicherung
+    return $normalize->($primary_term)->then(sub {
+        my $clean_query = shift;
+
+        return $fetch_match->($clean_query)->then(sub {
+            my $top_match = shift;
+            my $sim  = $top_match ? ($top_match->{similarity} // $top_match->{sim}) : 0;
+            my $dist = defined $sim ? (1.0 - $sim) : ($top_match->{distance} // 1.0);
+
+            my $fb_clean = defined $fallback_term ? clean_term_for_vector_mapping($fallback_term) : '';
+
+            if ($dist > 0.035 && length($fb_clean) > 1 && lc($fb_clean) ne lc($clean_query)) {
+                $self->app->log->info("[ICD10 FALLBACK TRIGGERED] Dist $dist > 0.035 für '$clean_query'. Prüfe Fallback: '$fb_clean'");
+
+                return $fetch_match->($fb_clean)->then(sub {
+                    my $fb_match = shift;
+                    if ($fb_match && defined $fb_match->{label}) {
+                        my $fb_sim  = $fb_match->{similarity} // $fb_match->{sim};
+                        my $fb_dist = defined $fb_sim ? (1.0 - $fb_sim) : ($fb_match->{distance} // 1.0);
+
+                        if (!defined $top_match || $fb_dist < $dist) {
+                            return $self->_build_icd10_res($fb_match, $fb_clean);
+                        }
+                    }
+                    return $self->_build_icd10_res($top_match, $clean_query);
+                });
+            }
+
+            return $self->_build_icd10_res($top_match, $clean_query);
+        });
+    })->then(sub {
+        my $res = shift;
+        return $apply_allergy_atc_override->($res);
     });
 };
 
@@ -1823,7 +1929,7 @@ helper map_to_icd10_async => sub {
 helper _build_icd10_res => sub {
     my ($self, $match, $term, $max_allowed_dist) = @_;
     
-    $max_allowed_dist //= 0.040;
+    $max_allowed_dist //= 0.05;
 
     return undef unless $match && defined $match->{label};
 
@@ -1846,7 +1952,7 @@ helper _build_icd10_res => sub {
     # --- TRAUMA-FILTER (S-Codes) ---
     # S-Codes nur dann abweisen, wenn der Begriff ABSOLUT KEIN Trauma/Verletzung darstellt
     if ($matched_id =~ /^ICD10:S/i) {
-        my $is_trauma_term = ($term =~ /(?:trauma\w*|unfall\w*|verletz\w*|fraktur\w*|\bfx\b|trümmer\w*|luxation\w*|perforat\w*|ruptur\w*|prolaps\w*|h[äa]matom\w*|monokel\w*|ri[ßs]s?\w*|wunde\w*|quetsch\w*|prell\w*|fremdkörper\w*|kontusion\w*|sturz\w*|schnitt\w*|verätzung\w*|verbrennung\w*)/i);
+        my $is_trauma_term = ($term =~ /(?:trauma\w*|unfall\w*|verletz\w*|fraktur\w*|\bfx\b|trümmer\w*|luxation\w*|perforat\w*|ruptur\w*|prolaps\w*|h[äa]matom\w*|monokel\w*|ri[ßs]s?\w*|wunde\w*|quetsch\w*|prell\w*|fremdkörper\w*|kontusion\w*|sturz\w*|schnitt\w*|verätzung\w*|verbrennung\w*|erosio)/i);
 
         unless ($is_trauma_term) {
             $self->app->log->warn("[ICD10 BLOCKED] Trauma-Code $matched_id für nichttraumatischen Begriff '$term' abgewiesen.");
@@ -3091,6 +3197,27 @@ sub prepare_loinc_search_term {
             : "LOINC:100076-9 Right cornea Endothelial cells counted";
     }
 
+    if ($combined_context =~ /\b(?:quick|quick-?wert|thromboplastinzeit)\b/i) {
+        return "LOINC:5902-2 Prothrombin time in Blood by Coagulation assay";
+    }
+    if ($combined_context =~ /\b(?:aptt|ptt)\b/i) {
+        return "LOINC:14979-9 aPTT in Platelet poor plasma";
+    }
+    if ($combined_context =~ /\b(?:bsg|blutsenkung|blutk[öo]rperchensenkung)\b/i) {
+        return "LOINC:30341-2 Erythrocyte sedimentation rate by Westergren";
+    }
+
+    # Schilddrüsenwerte zwingend auf Serum/Plasma festlegen (verhindert DBS Trockenblut!)
+    if ($combined_context =~ /\b(?:ft4|freies\s+t4|free\s+t4|free\s+thyroxine)\b/i) {
+        return "LOINC:14920-3 Thyroxine (T4) free in Serum or Plasma";
+    }
+    if ($combined_context =~ /\b(?:ft3|freies\s+t3|free\s+t3|free\s+triiodothyronine)\b/i) {
+        return "LOINC:14928-6 Triiodothyronine (T3) free in Serum or Plasma";
+    }
+    if ($combined_context =~ /\b(?:tsh|thyrotropin)\b/i && $combined_context !~ /\b(?:rezeptor|trak|rab)\b/i) {
+        return "LOINC:3016-3 Thyrotropin in Serum or Plasma";
+    }
+
     # Bereinigung redundanter Auge-Präfixe
     $clean_term =~ s/^\s*(?:right eye|left eye|study eye|fellow eye|both eyes)\s*//gi;
     $clean_term =~ s/\s*\b(?:in the right eye|in the left eye|in study eye|in fellow eye|in both eyes|in either eye)\b\s*//gi;
@@ -3721,6 +3848,65 @@ helper generate_phenopacket_impl => sub {
             if ($v =~ /\b(?:keinen?\s+h\.?a\.?\s+endokarditis|kein\s+eindeutiger\s+infekt[- ]fokus|kein\s+h\.?a\.?\s+infektfokus)\b/i) {
                 $item->{domain} = 'skip';
             }
+            if (($item->{domain} // '') eq 'ops' && $v =~ /\b(?:iol\s+in\s+loco|iridektomie\s+offen|hinterkapsel\s+eröffnet|transplantat\s+anliegend)\b/i) {
+                $item->{domain} = 'skip';
+            }
+            if ($v =~ /\b(?:absto[ßs]ung\w*|graft\s*rejection\w*|transplantatversagen\w*)\b/i
+                || $c =~ /\b(?:absto[ßs]ung\w*|graft\s*rejection\w*|transplantatversagen\w*)\b/i) {
+                $item->{domain}         = 'icd10';
+                $item->{canonical_term} = 'Hornhauttransplantatabstoßung';
+            }
+            if ($v =~ /\b(?:kein\s+)?versagen\b/i && $c =~ /^(?:versagen|failure)$/i) {
+                $item->{domain}         = 'icd10';
+                $item->{canonical_term} = 'Hornhauttransplantatversagen';
+            }
+            if ($v =~ /\b(?:dehiszenz|teilabhebung|stufenbildung|abhebung|graft\s*detachment)\b/i && $v =~ /\btransplantat\b/i
+                || $c =~ /\b(?:dehiszenz|teilabhebung|stufenbildung|graft\s*detachment)\b/i) {
+                $item->{domain}         = 'icd10';
+                $item->{canonical_term} = 'Hornhauttransplantat-Dehiszenz';
+            }
+            # Spaltlampenbefund "IOL in loco" von OPS nach ICD-10 (Z96.1 Pseudophakie) umlenken:
+            if ($v =~ /\biol\s+in\s+loco\b/i || $c =~ /\biol\s+in\s+loco\b/i) {
+                $item->{domain}         = 'icd10';
+                $item->{canonical_term} = 'Pseudophakie';
+            }
+            if ($item->{domain} eq 'loinc' && $v =~ /\b(?:prothese|augenprothese|enukleation|anophthalm\w*)\b/i) {
+                $item->{domain} = 'skip';
+            }
+            # Atrophiekonus / myoper Konus / peripapilläre Atrophie ist ein HPO-Phänotyp, kein ICD-10!
+            if ($item->{domain} eq 'icd10' && $v =~ /\b(?:atrophiekonus|myoper\s+konus|peripapill[äa]re\s+atrophie)\b/i) {
+                $item->{domain} = 'hpo';
+            }
+            if ($v =~ /\bhinterkapsel\s+(?:eröffnet|gefenstert)\b/i) {
+                # Entweder als Zustand nach Kapsulotomie führen:
+                $item->{canonical_term} = 'Zustand nach Kapsulotomie';
+                $item->{domain} = 'icd10';
+            }
+            if ($v =~ /\bverbandslinse\w*\b/i) {
+                $item->{domain} = 'skip'; # Verhindert absurde chirurgische OPS-Fehlzuordnungen
+            }
+            # Motilitäts- / Bewegungseinschränkungen gehören zu HPO, nicht ICD-10!
+            if ($item->{domain} eq 'icd10' && $v =~ /\b(?:hebung|senkung|abduktion|adduktion|motilit[äa]t)\w*einschr[äa]nkung\b/i
+                || $c =~ /\b(?:abduktions|hebungs|motilit[äa]t)\w*einschr[äa]nkung\b/i) {
+                $item->{domain} = 'hpo';
+            }
+
+            # Lamina papyracea Destruktion / Orbitainvasion zu HPO umlenken
+            if ($item->{domain} eq 'icd10' && $v =~ /\b(?:lamina\s+papyracea|destruktion|knochendestruktion|invasion.*orbita)\b/i) {
+                $item->{domain} = 'hpo' if ($item->{domain} // '') eq 'icd10';
+            }
+            if ($v =~ /\b(?:bindehautinjektion|gefaessinjektion|injektion\s+der\s+bindehaut)\b/i && $v !~ /\b(?:ivom|injektion\s+von|intravitreal)\b/i) {
+                $item->{domain} = 'hpo';
+                $item->{canonical_term} = 'Conjunctival hyperemia';
+            }
+            if ($v =~ /\b(?:schl[äa]fe|stirn|gesicht|haut|periorbital)\b/i && $v =~ /\b(?:sensibilit[äa]t|taubheit|hyp[äa]sthesie)\b/i) {
+                $item->{domain} = 'hpo';
+                $item->{canonical_term} = 'Hypoesthesia';
+            }
+            if (($item->{domain} // '') eq 'atc' && $v =~ /\b(?:pollen|gr[äa]ser|hausstaub|tierhaar|milben|heuschnupfen)\b/i) {
+                $item->{domain} = 'icd10';
+            }
+
         }
 
         @$atomic_items = grep { ($_->{domain} // '') ne 'skip' } @$atomic_items;
@@ -4091,6 +4277,21 @@ helper generate_phenopacket_impl => sub {
 
                 my $context_str = $v_text . " " . ($canon_term // '');
                 my $lat_code    = $self->get_laterality_hpo_object($item_lat, $context_str);
+
+                if ($direct_hit) {
+                    $self->app->log->info("[HPO DB INTERCEPT OVERRIDE] '$canon_term / $v_text' -> $direct_hit->{id} ($direct_hit->{label})");
+                    my @modifiers;
+                    push @modifiers, $lat_code if defined $lat_code;
+                    my $node = {
+                        type      => { id => $direct_hit->{id}, label => $canon_term || $direct_hit->{label} },
+                        modifiers => \@modifiers
+                    };
+                    $node->{excluded} = Mojo::JSON->true if $is_ex;
+                    $node->{onset}    = { timestamp => $item_timestamp } if defined $item_timestamp;
+
+                    push @feature_promises, Mojo::Promise->resolve($node);
+                    next;
+                }
 
                 my $p = $self->map_to_hpo_async($search_term, 0, $doc_lang)->then(sub {
                     my $mapped = shift;
@@ -5219,7 +5420,11 @@ helper execute_safe_cohort_sql => sub {
     my ($self, $sql) = @_;
     my ($out, $err);
 
-    if ($sql !~ /^\s*(?:WITH|SELECT)\b/i) {
+    # Kommentare und Whitespace am Anfang für die Validierung überspringen:
+    my $stripped = $sql;
+    $stripped =~ s/^(?:\s*|\/\*[\s\S]*?\*\/|--[^\n]*\n*)+//g;
+
+    if ($stripped !~ /^(?:WITH|SELECT)\b/i) {
         return (undef, "Sicherheitsfehler: Es sind nur SELECT- und WITH-Abfragen erlaubt.");
     }
 
@@ -5254,6 +5459,7 @@ sub run_cohort_agent_loop {
         model       => $llm_cfg->{model},
         messages    => $messages,
         temperature => 0.0,
+        max_tokens  => 4096,
         tools       => \@pheno_chat_tools
     };
 
@@ -5400,10 +5606,15 @@ post '/BBB/chat/query' => sub {
         my $clean_output = $res->{output} // '';
 
         # 2. Fallback: SQL aus Markdown-Codeblöcken extrahieren, falls nicht als Tool-Call geliefert
-        if (!length($last_sql) && $clean_output =~ /```(?:sql)?\s*(SELECT\b[\s\S]*?|WITH\b[\s\S]*?)\s*```/i) {
-            my $extracted = $1;
-            $extracted =~ s/^\s+|\s+$//g;
-            $last_sql = $extracted;
+        if (!length($last_sql)) {
+            if ($clean_output =~ /```(?:sql)?\s*([\s\S]*?)(?:```|$)/i) {
+                my $candidate_sql = $1;
+                # Prüfen, ob der Block tatsächlich eine SELECT- oder WITH-Query enthält
+                if ($candidate_sql =~ /\b(?:SELECT|WITH)\b/i) {
+                    $candidate_sql =~ s/^\s+|\s+$//g;
+                    $last_sql = $candidate_sql;
+                }
+            }
         }
 
         # 3. SQL ausführen, Fehler sichern & Patienten-Pseudonyme sammeln
@@ -6467,6 +6678,58 @@ get '/BBB/:table/:col/:pk' => [col => qr/[a-z_0-9\s]+/, pk => qr/[a-z0-9\s\-_\.]
     }
 
     $self->render(json => $self->pg->db->select($table, ['*'], {$col => $pk})->hashes->to_array);
+};
+
+# =========================================================
+# ENDPUNKT: KANDIDATEN NACH TAG NEU BERECHNEN (MINION QUEUE)
+# =========================================================
+post '/BBB/candidates/recompute_by_tag' => sub {
+    my $c = shift;
+    my $payload = $c->req->json // {};
+    my $tag            = $payload->{tag};
+    my $selected_model = $payload->{model};
+    my $deep_mode      = $payload->{deep_mode} // 0;
+
+    unless ($tag && length($tag)) {
+        return $c->render(json => { success => 0, error => "Parameter 'tag' ist erforderlich." }, status => 400);
+    }
+
+    $tag =~ s/^\s+|\s+$//g;
+    my $db = $c->pg->db;
+
+    # Alle Kandidaten mit dem Tag laden, die einen Freitextbericht besitzen
+    my $candidates = eval {
+        $db->query(q{
+                        SELECT id, doc_id, pseudonym, narrative_report, reference_date
+                        FROM candidates
+                        WHERE (tags ILIKE ? OR tags ILIKE ? OR tags ILIKE ? OR tags = ?)
+                          AND narrative_report IS NOT NULL
+                          AND TRIM(narrative_report) <> ''
+                        ORDER BY id ASC
+                    }, "%$tag,%", "%, $tag%", "%$tag", $tag)->hashes->to_array;
+    };
+
+    if ($@) {
+        $c->app->log->error("[RECOMPUTE BY TAG ERROR] $@");
+        return $c->render(json => { success => 0, error => "DB Fehler: $@" }, status => 500);
+    }
+
+    my $queued_count = 0;
+    for my $cand (@$candidates) {
+        $c->minion->enqueue(import_and_extract_letter_task => [{
+            candidate_id   => $cand->{id},
+            pseudonym      => $cand->{pseudonym},
+            doc_id         => $cand->{doc_id},
+            text_content   => $cand->{narrative_report},
+            reference_date => $cand->{reference_date},
+            model          => $selected_model,
+            deep_mode      => $deep_mode
+        }]);
+        $queued_count++;
+    }
+
+    $c->app->log->info("[RECOMPUTE BY TAG] $queued_count Kandidaten mit Tag '$tag' zur Neu-Extraktion in Minion eingereiht.");
+    $c->render(json => { success => 1, tag => $tag, queued => $queued_count });
 };
 
 # =========================================================
