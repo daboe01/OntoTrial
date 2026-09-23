@@ -5,6 +5,7 @@
 # TODO: use a BERT model to validate idems after union ensemble (idea)
 # TODO: backport of event date (or use observed date) for PhenoViewer to work properly
 # TODO: support orphacodes
+# todo: intercepts->vectorstore zusätzlich
 
 use utf8;
 use Mojolicious::Lite;
@@ -574,6 +575,8 @@ sub extract_visus_and_refraction {
         $eb_visus = $max_visus;
     }
 
+    my $is_contact_lens = ($raw_text =~ /\b(?:KL|formstabile\s+KL|kontaktlinse)\b/i) ? 1 : 0;
+    
     return {
         visus_value          => $max_visus,
         eb_value             => $eb_visus,
@@ -583,6 +586,7 @@ sub extract_visus_and_refraction {
         cylinder             => $cyl,
         axis                 => $axis,
         spherical_equivalent => $sph_eq,
+        is_contact_lens => $is_contact_lens
     };
 }
 
@@ -604,28 +608,30 @@ sub build_ophthalmic_loinc_measurements {
 
     my @measurements;
 
-    # 1. Visual Acuity (Bestkorrigiert, Eigene Brille oder Unkorrigiert)
-    if (defined $parsed_ref->{visus_value}) {
-        my ($loinc_id, $loinc_label);
-        my @extra_mods;
+    # 1. Visus mit eigener Brille (eB)
+    if (defined $parsed_ref->{eb_value}) {
+        my $loinc_id    = "LOINC:28637-7";
+        my $loinc_label = $is_left  ? "Visual acuity with own glasses Left eye"
+                        : ($is_right ? "Visual acuity with own glasses Right eye" : "Visual acuity with own glasses");
+        my @mods = ({ id => "LP7753-9", label => "Measurement: = $parsed_ref->{eb_value} decimal" });
+        push @mods, { id => "LP7753-9", label => "with own glasses (eB)" };
+        push @mods, $lat_obj if $lat_obj;
 
-        if ($parsed_ref->{is_own_glasses}) {
-            $loinc_id    = "LOINC:28637-7";
-            $loinc_label = $is_left ? "Visual acuity with own glasses Left eye"
-                         : ($is_right ? "Visual acuity with own glasses Right eye" : "Visual acuity with own glasses");
-            push @extra_mods, { id => "LP7753-9", label => "with own glasses (eB)" };
-        } elsif ($parsed_ref->{is_best_corrected}) {
-            $loinc_id    = $is_left ? "LOINC:65897-1" : ($is_right ? "LOINC:65893-0" : "LOINC:28637-7");
-            $loinc_label = $is_left ? "Visual acuity best corrected Left eye"
-                         : ($is_right ? "Visual acuity best corrected Right eye" : "Visual acuity best corrected");
-        } else {
-            $loinc_id    = $is_left ? "LOINC:65896-3" : ($is_right ? "LOINC:65892-2" : "LOINC:28637-7");
-            $loinc_label = $is_left ? "Visual acuity uncorrected Left eye"
-                         : ($is_right ? "Visual acuity uncorrected Right eye" : "Visual acuity uncorrected");
-        }
+        push @measurements, {
+            assay => { id => $loinc_id, label => $loinc_label },
+            value => { quantity => { comparator => '=', value => $parsed_ref->{eb_value}, unit => { label => "decimal" } } },
+            modifiers => \@mods,
+            ($ref_date ? (timeOfCollection => { timestamp => $ref_date }) : ())
+        };
+    }
+
+    # 2. Bestkorrigierter Visus (cc) - separat erfassen, wenn vorhanden und abweichend
+    if (defined $parsed_ref->{visus_value} && (!$parsed_ref->{is_own_glasses} || defined $parsed_ref->{sphere})) {
+        my $loinc_id    = $is_left  ? "LOINC:65897-1" : ($is_right ? "LOINC:65893-0" : "LOINC:28637-7");
+        my $loinc_label = $is_left  ? "Visual acuity best corrected Left eye"
+                        : ($is_right ? "Visual acuity best corrected Right eye" : "Visual acuity best corrected");
 
         my @mods = ({ id => "LP7753-9", label => "Measurement: = $parsed_ref->{visus_value} decimal" });
-        push @mods, @extra_mods;
         push @mods, $lat_obj if $lat_obj;
 
         push @measurements, {
@@ -705,6 +711,7 @@ sub build_ophthalmic_loinc_measurements {
 sub parse_quantitative_constraint {
     my ($text) = @_;
     return undef unless defined $text && $text ne '';
+    return undef if $text =~ /\b(?:n\.?\s*m\.?|nicht\s*messbar|nicht\s*beurteilbar|fehlgeschlagen)\b/i;
 
     # 1. Unicode, Formatierung & deutsches Dezimalkomma normalisieren
     $text =~ s/mm\s*hg/mmHg/gi;
@@ -1061,9 +1068,16 @@ helper format_loinc_id => sub {
     my ($self, $raw_id) = @_;
     return "LOINC:21889-1" unless $raw_id;
     $raw_id =~ s/^\s+//; $raw_id =~ s/\s+$//;
-    if ($raw_id =~ /^loinc:(.+)$/i) { return "LOINC:" . uc($1); }
-    if ($raw_id !~ /^loinc/i) { return "LOINC:" . uc($raw_id); }
-    return uc($raw_id);
+    $raw_id =~ s/^loinc:\s*//i;
+
+    # Lokale Erweiterungscodes tragen ein kleingeschriebenes Suffix
+    # (86290-4a, 86290-4b, 86301-9a, 86301-9b). uc() würde daraus "4A"/"4B"
+    # machen und den Lookup in loinc_terms brechen.
+    if ($raw_id =~ /^(\d+-\d+)([a-zA-Z])$/) {
+        return "LOINC:" . $1 . lc($2);
+    }
+
+    return "LOINC:" . uc($raw_id);
 };
 
 # =========================================================
@@ -1264,7 +1278,10 @@ helper get_domain_intercepts => sub {
     if (!$last_fetch->{$domain} || ($now - $last_fetch->{$domain} > 30)) {
         eval {
             my $rows = $self->pg->db->query(
-                "SELECT pattern, code, label FROM public.ontology_intercepts WHERE domain = ? AND active = TRUE ORDER BY priority ASC, id ASC",
+                "SELECT pattern, code, label, COALESCE(suppress, FALSE) AS suppress
+                   FROM public.ontology_intercepts
+                  WHERE domain = ? AND active = TRUE
+                  ORDER BY priority ASC, id ASC",
                 $domain
             )->hashes->to_array;
             $cache->{$domain} = $rows // [];
@@ -1294,6 +1311,13 @@ helper check_database_intercept => sub {
         }
 
         if ($matched) {
+            # Suppress-Regeln verwerfen den Begriff vollständig. Der Aufrufer
+            # muss auf { suppress => 1 } prüfen und die Zeile fallen lassen,
+            # OHNE auf den Vektor-Retrieval zurückzufallen.
+            if ($rule->{suppress}) {
+                $self->app->log->info("[INTERCEPT SUPPRESS] Domain '$domain': '$text' durch Regel '$rule->{code}' verworfen.");
+                return { suppress => 1, id => undef, label => $rule->{label} };
+            }
             return {
                 id    => $rule->{code},
                 label => $rule->{label}
@@ -1312,6 +1336,23 @@ sub enrich_term_with_section_context {
     return '' unless defined $term && length($term);
 
     my $combined = lc(($local_context // '') . ' ' . $term);
+
+    # ---------------------------------------------------------------------
+    # 0. ECHTE ALLGEMEINCHIRURGISCHE & GASTROENTEROLOGISCHE EINGRIFFE SCHÜTZEN
+    # (Verhindert, dass reale Darmeingriffe in Augenterme umgewandelt werden)
+    # ---------------------------------------------------------------------
+    if ($combined =~ /\bh[äa]moclip\b/i) {
+        # Verhindert Hämofiltration/Dialyse-Drift und zielt auf endoskopische GI-Blutstillung
+        return "Endoskopische Blutstillung Gastrointestinaltrakt Clip";
+    }
+    if ($combined =~ /\bkapselendoskop\w*\b/i) {
+        # Echte Kapselendoskopie des Magen-Darm-Traktes explizit beibehalten
+        return "Kapselendoskopie Dünndarm";
+    }
+    if ($combined =~ /\b(?:hemikolektomie|kolektomie|appendektomie|cholezystektomie|koloskopie|gastroskopie|ileostoma|laparotomie|laparoskopie)\b/i) {
+        # Reale Darm- und Abdomeneingriffe unverändert durchlassen
+        return $term;
+    }
 
     # ---------------------------------------------------------------------
     # A. VORAB-ERKENNUNG: STAMMT DER BEGRIFF AUS VAA / BINDEHAUT / LID / WUNDE?
@@ -1335,8 +1376,7 @@ sub enrich_term_with_section_context {
     my $retina_sections = qr/(?:nh[- ]?oct|oct|fundus|makula|macula|retina|netzhaut|fovea|fag|fla|angio)/i;
     my $retina_context_words = qr/(?:fag|cotton[\s-]wool|fleckblutung\w*|uhr\b|netzhaut|retina|gef[äa][ßs]anomalie|drusen)/i;
 
-    # Schutz: Wenn ein Befund aus VAA/Lid/Wunde stammt, darf er NICHT zur Netzhaut werden,
-    # es sei denn, im Kriterium selbst steht explizit Netzhaut/Fundus/Makula/OCT.
+    # Schutz: Wenn aus VAA/Lid, nicht zur Netzhaut machen, außer explizit genannt
     if (!$is_vaa || $combined =~ /\b(?:fundus|retina|netzhaut|makula|macula|fovea|oct|fag)\b/i) {
         if ($combined =~ /\b(?:nh[- ]?oct|oct|fundus|makula|macula|retina|netzhaut|fovea|fag|fla|angiograph\w*|pe[- ]?verklumpung|cotton[\s-]wool|fleckblutung\w*|pr[äa]retinal\w*|subretinal\w*|intraretinal\w*)\b/i) {
             $is_retina = 1;
@@ -1350,7 +1390,6 @@ sub enrich_term_with_section_context {
                 $is_retina = 1;
             }
             else {
-                # Signifikante Wörter aus dem Originaltext prüfen
                 my @test_words = grep { length($_) >= 4 && $_ !~ /^(?:kein|ohne|links|rechts|auge|grad|beidseits)$/i } split(/[^\p{L}\p{N}]+/, lc($local_context // ''));
                 for my $w (@test_words) {
                     my $qw = quotemeta($w);
@@ -1364,11 +1403,165 @@ sub enrich_term_with_section_context {
             }
         }
 
-        # Ophthalmo-Sicherheitsnetz:
-        # "Neovaskularisation" im Augenbericht ist IMMER retinal, solange NICHT die Hornhaut/Limbus genannt ist:
+        # Ophthalmo-Sicherheitsnetz für Neovaskularisationen
         if ($term =~ /\b(?:neovaskularisation|neovascularization|neovask)\b/i && $combined !~ /\b(?:cornea|hornhaut|limbus|pannus)\b/i) {
             $is_retina = 1;
         }
+    }
+
+    # Übergreifender Indikator für okulären Kontext:
+    my $is_eye_context = ($is_vaa || $is_retina || $combined =~ /\b(?:auge|augen|bulbus|ra\b|la\b|od\b|os\b|ba\b|ou\b|ocul\w*|opht\w*|cataract|grauer\s+star|gr[üu]ner\s+star|glaukom)\b/i);
+
+    # ---------------------------------------------------------------------
+    # OKULÄRE NARBENLÖSUNG / ADHÄSIOLYSE (SCHUTZ VOR NARBENHERNIE 5-536)
+    # ---------------------------------------------------------------------
+    if ($term =~ /\b(?:narbenl[öo]sung\w*|l[öo]sung\s+von\s+narben|adh[äa]siolys\w*|strangl[öo]sung\w*)\b/i
+        || $combined =~ /\b(?:narbenl[öo]sung\w*|symblepharonl[öo]sung\w*)\b/i) {
+
+        # 1. Bindehaut / Symblepharon (Fornix, Bindehaut, Bulbus)
+        if ($combined =~ /\b(?:bindehaut|konjunktiv\w*|symblepharon|fornix|bulbus)\b/i) {
+            return "Lösung von Adhäsionen der Konjunktiva Symblepharon"; # Zielt auf OPS:5-115.1
+        }
+
+        # 2. Augenlid / Kanthus (Lidnarben, Ektropium)
+        if ($combined =~ /\b(?:lid|unterlid|oberlid|kanthus|tarsus|ektropi\w*|entropi\w*)\b/i) {
+            return "Lösung von Verwachsungen der Augenlider";            # Zielt auf OPS:5-096.1
+        }
+
+        # 3. Iris / Vorderkammer (Synechien)
+        if ($combined =~ /\b(?:iris|synechi\w*|vorderkammer|pupill\w*)\b/i) {
+            return ($combined =~ /\bhintere\b/i)
+                ? "Lösung hinterer Synechien"                            # Zielt auf OPS:5-137.1
+                : "Lösung vorderer Synechien";                           # Zielt auf OPS:5-137.0
+        }
+
+        # 4. Standard-Fallback für Augenberichte (Bindehaut-Symblepharon ist am häufigsten)
+        return "Lösung von Adhäsionen der Konjunktiva Symblepharon";     # OPS:5-115.1
+    }
+    # ---------------------------------------------------------------------
+    # OKULÄRE HERPES- UND ZOSTER-INFEKTIONEN (SCHUTZ VOR GENITALHERPES A60)
+    # ---------------------------------------------------------------------
+    if ($term =~ /\b(?:herpes|herpetisch\w*|hsv|zoster)\b/i || $combined =~ /\b(?:herpes|herpetisch\w*)\b/i) {
+        
+        # 1. Zoster ophthalmicus (Gürtelrose am Auge)
+        if ($term =~ /\bzoster\b/i || $combined =~ /\bzoster\b/i) {
+            return "herpes zoster ophthalmicus"; # Mappt auf ICD10:B02.3 / HP:0032087
+        }
+
+        # 2. Hornhaut-Beteiligung (Keratitis herpetica / herpetisches Ulkus / Dendritica)
+        if ($combined =~ /\b(?:hornhaut|cornea|ulkus|ulcus|keratit\w*|stroma|endothel|dendrit\w*|wund\w*)\b/i
+            || $term =~ /\b(?:hornhaut|cornea|ulkus|ulcus|keratit\w*|dendrit\w*)\b/i) {
+            return "herpetic keratitis";         # Mappt auf ICD10:B00.5 / HP:0012114
+        }
+
+        # 3. Uveitis / Netzhaut-Beteiligung (z. B. ARN - Akute Retinanekrose)
+        if ($is_retina || $combined =~ /\b(?:retin\w*|netzhaut|uveit\w*|nekros\w*|arn)\b/i) {
+            return "herpetic retinitis";         # Mappt auf ICD10:B00.5
+        }
+
+        # 4. Allgemeines Herpesrezidiv / Herpes am Auge (Standard-Fallback)
+        return "ocular herpes simplex";          # Mappt auf ICD10:B00.5 / HP:0012114
+    }
+
+    # ---------------------------------------------------------------------
+    # C. ANATOMISCHE SCHUTZANKER & DESAMBIGUIERUNG (CROSS-ORGAN DRIFT STOPPEN)
+    # ---------------------------------------------------------------------
+    # 1. Aderhaut (Auge) vs. Plexus choroideus (Gehirn)
+    if ($term =~ /\bchoroid\w*\b/i && $term !~ /\bplexus\b/i) {
+        $term =~ s/\bchoroid\w*\s+vessels\b/ocular choroidal vasculature/gi;
+        $term =~ s/\bchoroid\w*\b/ocular choroid/gi;
+    }
+
+    # 2. Raumorientierung im Auge (Nasal/Temporal) -> Schützt vor "Nose" und "Temporal lobe"
+    if ($term =~ /\b(?:nasal|nasale|nasaler|nasales)\b/i) {
+        if ($is_retina || $combined =~ /\b(?:rnfl|oct|retina|fundus|papille|gesichtsfeld|gf|sehnerv)\b/i) {
+            $term =~ s/\bnasal\b/ocular fundus nasal sector/gi;
+        } elsif ($is_vaa || $combined =~ /\b(?:hornhaut|cornea|tr[äa]nen|limbus)\b/i) {
+            $term =~ s/\bnasal\b/medial ocular/gi;
+        }
+    }
+    if ($term =~ /\b(?:temporal|temporale|temporaler|temporales)\b/i) {
+        if ($is_retina || $combined =~ /\b(?:rnfl|oct|retina|fundus|papille|gesichtsfeld|gf|sehnerv)\b/i) {
+            $term =~ s/\btemporal\b/ocular fundus temporal sector/gi;
+        }
+    }
+
+    # 3. Amnionmembran am Auge vs. Fruchtblase (Geburtshilfe)
+    if (($term =~ /\bamnion\w*\b/i || $combined =~ /\bamnion\w*\b/i) && $is_eye_context) {
+        return "corneal graft defect"; # Schützt vor vorzeitigem Blasensprung
+    }
+
+    # 4. Hornhautnaht/Fadenkanal vs. Spinalkanal
+    if ($term =~ /\bfadenkanal\w*\b/i) {
+        return "corneal suture track complication";
+    }
+
+    # 5. Lid-Talgdrüse vs. Speicheldrüse
+    if ($term =~ /\b(?:talgretention\w*|talgzyste)\b/i && ($is_vaa || $combined =~ /\b(?:lid|unterlid|oberlid|auge)\b/i)) {
+        return "eyelid sebaceous cyst";
+    }
+
+    # 6. Hornhautulkus vs. Magengeschwür
+    if ($term =~ /^(?:ulcus|ulkus|ulcer)$/i && $is_eye_context) {
+        return "corneal ulcer";
+    }
+
+    # 7. Synechien: Anterior vs. Posterior strikt trennen
+    if ($term =~ /\b(?:vordere|anteriore)\s+synechie\w*\b/i) {
+        return "anterior synechiae of the iris";
+    }
+    if ($term =~ /\b(?:hintere|posteriore)\s+synechie\w*\b/i) {
+        return "posterior synechiae of the iris";
+    }
+
+    # 8. Pupillenweite: Miosis vs. Mydriasis
+    if ($term =~ /\b(?:pupilleneng|pupillenverengung|miosis)\b/i) {
+        return "miosis";
+    }
+    if ($term =~ /\b(?:pupillenweit|pupillenerweiterung|mydriasis)\b/i) {
+        return "mydriasis";
+    }
+
+    # 9. IOL am Ort / Pseudophakie (schützt vor Retinal Tubulation!)
+    if ($term =~ /\b(?:iol\s+(?:am\s+ort|in\s+loco|im\s+ort|regelrecht)|pseudophakie)\b/i) {
+        return "pseudophakia";
+    }
+
+    # 10. Subjektive Augensymptome (schützt vor Trichotillomanie und Rundrücken)
+    if ($term =~ /\bziehen\b/i && $is_eye_context) {
+        return "ocular discomfort";
+    }
+    if ($term =~ /\bstichgef[üu]hl\b/i && $is_eye_context) {
+        return "eye pain";
+    }
+
+    # 11. MEHRDEUTIGE OPERATIONEN/EINGRIFFE NUR IM AUGEN-KONTEXT PRÄZISIEREN
+    if ($is_eye_context) {
+        if ($term =~ /\bkapsel[öo]ffnung\b/i || $term =~ /\bkapsulotom\w*\b/i) {
+            return "Kapsulotomie der Augenlinse";
+        }
+        if ($term =~ /\b(?:intrakameral\w*|luftinjektion|re-bubbling|bubbling)\b/i) {
+            return "Lufteingabe in die vordere Augenkammer";
+        }
+        if ($term =~ /\bdebridement\b/i && ($is_vaa || $combined =~ /\b(?:bindehaut|hornhaut|cornea|conjunctiv\w*)\b/i)) {
+            return "Exzision von erkranktem Gewebe der Bindehaut";
+        }
+        if ($term =~ /\b(?:linsenentfernung|linsenabsaugung|aphakiebelassung)\b/i) {
+            return "Extrakapsuläre Extraktion der Linse";
+        }
+        if ($term =~ /\bdiaphanoskop\w*\b/i) {
+            return "Diaphanoskopie des Augapfels";
+        }
+        if ($term =~ /\bprothese\b/i && $combined !~ /\b(?:zahn|knie|h[üu]fte|bein|arm)\b/i) {
+            return "Implantation einer Augenprothese";
+        }
+    }
+
+    if ($is_retina && $term =~ /\b(?:kristallin\w*|crystalline)\b/i) {
+        return "retinal refractile deposits";
+    }
+    if ($is_vaa && $term =~ /\b(?:kristallin\w*|crystalline)\b/i) {
+        return "crystalline cataract"; # zielt auf HP:0000518
     }
 
     # ---------------------------------------------------------------------
@@ -1489,6 +1682,37 @@ sub enrich_term_with_section_context {
                 return "extraocular muscle hypertrophy";
             }
         }
+
+        if ($term =~ /\b(?:zirkulierende\s+)?zellen\b/i && $combined !~ /glask[öo]rper/i) {
+            return "anterior chamber cells";
+        }
+
+        if ($term =~ /\b(?:rosthof\w*|rostring\w*|rostablagerung\w*|eisenrost\w*)\b/i
+            || $combined =~ /\b(?:rosthof\w*|rostring\w*)\b/i) {
+            return "corneal rust ring";
+        }
+
+        # Pigmentierter Bereich / Pigmentierung im Vorderabschnitt
+        if ($term =~ /\b(?:pigmentiert\w*|hyperpigmentiert\w*|pigment\w*)\s*(?:bereich\w*|areal\w*|ver[äa]nderung\w*|fleck\w*|herd\w*|l[äa]sion\w*|zone\w*|stelle\w*)\b/i
+            || $term =~ /\b(?:pigmentierung\w*|hyperpigmentierung\w*)\b/i) {
+            
+            # Iris
+            if ($combined =~ /\b(?:iris|regenbogenhaut|stroma|pupill\w*)\b/i) {
+                return "hyperpigmentation of the iris";
+            }
+            # Bindehaut
+            if ($combined =~ /\b(?:bindehaut|konjunktiv\w*|limbus|skler\w*)\b/i) {
+                return "conjunctival hyperpigmentation";
+            }
+            # Hornhaut / Endothel (z.B. pigmentierte Beschläge)
+            if ($combined =~ /\b(?:endothel\w*|hornhaut|cornea|beschl[äa]g\w*)\b/i) {
+                return "pigmented keratic precipitates";
+            }
+            # Lid
+            if ($combined =~ /\b(?:lid|unterlid|oberlid|lidrand)\b/i) {
+                return "eyelid hyperpigmentation";
+            }
+        }
     }
 
     # ---------------------------------------------------------------------
@@ -1529,7 +1753,7 @@ sub enrich_term_with_section_context {
         }
 
         # Narben (inkl. Narbenbildung)
-        if ($term =~ /\b(?:zentrale\s+|alte\s+|pigmentierte\s+)?narbe\w*\b/i && $combined !~ /\b(?:cornea|hornhaut|lid|bindehaut)\b/i) {
+        if ($term =~ /\b(?:zentrale\s+|alte\s+|pigmentierte\s+)?narb\w*\b/i && $combined !~ /\b(?:cornea|hornhaut|lid|bindehaut)\b/i) {
             return "chorioretinal macular scar";
         }
         if ($term =~ /^(?:scar|retinal\s+scar)$/i) {
@@ -1604,6 +1828,25 @@ sub enrich_term_with_section_context {
         # Gefäßverschluss
         if ($term =~ /\b(?:gef[äa][ßs]verschluss|vascular\s*occlusion|verschluss)\b/i && $term !~ /\b(?:retin\w*|netzhaut|ast|zentral)\b/i) {
             return "retinal vascular occlusion";
+        }
+
+        if ($is_retina && $term =~ /\bnekros\w*\b/i) {
+            return "retinal necrosis";
+        }
+        # Pigmentierter Bereich / Pigmentierung / RPE-Veränderungen in der Netzhaut
+        if ($term =~ /\b(?:pigmentiert\w*|hyperpigmentiert\w*|pigment\w*)\s*(?:bereich\w*|areal\w*|ver[äa]nderung\w*|fleck\w*|herd\w*|l[äa]sion\w*|zone\w*|stelle\w*|rundherd\w*)\b/i
+            || $term =~ /\b(?:pigmentierung\w*|pigmentverschiebung\w*|pigmentauflockerung\w*|hyperpigmentierung\w*)\b/i) {
+            
+            # Nävus-Kontext (flach, solitär, scharf begrenzt)
+            if ($combined =~ /\b(?:n[äa]vus|nevus|flach|solit[äa]r|gutartig|prominenzfrei)\b/i) {
+                return "choroidal nevus";
+            }
+            # Makula-Kontext
+            if ($combined =~ /\b(?:makula|macula|fovea|zentrum|zentral)\b/i) {
+                return "abnormal macular pigmentation";
+            }
+            # Allgemeine Netzhaut / Fundus
+            return "abnormal retinal pigmentation";
         }
     }
 
@@ -1696,6 +1939,7 @@ helper map_to_hpo_async => sub {
 
     # 1. Check auf Originalbegriff
     if (my $hit = $self->check_database_intercept('hpo', $term)) {
+        return Mojo::Promise->resolve(undef) if $hit->{suppress};
         $self->app->log->info("[HPO DB INTERCEPT] '$term' -> $hit->{id} ($hit->{label})");
         return Mojo::Promise->resolve($hit);
     }
@@ -1728,18 +1972,14 @@ helper map_to_hpo_async => sub {
                 if ($tx->result && $tx->result->is_success) {
                     my $body = $tx->result->body;
                     my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
-                    if (ref $matches eq 'ARRAY' && @$matches && defined $matches->[0]->{label}) {
-                        my $raw_code      = $matches->[0]->{label};
-                        my $matched_id    = $self->format_hpo_id($raw_code);
-                        my $db_label      = $self->get_canonical_ontology_label('hpo', $raw_code);
-                        my $matched_label = $db_label // $matches->[0]->{payload} // $term;
-
-                        $self->app->log->info("[HPO RETRIEVAL] '$clean_query' -> $matched_id ($matched_label)");
-                        return { id => $matched_id, label => $matched_label };
+                    if (ref $matches eq 'ARRAY' && @$matches) {
+                        my $res = $self->_build_vector_res('hpo', $matches->[0], $clean_query);
+                        return $res if $res;
                     }
                 }
-                return { id => "HP:0000118", label => $term };
-            })->catch(sub { return { id => "HP:0000118", label => $term }; });
+                # Kein Treffer oder verworfen: KEIN HP:0000118-Wurzelknoten zurückgeben.
+                return undef;
+            })->catch(sub { return undef; });
         };
         return $self->enqueue_patchbay_call($execute_call, $clean_query);
     });
@@ -1767,6 +2007,134 @@ sub _extract_vector_dist_str {
     return "";
 }
 
+our $OCULAR_TERM_REGEX = qr{\b(?:
+    auge|augen|ocular|ophthalm\w*|bulbus|intraokular\w*|intraocular|
+    hornhaut|kornea|cornea|corneal|keratit\w*|keratopath\w*|keratoplast\w*|
+    bindehaut|konjunktiv\w*|conjunctiv\w*|
+    augenlid|lidrand|lidkante|lidspalte|eyelid|palpebr\w*|tarsus|kanthus|canthus|
+    iris|pupill\w*|pupil|synechi\w*|
+    linse|lens|katarakt|cataract|iol|hinterkammerlinse|kapselsack|
+    netzhaut|retina|retinal|makula|macula|macular|fovea|foveal|
+    aderhaut|choroid\w*|
+    papille|sehnerv|optic\s*(?:disc|nerve)|rnfl|bmo|
+    glask[öo]rper|vitre\w*|
+    skleral?|sclera\w*|
+    vorderkammer|anterior\s*chamber|kammerwinkel|trabekel\w*|
+    tr[äa]nen\w*|lacrimal|dakryo\w*|
+    orbita|orbital|
+    descemet|deszemet|endothel\w*|endotheli\w*|limbus|limbal|epithelstippung|
+    visus|sehsch[äa]rfe|visual\s*acuity|gesichtsfeld|visual\s*field|
+    skotom|scotoma|perimetr\w*|
+    glaukom|glaucoma|tensio|augeninnendruck|intraocular\s*pressure|
+    uveit\w*|amotio|ablatio\s*retinae|
+    sickerkissen|filterkissen|filtering\s*bleb|bleb
+    )\b}xi;
+
+# Signalwörter für "der Begriff betrifft ausdrücklich NICHT das Auge".
+# Bewusst eng gehalten: nur Organe und Gefässgebiete, die im Augenbrief
+# eindeutig als Nebenbefund auftreten.
+our $EXTRAOCULAR_TERM_REGEX = qr{\b(?:
+    aorta|aorten\w*|aortal\w*|carotis|karotis|femoralis|
+    zerebral\w*|cerebral\w*|intrakraniell\w*|hirn\w*|
+    arterielle[rns]?\s+(?:hyperton|hypoton|verschluss)\w*|blutdruck|
+    magen|ventriculi|gastric|duoden\w*|darm|kolon|colon|appendix|
+    unterschenkel|cruris|\bbein\b|\bbeine\b|\bfu[ßs]\b|zehe|
+    \bhand\b|finger|\barm\b|schulter|
+    niere|renal|nephro\w*|blase|prostata|
+    leber|hepat\w*|
+    lunge|pulmonal\w*|bronchial\w*|
+    herz|kardial\w*|koronar\w*|myokard\w*|
+    mamma|uterus|ovar\w*|
+    schilddr[üu]se|thyreo\w*|
+    wirbels[äa]ule|knochen|gelenk|h[üu]fte|\bknie\b|
+    zahn|z[äa]hne|dens\b|kiefer
+    )\b}xi;
+
+# Gibt 1 zurück, wenn Begriff und Code einander widersprechen.
+helper has_scope_conflict => sub {
+    my ($self, $domain, $code, $term) = @_;
+    return 0 unless defined $code && length $code;
+    return 0 unless defined $term && length $term;
+
+    my $term_ocular      = ($term =~ $OCULAR_TERM_REGEX)      ? 1 : 0;
+    my $term_extraocular = ($term =~ $EXTRAOCULAR_TERM_REGEX) ? 1 : 0;
+
+    # Kein Signal in beide Richtungen -> nicht bewerten, durchlassen.
+    return 0 unless $term_ocular || $term_extraocular;
+
+    # Beides genannt ("Aderhautmetastase bei Mammakarzinom",
+    # "Diabetische Retinopathie") -> nicht bewerten, durchlassen.
+    return 0 if $term_ocular && $term_extraocular;
+
+    # Ist der CODE okulär?
+    my $code_ocular;
+    if ($domain eq 'icd10') {
+        my $c = uc($code); $c =~ s/^ICD10://;
+        $code_ocular = ($c =~ /^H[0-5]\d/) ? 1 : 0;      # Kapitel VII: H00-H59
+    }
+    elsif ($domain eq 'hpo') {
+        $code_ocular = ( $self->is_subclass_of($code, 'HP:0000478')
+        || $self->is_subclass_of($code, 'HP:0000315') ) ? 1 : 0;
+    }
+    elsif ($domain eq 'ops') {
+        my $c = lc($code); $c =~ s/^ops://;
+        $code_ocular = ($c =~ /^5-(?:0[89]|1[0-6])/     # Augenchirurgie
+        || $c =~ /^1-2[0-4]/               # Augendiagnostik
+        || $c =~ /^8-020/) ? 1 : 0;        # Injektion Auge
+    }
+    else {
+        return 0;   # atc, loinc: kein anatomischer Scope
+    }
+
+    return 1 if $term_ocular      && !$code_ocular;   # Auge -> Fremdfach
+    return 1 if $term_extraocular &&  $code_ocular;   # Fremdfach -> Auge
+    return 0;
+};
+
+# Einheitliche Treffer-Auswertung für HPO/OPS/ATC/LOINC:
+# Distanzschwelle + Scope-Guard + Label-Auflösung.
+# Gibt undef zurück, wenn der Treffer verworfen wird.
+helper _build_vector_res => sub {
+    my ($self, $domain, $match, $term, $max_dist) = @_;
+
+    # Schwellen je Domäne. ATC ist tolerant (Handelsnamen), HPO/OPS streng.
+    $max_dist //= { hpo => 0.12, ops => 0.10, atc => 0.18, loinc => 0.15 }->{$domain} // 0.12;
+
+    return undef unless $match && defined $match->{label};
+
+    my $sim  = $match->{similarity} // $match->{sim};
+    my $dist = defined $sim ? (1.0 - $sim) : ($match->{distance} // $match->{dist} // 1.0);
+    my $dist_str = _extract_vector_dist_str($match);
+
+    if ($dist > $max_dist) {
+        $self->app->log->warn(
+        "[\U$domain\E SUPPRESSED]$dist_str '$term' -> $match->{label} "
+        . "überschreitet Max-Distanz ($dist > $max_dist). Treffer verworfen."
+        );
+        return undef;
+    }
+
+    my $raw_code = $match->{label};
+    my $fmt = { hpo => 'format_hpo_id', ops => 'format_ops_id',
+        atc => 'format_atc_id', loinc => 'format_loinc_id' }->{$domain};
+    my $matched_id = $self->$fmt($raw_code);
+
+    if ($self->has_scope_conflict($domain, $matched_id, $term)) {
+        $self->app->log->warn(
+        "[\U$domain\E SCOPE CONFLICT]$dist_str '$term' -> $matched_id "
+        . "widerspricht der im Begriff genannten Anatomie. Treffer verworfen."
+        );
+        return undef;
+    }
+
+    my $db_label      = $self->get_canonical_ontology_label($domain, $raw_code);
+    my $matched_label = $db_label // $match->{payload} // $term;
+
+    $self->app->log->info("[\U$domain\E RETRIEVAL]$dist_str '$term' -> $matched_id ($matched_label)");
+    return { id => $matched_id, label => $matched_label };
+};
+
+
 # =========================================================================
 # ICD-10 ASYNCHRONOUS MAPPING ENGINE MIT DB-INTERCEPT & ATC-ALLERGIE-FIX
 # =========================================================================
@@ -1791,70 +2159,126 @@ helper map_to_icd10_async => sub {
                       : $verbatim_term;
     my $fallback_term = ($primary_term eq $verbatim_term) ? $canonical_term : $verbatim_term;
 
-    # --- HILFSFUNKTION: ATC-ANREICHERUNG FÜR Z88.8 ALLERGIEN ---
-    my $apply_allergy_atc_override = sub {
-        my ($res) = @_;
-        return Mojo::Promise->resolve($res) unless $res && $res->{id};
+    # --- HILFSFUNKTION: INTELLIGENTE ALLERGIE-TRENNUNG (ARZNEIMITTEL VS. ALLERGENE) ---
+        my $apply_allergy_atc_override = sub {
+            my ($res) = @_;
+            return Mojo::Promise->resolve($res) unless $res && $res->{id};
 
-        if ($is_allergy) {
-            my $is_specific_code = ($res->{id} =~ /^ICD10:Z88\.0/i); # Z88.0 = Penicillin hat eigenen Code
+            if ($is_allergy) {
+                my $t_check = lc("$verbatim_term " . ($canonical_term // ''));
 
-            my $is_unspecific = (!$is_specific_code) && (
-                $res->{id} =~ /^ICD10:(?:T88|T78|Z88\.8|Z88\.9|Z88$)/i ||
-                $res->{id} =~ /^ICD10:Z88\.[1-9]/i
-            );
+                # Eine Krankheit hinter "Allergie gegen" ist ein Extraktionsfehler,
+                # kein Allergen. Belegt im Audit: "Allergie gegen GvHD",
+                # "Allergie gegen Transplantatabstoßung", "Allergie gegen
+                # Limbusinsuffizienz". Diese dürfen weder in ATC noch nach Z88.8.
+                if ($t_check =~ /\b(?:gvhd|absto[ßs]ung|transplantat\w*|limbus\w*|ektropium|entropium|
+                    hornhaut|keratit\w*|glaukom|katarakt|amotio|uveiti\w*)/xi) {
+                    return Mojo::Promise->resolve($res);
+                }
 
-            if ($is_unspecific) {
-                my $extract_substance = sub {
-                    my ($t) = @_;
-                    return '' unless defined $t && length($t);
-                    my $s = $t;
-                    $s =~ s/[-_]/ /g;
-                    $s =~ s/\b(?:allergie\s*(?:gegen|auf|g\/?g)?|unvertr(?:ä|a)glichkeit\s*(?:gegen|auf)?|intoleranz\s*(?:gegen|auf)?|anaphylaktische\s*reaktion\s*(?:auf|nach)?|anaphylaxie\s*(?:auf|nach|gegen)?|überempfindlichkeit\s*(?:gegen|auf)?)\s*:\s*/ /gi;
-                    $s =~ s/\b(?:allergie\s*(?:gegen|auf|g\/?g)?|unvertr(?:ä|a)glichkeit\s*(?:gegen|auf)?|intoleranz\s*(?:gegen|auf)?|anaphylaktische\s*reaktion\s*(?:auf|nach)?|anaphylaxie\s*(?:auf|nach|gegen)?|überempfindlichkeit\s*(?:gegen|auf)?)\b/ /gi;
-                    $s =~ s/\b(?:in\s+der\s+eigenanamnese|eigenanamnese|anamnestisch|bekannte?r?s?)\b/ /gi;
-                    $s =~ s/\b(?:i\.?\s*v\.?|oral|intravenös(?:e)?|therapie|gabe|behandlung|medikation|arzneimittel|medikament|präparat|tabletten?|tropfen|kapseln?|infusion)\b/ /gi;
-                    $s =~ s/[^\p{L}\p{N}\s]+//g;
-                    $s =~ s/\s+/ /g;
-                    $s =~ s/^\s+|\s+$//g;
-                    return $s;
-                };
-
-                my $substance = $extract_substance->($canonical_term);
-                $substance = $extract_substance->($verbatim_term) unless length($substance) > 2;
-
-                if (length($substance) > 2) {
-                    return $self->map_to_atc_async($substance, $doc_lang)->then(sub {
-                        my $atc_hit = shift;
-                        my $klartext = (uc($substance) eq $substance) ? $substance : ucfirst(lc($substance));
-
-                        if ($atc_hit && $atc_hit->{id} && $atc_hit->{id} ne 'ATC:V03AX') {
-                            $self->app->log->info("[ICD10 DRUG ALLERGY OVERRIDE] '$substance' -> ICD10:Z88.8 ($atc_hit->{id} ($klartext))");
-                            return {
-                                id    => 'ICD10:Z88.8',
-                                label => "$atc_hit->{id} ($klartext)"
-                            };
-                        } else {
-                            $self->app->log->info("[ICD10 DRUG ALLERGY OVERRIDE] '$substance' -> ICD10:Z88.8 (Allergie gegen $klartext)");
-                            return {
-                                id    => 'ICD10:Z88.8',
-                                label => "Allergie gegen $klartext"
-                            };
-                        }
+                # 1. Insekten- & Tiergifte (Dürfen NIEMALS in ATC!)
+                if ($t_check =~ /\b(?:biene|wespe|hornis|insekt|tierhaar|katze|hund|pferd|meerschwein)/i) {
+                    my $label = ($t_check =~ /biene/i)  ? 'Allergie gegen Bienengift'
+                              : ($t_check =~ /wespe/i)  ? 'Allergie gegen Wespengift'
+                              : 'Allergie gegen Tierhaare/Tiergifte';
+                    return Mojo::Promise->resolve({
+                        id    => 'ICD10:T63.4',
+                        label => $label
                     });
                 }
-            }
-        }
-        return Mojo::Promise->resolve($res);
-    };
 
-    # 2. DB-Intercepts prüfen (JETZT MIT ATC-ANREICHERUNG BEI ALLERGIEN!)
+                # 2. Pollen / Inhalationsallergien
+                if ($t_check =~ /\b(?:birke|gr[äa]ser|roggen|beifu[ßs]|pollen|heu(?:schnupfen)?|hausstaub|milbe|schimmel)/i) {
+                    return Mojo::Promise->resolve({
+                        id    => 'ICD10:J30.1',
+                        label => 'Allergische Rhinopathie durch Pollen/Inhalationsallergene'
+                    });
+                }
+
+                # 3. Nahrungsmittelallergien
+                if ($t_check =~ /\b(?:haselnuss|n[üu]ss|soja|erdnuss|apfel|[äa]pfel|citrus|zitrus|zitrone|
+                    karotte|m[öo]hre|fisch|meeresfr[üu]cht|eiwei[ßs]|eigelb|h[üu]hnerei|
+                    weizen|gluten|laktose|fruktose|curry|ananas|kiwi|sellerie|senf|
+                    nahrungsmittel|lebensmittel|obst|gem[üu]se|gespritzte\s+fr[üu]chte)/xi) {
+                    return Mojo::Promise->resolve({
+                        id    => 'ICD10:T78.1',
+                        label => 'Sonstige unerwünschte Nebenwirkungen von Nahrungsmitteln'
+                    });
+                }
+
+                # 4. Kontaktallergien & Hilfsstoffe
+                if ($t_check =~ /\b(?:pflaster|latex|nickel|perubalsam|duftstoff|konservier|kontakt|
+                    nahtmaterial|verbandmaterial|wollwachs|lanolin|chrom|kobalt)/xi) {
+                    return Mojo::Promise->resolve({
+                        id    => 'ICD10:L23.9',
+                        label => 'Allergische Kontaktdermatitis'
+                    });
+                }
+
+                # 5. NUR WENN ES SICH TATSÄCHLICH UM MEDIKAMENTE HANDELT -> ATC Lookup
+                my $is_specific_code = ($res->{id} =~ /^ICD10:Z88\.0/i);
+                my $is_unspecific    = (!$is_specific_code) && ($res->{id} =~ /^ICD10:(?:T88|T78|Z88)/i);
+
+                # Absoluter Schutz: Augenbefunde dürfen niemals als Arzneimittelallergie gewertet werden!
+                return Mojo::Promise->resolve($res) if $t_check =~ /\b(?:limbus|transplantat|ektropium|entropium|hornhaut)\b/i;
+
+                if ($is_unspecific) {
+                    my $extract_substance = sub {
+                        my ($t) = @_;
+                        return '' unless defined $t && length($t);
+                        my $s = $t;
+                        $s =~ s/[-_]/ /g;
+                        $s =~ s/\b(?:allergie\s*(?:gegen|auf|g\/?g)?|unvertr(?:ä|a)glichkeit\s*(?:gegen|auf)?|intoleranz\s*(?:gegen|auf)?|anaphylaktische\s*reaktion\s*(?:auf|nach)?|anaphylaxie\s*(?:auf|nach|gegen)?|überempfindlichkeit\s*(?:gegen|auf)?)\s*:\s*/ /gi;
+                        $s =~ s/\b(?:allergie\s*(?:gegen|auf|g\/?g)?|unvertr(?:ä|a)glichkeit\s*(?:gegen|auf)?|intoleranz\s*(?:gegen|auf)?|anaphylaktische\s*reaktion\s*(?:auf|nach)?|anaphylaxie\s*(?:auf|nach|gegen)?|überempfindlichkeit\s*(?:gegen|auf)?)\b/ /gi;
+                        $s =~ s/\b(?:in\s+der\s+eigenanamnese|eigenanamnese|anamnestisch|bekannte?r?s?)\b/ /gi;
+                        $s =~ s/\b(?:i\.?\s*v\.?|oral|intravenös(?:e)?|therapie|gabe|behandlung|medikation|arzneimittel|medikament|präparat|tabletten?|tropfen|kapseln?|infusion)\b/ /gi;
+                        $s =~ s/[^\p{L}\p{N}\s]+//g;
+                        $s =~ s/\s+/ /g;
+                        $s =~ s/^\s+|\s+$//g;
+                        return $s;
+                    };
+
+                    my $substance = $extract_substance->($canonical_term);
+                    $substance = $extract_substance->($verbatim_term) unless length($substance) > 2;
+
+                    # Typo-Korrekturen für gängige Medikamente
+                    $substance = 'Salbutamol' if $substance =~ /^subtamol$/i;
+
+                    if (length($substance) > 2) {
+                        return $self->map_to_atc_async($substance, $doc_lang)->then(sub {
+                            my $atc_hit = shift;
+                            my $klartext = (uc($substance) eq $substance) ? $substance : ucfirst(lc($substance));
+
+                            # Nur verknüpfen, wenn ein spezifischer ATC-Code gefunden wurde (kein V03AX-Fallback!)
+                            if ($atc_hit && $atc_hit->{id}) {
+                                $self->app->log->info("[ICD10 DRUG ALLERGY OVERRIDE] '$substance' -> ICD10:Z88.8 ($atc_hit->{id} ($klartext))");
+                                return {
+                                    id    => 'ICD10:Z88.8',
+                                    label => "$atc_hit->{id} ($klartext)"
+                                };
+                            } else {
+                                return {
+                                    id    => 'ICD10:Z88.8',
+                                    label => "Allergie gegen $klartext"
+                                };
+                            }
+                        });
+                    }
+                }
+            }
+            return Mojo::Promise->resolve($res);
+        };    # 2. DB-Intercepts prüfen (MIT ATC-ANREICHERUNG BEI ALLERGIEN!)
     for my $cand ($verbatim_term, $primary_term, $canonical_term) {
         next unless defined $cand && length($cand);
         my $clean = lc(clean_term_for_vector_mapping($cand));
+        
         if (my $hit = $self->check_database_intercept('icd10', $clean) || $self->check_database_intercept('icd10', $cand)) {
             $self->app->log->info("[ICD10 DB INTERCEPT] '$cand' -> $hit->{id} ($hit->{label})");
-            # Wenn es eine Allergie ist, nicht blind abbrechen, sondern ATC-Code anhängen!
+            # Wenn es KEINE Medikamentenallergie ist (z.B. Pflaster, Latex), Intercept unverändert belassen!
+            if ($hit->{label} =~ /pflaster|verband|latex|kontakt/i || $cand =~ /pflaster|latex/i) {
+                return Mojo::Promise->resolve($hit);
+            }
+            # Wenn es eine Allergie ist, ATC-Code anhängen!
             return $apply_allergy_atc_override->($hit);
         }
     }
@@ -1949,6 +2373,12 @@ helper _build_icd10_res => sub {
     my $matched_label = $db_label // $match->{payload} // $term;
     my $dist_str      = _extract_vector_dist_str($match);
 
+    # --- SCOPE-GUARD ---
+    if ($self->has_scope_conflict('icd10', $matched_id, $term)) {
+        $self->app->log->warn("[ICD10 SCOPE CONFLICT]$dist_str '$term' -> $matched_id widerspricht der im Begriff genannten Anatomie. Verworfen.");
+        return undef;
+    }
+
     # --- TRAUMA-FILTER (S-Codes) ---
     # S-Codes nur dann abweisen, wenn der Begriff ABSOLUT KEIN Trauma/Verletzung darstellt
     if ($matched_id =~ /^ICD10:S/i) {
@@ -1960,6 +2390,15 @@ helper _build_icd10_res => sub {
         }
     }
 
+    # --- AMPUTATIONS-FILTER (Z89-Codes abfangen) ---
+    # Verhindert, dass Augenbefunde wie "IOL-Verlust" als Zehen-/Fußverlust kodiert werden!
+    if ($matched_id =~ /^ICD10:Z89/i) {
+        unless ($term =~ /\b(?:amputation|verlust\s+(?:finger|hand|fu[ßs]|zehe|gliedma[ßs]))\b/i) {
+            $self->app->log->warn("[ICD10 BLOCKED] Amputations-Code $matched_id für '$term' abgewiesen.");
+            return undef;
+        }
+    }
+    
     $self->app->log->info("[ICD10 RETRIEVAL]$dist_str '$term' -> $matched_id ($matched_label)");
     return { id => $matched_id, label => $matched_label };
 };
@@ -1998,18 +2437,20 @@ helper map_to_ops_async => sub {
                 if ($tx->result && $tx->result->is_success) {
                     my $body = $tx->result->body;
                     my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
-                    if (ref $matches eq 'ARRAY' && @$matches && defined $matches->[0]->{label}) {
-                        my $raw_code      = $matches->[0]->{label};
-                        my $matched_id    = $self->format_ops_id($raw_code);
-                        my $db_label      = $self->get_canonical_ontology_label('ops', $raw_code);
-                        my $matched_label = $db_label // 'Inoffizieller Code'// $term;
-
-                        $self->app->log->info("[OPS RETRIEVAL] '$clean_query' -> $matched_id ($matched_label)");
-                        return { id => $matched_id, label => $matched_label };
+                    if (ref $matches eq 'ARRAY' && @$matches) {
+                        my $res = $self->_build_vector_res('ops', $matches->[0], $clean_query);
+                        # Ein OPS-Code, der sich nicht in ops_terms auflösen lässt, ist
+                        # ein Phantomkode ("Inoffizieller Code") und wird verworfen.
+                        if ($res && $res->{label} && $res->{label} ne $clean_query) {
+                            return $res;
+                        }
+                        if ($res) {
+                            $self->app->log->warn("[OPS UNRESOLVED] '$clean_query' -> $res->{id} nicht in ops_terms. Verworfen.");
+                        }
                     }
                 }
-                return { id => "OPS:9-999", label => $term };
-            })->catch(sub { return { id => "OPS:9-999", label => $term }; });
+                return undef;
+            })->catch(sub { return undef; });
         };
         return $self->enqueue_patchbay_call($execute_call, $clean_query);
     });
@@ -2050,18 +2491,15 @@ helper map_to_atc_async => sub {
                 if ($tx->result && $tx->result->is_success) {
                     my $body = $tx->result->body;
                     my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
-                    if (ref $matches eq 'ARRAY' && @$matches && defined $matches->[0]->{label}) {
-                        my $raw_code      = $matches->[0]->{label};
-                        my $matched_id    = $self->format_atc_id($raw_code);
-                        my $db_label      = $self->get_canonical_ontology_label('atc', $raw_code);
-                        my $matched_label = $db_label // $matches->[0]->{payload} // $term;
-
-                        $self->app->log->info("[ATC RETRIEVAL] '$clean_query' -> $matched_id ($matched_label)");
-                        return { id => $matched_id, label => $matched_label };
+                    if (ref $matches eq 'ARRAY' && @$matches) {
+                        my $res = $self->_build_vector_res('atc', $matches->[0], $clean_query);
+                        return $res if $res;
                     }
                 }
-                return { id => "ATC:V03AX", label => $term };
-            })->catch(sub { return { id => "ATC:V03AX", label => $term }; });
+                # V03AX war bisher der Sammelcode für alles Unerkannte und hat
+                # im Allergie-Override als "spezifischer Treffer" gegolten.
+                return undef;
+            })->catch(sub { return undef; });
         };
         return $self->enqueue_patchbay_call($execute_call, $clean_query);
     });
@@ -2112,18 +2550,13 @@ helper map_to_loinc_async => sub {
                 if ($tx->result && $tx->result->is_success) {
                     my $body = $tx->result->body;
                     my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
-                    if (ref $matches eq 'ARRAY' && @$matches && defined $matches->[0]->{label}) {
-                        my $raw_code      = $matches->[0]->{label};
-                        my $matched_id    = $self->format_loinc_id($raw_code);
-                        my $db_label      = $self->get_canonical_ontology_label('loinc', $raw_code);
-                        my $matched_label = $db_label // $matches->[0]->{payload} // $term;
-
-                        $self->app->log->info("[LOINC RETRIEVAL] '$loinc_payload_query' -> $matched_id ($matched_label)");
-                        return { id => $matched_id, label => $matched_label };
+                    if (ref $matches eq 'ARRAY' && @$matches) {
+                        my $res = $self->_build_vector_res('loinc', $matches->[0], $loinc_payload_query);
+                        return $res if $res;
                     }
                 }
-                return { id => "LOINC:21889-1", label => $term };
-            })->catch(sub { return { id => "LOINC:21889-1", label => $term }; });
+                return undef;
+            })->catch(sub { return undef; });
         };
         return $self->enqueue_patchbay_call($execute_call, $loinc_payload_query);
     });
@@ -2174,29 +2607,35 @@ sub clean_atc_term {
 # =========================================================================
 sub split_into_clinical_section_chunks {
     my ($text, $target_chunk_chars) = @_;
-    $target_chunk_chars //= 800; # Standard-Zielgröße für fokussierte LLM-Chunks
+    $target_chunk_chars //= 1100; # Optimale Zielgröße für ophthalmologische Kohärenz
 
     return () unless defined $text && length($text);
+
+    # 0. SCHRITT: HTML-Tags, Entitäten und Whitespace-Noise bereinigen
+    $text =~ s/<\/?[a-zA-Z][^>]*>/ /g;
+    $text =~ s/&nbsp;/ /g;
+    $text =~ s/&amp;/&/g;
+    $text =~ s/\r//g;
 
     # 1. SCHRITT: Lateralitäts-Präfixe/-Suffixe (RA, LA, BA, OD, OS, OU, R, L, B)
     my $lat_pattern = qr/(?:\s+(?:[rlb]|ra|la|ba|od|os|ou|rechts?|links?|beidseits))/i;
 
-    # 2. SCHRITT: Header-Regex definieren (inkl. FAG, IOL-Master, VAA-OCT etc.)
+    # 2. SCHRITT: Vollständiger ophthalmologischer & klinischer Header-Regex
     my $header_pattern = qr{(?:
         (?:inclusion(?:\s+criteria)?|einschluss(?:kriterien)?|key\s+inclusion)|
         (?:exclusion(?:\s+criteria)?|ausschluss(?:kriterien)?|key\s+exclusion)|
         (?:study\s+eye(?:\s+criteria)?|fellow\s+eye(?:\s+criteria)?|studienauge|partnerauge)|
         (?:general\s+criteria|allgemeine\s+kriterien|safety\s+criteria)|
         (?:diagnosen?|anamnese|ivom(?:[\s\-]anamnese)?|therapie|aktuelle\s+(?:ophthalmologische\s+)?therapie|lokaltherapie|medikation|dauermedikation|blutverd[üu]nnung|vorgeschichte|allgemein(?:erkrankungen(?:\/medikation)?)?|allergien?)$lat_pattern?|
-        (?:visus|refraktion|skiaskopie|brille|orthoptik|binokularsehen|motilit[äa]t|stereosehen|tensio|druck|tonometrie|pachymetrie|pentacam|topographie|gf|gesichtsfeld|perimetrie|hertel|iolmaster|biometrie)$lat_pattern?|
-        (?:vaa|vorderabschnitt|spaltlampe|hornhaut|fundus|papille|makula|nh[\s\-]oct|rnfl(?:[\s\-]oct)?|oct|bmo[\s\-]oct|gcl(?:[\s\-]oct)?|vaa[\s\-]oct|fag|fla|fl[\s\-]angio|angiograph\w*)$lat_pattern?|
+        (?:visus|refraktion|skiaskopie|brille|fernvisus|nahvisus|orthoptik|binokularsehen|motilit[äa]t|stereosehen|tensio|druck|tonometrie|icare|goldmann|pachymetrie|cct|pentacam|topographie|gf|gesichtsfeld|perimetrie|hertel|iol[\s\-]?master|biometrie|endothel(?:zell\w*)?|ecd|ezd)$lat_pattern?|
+        (?:vaa|vorderabschnitt|spaltlampe|hornhaut|cornea|fundus|papille|makula|macula|nh[\s\-]oct|rnfl(?:[\s\-]oct)?|oct|bmo[\s\-]oct|gcl(?:[\s\-]oct)?|vaa[\s\-]oct|fag|fla|fl[\s\-]angio|angiograph\w*)$lat_pattern?|
         (?:lebensalter|geschlecht|alter|befund|prozeduren?|operationen?|orderheute|bemerkungen)
     )\s*[:=]}ix;
 
     # 3. SCHRITT: Zeilenumbrüche vor jedem erkannten Header sicherstellen
     $text =~ s/($header_pattern)/\n$1/g;
 
-    my @lines = split /\r?\n/, $text;
+    my @lines = split /\n/, $text;
     my @sections;
     my $current_section_header = "";
     my $current_section_body   = "";
@@ -2225,7 +2664,7 @@ sub split_into_clinical_section_chunks {
     }
     push @sections, { header => $current_section_header, text => $current_section_body } if length($current_section_body);
 
-    # 4. SCHRITT: Lateralitäts-Kontext injizieren & Chunks bündeln
+    # 4. SCHRITT: Lateralitäts-Kontext injizieren & Chunks mit Anti-Split bündeln
     my @chunks;
     my $current_chunk = "";
 
@@ -2248,8 +2687,19 @@ sub split_into_clinical_section_chunks {
             $sec_text = "[ANATOMICAL LATERALITY FOR THIS ENTIRE SECTION: $header_lat]\n" . $sec_text;
         }
 
+        # -----------------------------------------------------------------
+        # OPHTHALMISCHE ANTI-SPLIT-REGEL:
+        # Rechter und linker Befund derselben Untersuchung gehören ZWINGEND zusammen!
+        # (Verhindert, dass Visus L von Visus R getrennt wird)
+        # -----------------------------------------------------------------
+        my $must_stay_together = 0;
+        if ($current_chunk =~ /\b(visus|tensio|endothel|pachymetrie|pentacam|nh[\s\-]oct|vaa)\s*r\b/i &&
+            $sec_header    =~ /\b(visus|tensio|endothel|pachymetrie|pentacam|nh[\s\-]oct|vaa)\s*l\b/i) {
+            $must_stay_together = 1;
+        }
+
         # Sektionen bis zur Zielgröße zusammenfassen
-        if (length($current_chunk) + length($sec_text) + 2 > $target_chunk_chars && length($current_chunk) > 0) {
+        if (!$must_stay_together && (length($current_chunk) + length($sec_text) + 2 > $target_chunk_chars) && length($current_chunk) > 0) {
             push @chunks, $current_chunk;
             $current_chunk = $sec_text;
         } else {
@@ -2449,6 +2899,7 @@ helper extract_atomic_criteria_async => sub {
     $text =~ s/<[^>]+>/ /g;
     $text =~ s/&nbsp;/ /g;
     $text =~ s/&amp;/&/g;
+    $text =~ s/<\/?[a-zA-Z][^>]*>/ /g;
 
     if ($mode eq 'phenopacket') {
         $mode_context = qq|
@@ -3344,7 +3795,7 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
                         valueQuantity => {
                             comparator => $q->{comparator},
                             value      => $q->{value},
-                            unit       => "cells/mm2",
+                            unit       => $q->{unit},
                             system     => "http://unitsofmeasure.org",
                             code       => $ucum_code
                         }
@@ -3462,36 +3913,55 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
 
                 my $p_combined = Mojo::Promise->all($p_loinc, $p_hpo)->then(sub {
                     my ($loinc_res, $hpo_res) = @_;
+
                     my $mapped_loinc = $loinc_res->[0];
                     my $mapped_hpo   = $hpo_res->[0];
 
-                    my $assay_node = {
-                        exclude => $is_ex ? \1 : \0,
-                        combinationMethod => $comb_method,
-                        code => { coding => [{ system => "http://snomed.info/sct", code => "8116006", display => "Phänotypisches Merkmal" }] },
-                        valueCodeableConcept => { coding => [{ system => "http://loinc.org", code => $mapped_loinc->{id}, display => $mapped_loinc->{label} // $v_text, is_modifier => \0 }] }
-                    };
+                    my $has_loinc = ($mapped_loinc && $mapped_loinc->{id}) ? 1 : 0;
+                    my $has_hpo   = ($mapped_hpo && $mapped_hpo->{id} && $mapped_hpo->{id} ne 'HP:0000118') ? 1 : 0;
 
-                    my $paired_node = $pair_with_quantity->($assay_node);
+                    # Weder LOINC noch HPO lieferten einen gültigen Code -> Zeile verwerfen
+                    return undef unless $has_loinc || $has_hpo;
 
-                    if ($mapped_hpo && $mapped_hpo->{id} && $mapped_hpo->{id} ne 'HP:0000118') {
-                        my $hpo_node = {
-                            exclude => $is_ex ? \1 : \0,
+                    # Fall 1: LOINC vorhanden (Basis-Knoten bauen, ggf. mit Menge/Quantity paaren)
+                    my $paired_loinc_node = undef;
+                    if ($has_loinc) {
+                        my $assay_node = {
+                            exclude           => $is_ex ? \1 : \0,
                             combinationMethod => $comb_method,
-                            code => { coding => [{ system => "http://snomed.info/sct", code => "8116006", display => "Phänotypisches Merkmal" }] },
+                            code              => { coding => [{ system => "http://snomed.info/sct", code => "8116006", display => "Phänotypisches Merkmal" }] },
+                            valueCodeableConcept => { coding => [{ system => "http://loinc.org", code => $mapped_loinc->{id}, display => $mapped_loinc->{label} // $v_text, is_modifier => \0 }] }
+                        };
+                        $paired_loinc_node = $pair_with_quantity->($assay_node);
+                    }
+
+                    # Fall 2: HPO vorhanden
+                    my $hpo_node = undef;
+                    if ($has_hpo) {
+                        $hpo_node = {
+                            exclude           => $is_ex ? \1 : \0,
+                            combinationMethod => $comb_method,
+                            code              => { coding => [{ system => "http://snomed.info/sct", code => "8116006", display => "Phänotypisches Merkmal" }] },
                             valueCodeableConcept => { coding => [{ system => "http://purl.obolibrary.org/obo/hp.owl", code => $mapped_hpo->{id}, display => $mapped_hpo->{label} // $v_text, is_modifier => \0 }] }
                         };
+                    }
 
+                    # Beide vorhanden -> als Composite Group bündeln
+                    if ($paired_loinc_node && $hpo_node) {
                         my $composite_group = {
                             resourceType      => 'Group',
                             combinationMethod => 'all-of',
                             exclude           => $is_ex ? \1 : \0,
-                            characteristic    => [ $hpo_node, $paired_node ]
+                            characteristic    => [ $hpo_node, $paired_loinc_node ]
                         };
                         return $wrap_res->($composite_group);
                     }
 
-                    return $wrap_res->($paired_node);
+                    # Nur LOINC vorhanden
+                    return $wrap_res->($paired_loinc_node) if $paired_loinc_node;
+
+                    # Nur HPO vorhanden (ggf. mit Quantity gepaart)
+                    return $wrap_res->($pair_with_quantity->($hpo_node));
                 });
 
                 push @row_promises, $p_combined;
@@ -3502,6 +3972,9 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
             if ($domain eq 'icd10') {
                 my $p_icd = $c->map_to_icd10_async($clean_search_term, $doc_lang)->then(sub {
                     my $mapped = shift;
+
+                    return undef unless $mapped && $mapped->{id};
+
                     my $node = {
                         exclude => $is_ex ? \1 : \0,
                         combinationMethod => $comb_method,
@@ -3518,6 +3991,9 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
             if ($domain eq 'ops') {
                 my $p_ops = $c->map_to_ops_async($clean_search_term, $doc_lang)->then(sub {
                     my $mapped = shift;
+
+                    return undef unless $mapped && $mapped->{id};
+
                     my $node = {
                         exclude => $is_ex ? \1 : \0,
                         combinationMethod => $comb_method,
@@ -3534,6 +4010,9 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
             if ($domain eq 'atc') {
                 my $p_atc = $c->map_to_atc_async($clean_search_term, $doc_lang)->then(sub {
                     my $mapped = shift;
+
+                    return undef unless $mapped && $mapped->{id};
+
                     my $node = {
                         exclude => $is_ex ? \1 : \0,
                         combinationMethod => $comb_method,
@@ -3551,6 +4030,9 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
 
             my $p_hpo = $c->map_to_hpo_async($enriched_term, 0, $doc_lang)->then(sub {
                 my $mapped = shift;
+
+                return undef unless $mapped && $mapped->{id};
+
                 my $node = {
                     exclude => $is_ex ? \1 : \0,
                     combinationMethod => $comb_method,
@@ -3853,8 +4335,15 @@ helper generate_phenopacket_impl => sub {
             }
             if ($v =~ /\b(?:absto[ßs]ung\w*|graft\s*rejection\w*|transplantatversagen\w*)\b/i
                 || $c =~ /\b(?:absto[ßs]ung\w*|graft\s*rejection\w*|transplantatversagen\w*)\b/i) {
-                $item->{domain}         = 'icd10';
-                $item->{canonical_term} = 'Hornhauttransplantatabstoßung';
+                # Wenn es bereits als Prozedur (OPS) erkannt wurde (z.B. Re-DMEK, PKP), behalte OPS bei!
+                unless (($item->{domain} // '') eq 'ops' || $v =~ /\b(?:z\.?\s*n\.?|re[- ]?dmek|dmek|dsaek|pkp|keratoplastik)\b/i) {
+                    $item->{domain}         = 'icd10';
+                    $item->{canonical_term} = 'Hornhauttransplantatabstoßung';
+                }
+            }
+            if ($v =~ /\b(?:re[- ]?dmek|re[- ]?dsaek|re[- ]?keratoplastik)\b/i || $c =~ /\bre[- ]?dmek\b/i) {
+                $item->{domain}         = 'ops';
+                $item->{canonical_term} = 'Re-DMEK';
             }
             if ($v =~ /\b(?:kein\s+)?versagen\b/i && $c =~ /^(?:versagen|failure)$/i) {
                 $item->{domain}         = 'icd10';
@@ -4192,7 +4681,7 @@ helper generate_phenopacket_impl => sub {
             elsif ($domain eq 'ops') {
                 my $search_proc = (defined $canon_term && length($canon_term) > 1) ? $canon_term : $v_text;
 
-                if ($v_text =~ /\b(avastin|bevacizumab|lucentis|ranibizumab|eylea|aflibercept|vabysmo|faricimab|beovu|brolucizumab|ozurdex|dexamethason)\b/i) {
+                if ($v_text =~ /\b(avastin|bevacizumab|lucentis|ranibizumab|eylea|aflibercept|vabysmo|faricimab|beovu|brolucizumab|ozurdex|dexamethason|vitreal[\s\-]*s|triamcinolon)\b/i) {
                     my $substance = $1;
                     my $p_atc_auto = $self->map_to_atc_async($substance, $doc_lang)->then(sub {
                         my $mapped_atc = shift;
@@ -4467,15 +4956,41 @@ helper generate_phenopacket_impl => sub {
 
             my %seen_procs;
             my @final_procedures;
+
             foreach my $p (@raw_procedures) {
                 next unless $p && $p->{code}{id};
-                my $key = join('|',
-                    $p->{code}{id},
-                    ($p->{bodySite} ? $p->{bodySite}{id} : 'none'),
-                    ($p->{performedTime} // 'none')
-                );
-                next if $seen_procs{$key}++;
-                push @final_procedures, $p;
+                
+                my $p_code = $p->{code}{id};
+                my $p_site = $p->{bodySite} ? ($p->{bodySite}{id} // 'none') : 'none';
+                my $p_time = $p->{performedTime};
+
+                my $already_exists = 0;
+                for my $existing (@final_procedures) {
+                    my $e_code = $existing->{code}{id};
+                    my $e_site = $existing->{bodySite} ? ($existing->{bodySite}{id} // 'none') : 'none';
+                    my $e_time = $existing->{performedTime};
+
+                    # Gleicher OPS-Code am gleichen Auge
+                    if ($p_code eq $e_code && $p_site eq $e_site) {
+                        # Fall 1: Exakt gleiches Datum
+                        if (defined $p_time && defined $e_time && $p_time eq $e_time) {
+                            $already_exists = 1;
+                            last;
+                        }
+                        # Fall 2: Einer der beiden Einträge hat KEIN Datum (narrative Wiederholung in Anamnese)
+                        # -> Das vorhandene konkrete Datum gewinnt immer!
+                        if (!defined $p_time && defined $e_time) {
+                            $already_exists = 1;
+                            last;
+                        }
+                        if (defined $p_time && !defined $e_time) {
+                            $existing->{performedTime} = $p_time; # Datum nachtragen
+                            $already_exists = 1;
+                            last;
+                        }
+                    }
+                }
+                push @final_procedures, $p unless $already_exists;
             }
 
             my @final_medications;
