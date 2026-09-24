@@ -1,6 +1,8 @@
 #!/usr/bin/env perl
-# Copyright 2026 Daniel Böhringer
+
 # OntoTrial Backend - Step-by-Step Extraction & Deduplicated Disjunctive Assembly Engine
+# Copyright 2026 Daniel Böhringer
+
 # + FHIR Eye Normalization (Study Eye -> Right Eye, Fellow Eye -> Left Eye)
 # TODO: use a BERT model to validate idems after union ensemble (idea)
 # TODO: backport of event date (or use observed date) for PhenoViewer to work properly
@@ -20,6 +22,7 @@ use POSIX qw(strftime);
 use DateTime;
 use Time::HiRes qw(gettimeofday tv_interval);
 use Text::CSV;
+use Digest::MD5 qw(md5_hex);   # ONTOTRIAL-PATCHSET-2026-09-23
 
 no warnings 'uninitialized';
 no warnings 'experimental::vlb'; # Unterdrückt die Lookbehind-Warnung global
@@ -70,7 +73,7 @@ app->hook(before_dispatch => sub {
 # =========================================================
 # GLOBAL CONFIGURATION & LLM SETTINGS
 # =========================================================
-my $api_key      = $ENV{VLLM_API_KEY}   // 'ap-';
+my $api_key      = $ENV{VLLM_API_KEY}   // 'ap-yf';
 my $endpoint     = $ENV{VLLM_ENDPOINT}  // 'https://inference-api.aipier.kn.uniklinik-freiburg.de/v1/chat/completions';
 my $model        = $ENV{VLLM_MODEL}     // 'gpt-oss-120b';
 
@@ -79,6 +82,19 @@ my $llm_provider = $ENV{LLM_PROVIDER}   // 'vllm'; # Options: 'vllm' or 'ollama'
 my $ollama_model = $ENV{OLLAMA_MODEL}   // 'gemma4:31b-mlx';
 
 my $patchbay_url = $ENV{PATCHBAY_URL}   // 'http://localhost:3036';
+# ---------------------------------------------------------
+# MAPPING-QUALITÄT: Reranking, okulärer Prior, Übersetzungscache
+# ---------------------------------------------------------
+my $rerank_enabled       = $ENV{ONTOTRIAL_RERANK}                // 1;
+my $rerank_accept_sim    = $ENV{ONTOTRIAL_RERANK_ACCEPT_SIM}     // 0.985; # ab hier ohne Rückfrage übernehmen
+my $rerank_top_k         = $ENV{ONTOTRIAL_RERANK_TOP_K}          // 5;
+my $ocular_prior_enabled = $ENV{ONTOTRIAL_OCULAR_PRIOR}          // 1;     # Korpus ist ophthalmologisch
+my $ocular_prior_min_sim = $ENV{ONTOTRIAL_OCULAR_PRIOR_MIN_SIM}  // 0.98;
+my $translation_cache_on = $ENV{ONTOTRIAL_TRANSLATION_CACHE}     // 1;
+# PATCH 2026-09-24: Label-Gate und ICD-Auflösungspflicht
+my $label_gate_min_cov   = $ENV{ONTOTRIAL_LABEL_GATE_MIN_COVERAGE} // 0.67;  # Anteil gedeckter Query-Wörter
+my $icd_require_resolved = $ENV{ONTOTRIAL_ICD_REQUIRE_RESOLVED}    // 1;     # ICD-Code muss in icd10_terms stehen
+
 
 # Concurrency throttling configuration for Patchbay
 my $max_patchbay_concurrency = 1;
@@ -164,12 +180,21 @@ my $atomic_criteria_schema = {
                         type => 'string',
                         enum => ['age', 'sex', 'temporal', 'quantity', 'none']
                     },
+                    anatomical_site => {
+                        type => 'string',
+                        enum => [qw(eyelid conjunctiva cornea sclera anterior_chamber iris lens vitreous retina macula choroid optic_disc orbit lacrimal visual_field ocular_motility ocular_other systemic none)],
+                        description => 'Anatomische Struktur des Befundes. "systemic" für extraokuläre Erkrankungen, Labor und Allgemeinmedikation; "none" nur für Demografie.'
+                    },
+                    is_history => {
+                        type => 'boolean',
+                        description => 'true für Vorgeschichte, Z.n., abgeschlossene Ereignisse; false für aktuelle Befunde, laufende Therapie und aktuelle Messwerte.'
+                    },
                     demographic_value => {
                         type => 'string',
                         description => 'Raw numerical threshold or constraint value (e.g., ">= 18", "< 3 mm", "FEMALE", "MALE_OR_FEMALE", "<= 180 days")'
                     }
                 },
-                required => ['verbatim_text', 'canonical_term', 'event_date', 'is_exclusion', 'combination_method', 'disjunction_group_id', 'domain', 'laterality', 'has_modifiers', 'demographic_type', 'demographic_value'],
+                required => ['verbatim_text', 'canonical_term', 'event_date', 'is_exclusion', 'combination_method', 'disjunction_group_id', 'domain', 'laterality', 'has_modifiers', 'demographic_type', 'demographic_value', 'anatomical_site', 'is_history'],
                 additionalProperties => \0
             }
         }
@@ -559,12 +584,14 @@ sub extract_visus_and_refraction {
     return undef unless defined $max_visus || defined $sph;
 
     # Korrekturstatus sauber differenzieren
-    my $is_own_glasses = ($clean_for_visus =~ /\b(?:eB|m\.?e\.?B|eigene\s+brille)\b/i) ? 1 : 0;
-    my $is_corrected   = 0;
+    my $is_own_glasses  = ($clean_for_visus =~ /\b(?:eB|m\.?e\.?B|eigene\s+brille)\b/i) ? 1 : 0;
+    my $is_contact_lens = ($raw_text =~ /\b(?:KL|formstabile\s+KL|kontaktlinse|mit\s+kontaktlinse|mit\s+[kvc]l)\b/i) ? 1 : 0;
+    my $is_corrected    = 0;
 
-    if (defined $sph || $clean_for_visus =~ /\b(?:cc|mit\s+korrektur)\b/i) {
-        $is_corrected = 1; # Bestkorrigiert mit Refraktion / Gläsern
-    } elsif ($clean_for_visus =~ /\bsc\b|\bohne\s+korrektur\b/i && !$is_own_glasses) {
+    # Kontaktlinse oder Refraktion gilt immer als korrigierter Visus (cc)
+    if (defined $sph || $clean_for_visus =~ /\b(?:cc|mit\s+korrektur|mit\s+kontaktlinse|mit\s+[kvc]l)\b/i || $is_contact_lens) {
+        $is_corrected = 1; # Bestkorrigiert mit Refraktion / Gläsern / Kontaktlinse
+    } elsif ($clean_for_visus =~ /\bsc\b|\bohne\s+korrektur\b/i && !$is_own_glasses && !$is_contact_lens) {
         $is_corrected = 0; # Unkorrigiert
     }
 
@@ -574,8 +601,6 @@ sub extract_visus_and_refraction {
     } elsif ($is_own_glasses && defined $max_visus) {
         $eb_visus = $max_visus;
     }
-
-    my $is_contact_lens = ($raw_text =~ /\b(?:KL|formstabile\s+KL|kontaktlinse)\b/i) ? 1 : 0;
     
     return {
         visus_value          => $max_visus,
@@ -627,10 +652,17 @@ sub build_ophthalmic_loinc_measurements {
 
     # 2. Bestkorrigierter Visus (cc) - separat erfassen, wenn vorhanden und abweichend
     if (defined $parsed_ref->{visus_value} && (!$parsed_ref->{is_own_glasses} || defined $parsed_ref->{sphere})) {
-        my $loinc_id    = $is_left  ? "LOINC:65897-1" : ($is_right ? "LOINC:65893-0" : "LOINC:28637-7");
-        my $loinc_label = $is_left  ? "Visual acuity best corrected Left eye"
-                        : ($is_right ? "Visual acuity best corrected Right eye" : "Visual acuity best corrected");
-
+        my ($loinc_id, $loinc_label);
+        if ($parsed_ref->{is_best_corrected}) {
+            $loinc_id    = $is_left ? "LOINC:65897-1" : ($is_right ? "LOINC:65893-0" : "LOINC:28637-7");
+            $loinc_label = $is_left ? "Visual acuity best corrected Left eye"
+                                    : ($is_right ? "Visual acuity best corrected Right eye" : "Visual acuity best corrected");
+        } else {
+            # Unkorrigierter Visus (s.c.)
+            $loinc_id    = $is_left ? "LOINC:65896-3" : ($is_right ? "LOINC:65892-2" : "LOINC:28637-7");
+            $loinc_label = $is_left ? "Visual acuity uncorrected Left eye"
+                                    : ($is_right ? "Visual acuity uncorrected Right eye" : "Visual acuity uncorrected");
+        }
         my @mods = ({ id => "LP7753-9", label => "Measurement: = $parsed_ref->{visus_value} decimal" });
         push @mods, $lat_obj if $lat_obj;
 
@@ -730,7 +762,9 @@ sub parse_quantitative_constraint {
     $text =~ s/(\d+),(\d+)/$1.$2/g;
     $text =~ s/cm\s*h2o/cmH2O/gi;
     $text =~ s/cm\s*wasser/cmH2O/gi;
-
+    # Spannweiten wie "586-1187 Zellen/mm²" normalisieren (unteren Wert nehmen)
+    $text =~ s/(\d+)\s*[-–]\s*\d+\s*(zellen|cells)/$1 $2/gi;
+    
     # Bilateral Ophthalmic Pressure Intercept
     if ($text =~ /\b(?:tmax|tensio|iop|augendruck)\s*[:=]?\s*(\d{1,2})\s*[\/;]\s*(\d{1,2})\s*(?:mmhg)?\b/i) {
         my ($p_right, $p_left) = ($1 + 0, $2 + 0);
@@ -819,9 +853,12 @@ sub parse_quantitative_constraint {
         }
     }
 
-    # Bilateraler BMO-Area / OCT-Flächen-Intercept (z. B. "BMO-Area: 1,49/1,83 mm²")
-    if ($text =~ /\b(?:bmo[- ]?(?:area|fl[äa]che)?|fl[äa]che)\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*[\/;]\s*(\d+(?:[\.,]\d+)?)\s*(?:mm[²2])?\b/i) {
-        my ($bmo_r, $bmo_l) = ($1 + 0.0, $2 + 0.0);
+    # -------------------------------------------------------------
+    # BMO-Area / Bruch's Membrane Opening Fläche (bilateral & unilateral)
+    # -------------------------------------------------------------
+    # 1. Bilateraler BMO-Area Intercept (z. B. "BMO-Area: 1,49/1,83 mm²")
+    if ($text =~ /\b(?:bmo[- ]?(?:area|fl[äa\?]che)?|fl[äa\?]che)\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*[\/;]\s*(\d+(?:[\.,]\d+)?)\s*(?:mm[²23]|mm\^?[23]|mm\?)?\b/i) {
+        my ($bmo_r, $bmo_l) = ($1, $2); # ERST String zuweisen, KEIN vorzeitiges '+ 0.0'!
         $bmo_r =~ s/,/./;
         $bmo_l =~ s/,/./;
         return {
@@ -830,6 +867,18 @@ sub parse_quantitative_constraint {
             left_bmo         => $bmo_l + 0.0,
             unit             => 'mm2',
             comparator       => '='
+        };
+    }
+
+    # 2. Unilateraler BMO-Area Intercept (z. B. "bmo-oct R: BMO-Area 1,91 mm²")
+    if ($text =~ /\b(?:bmo[- ]?(?:area|fl[äa\?]che)?|bmo[- ]?oct.*?area)\s*[:=]?\s*([+-]?\d+(?:[\.,]\d+)?)\s*(?:mm[²23]|mm\^?[23]|mm\?)?/i) {
+        my $val = $1;
+        $val =~ s/,/./;
+        return {
+            comparator => '=',
+            value      => $val + 0.0,
+            unit       => 'mm2',
+            formatted  => "= $val mm2"
         };
     }
 
@@ -854,6 +903,19 @@ sub parse_quantitative_constraint {
     my $clean_text = $text;
     $clean_text =~ s/\(.*?\)//g;
 
+    # -------------------------------------------------------------
+    # Datumsangaben (z. B. "01/2023", "14.08.2023", "stabil zu 2023")
+    # maskieren/entfernen, damit Tage/Monate nicht als Messwert "1" geparst werden!
+    # -------------------------------------------------------------
+    $clean_text =~ s/\b(?:stabil\s+zu|progredient\s+zu|befund\s+vom?|stand|vom?|zuletzt|am)\s+(?:0?[1-9]|1[0-2])[\/\.](?:19|20)\d{2}\b/ /gi;
+    $clean_text =~ s/\b(?:0?[1-9]|[12]\d|3[01])\.(?:0?[1-9]|1[0-2])\.(?:19|20)\d{2}\b/ /g; # DD.MM.YYYY
+    $clean_text =~ s/\b(?:0?[1-9]|1[0-2])\/(?:19|20)\d{2}\b/ /g;                           # MM/YYYY
+    $clean_text =~ s/\b(?:19|20)\d{2}\b/ /g;                                               # Vierstelliges Jahr YYYY
+
+    # Reines Datum / rein qualitativer Text übrig geblieben? -> Kein quantitativer Messwert
+        if ($clean_text !~ /\d/) {
+            return undef;
+        }
     # Akronyme mit Zahlen maskieren, um Fehlmatches zu verhindern
     $clean_text =~ s/\b(?:löslicher\s+)?interleukin[- ]?(?:rezeptor[- ]?)?\d+\b/__INTERLEUKIN__/gi;
     $clean_text =~ s/\b(?:s?il[- ]?2[- ]?r|il[- ]?\d+)\b/__INTERLEUKIN__/gi;
@@ -1145,6 +1207,47 @@ sub generate_characteristic_signature {
 # =========================================================
 # ASYNCHRONOUS DENSE VECTOR QUERY TRANSLATOR & LANGUAGE DETECTOR
 # =========================================================
+# ---------------------------------------------------------
+# GENERISCHER SCHEMA-GEBUNDENER LLM-AUFRUF (vLLM / Ollama)
+# ---------------------------------------------------------
+helper llm_json_call_async => sub {
+    my ($self, $sys_prompt, $user_prompt, $schema, $schema_name, $client_model) = @_;
+    my $cfg = resolve_llm_config($client_model);
+
+    my $payload = $cfg->{is_ollama}
+        ? {
+            model    => $cfg->{model},
+            messages => [ { role => 'system', content => $sys_prompt }, { role => 'user', content => $user_prompt } ],
+            format   => $schema,
+            stream   => Mojo::JSON->false,
+            options  => { temperature => 0.0, repeat_penalty => 1.15, repeat_last_n => 512, num_predict => 512 },
+          }
+        : {
+            model           => $cfg->{model},
+            messages        => [ { role => 'system', content => $sys_prompt }, { role => 'user', content => $user_prompt } ],
+            temperature     => 0.0,
+            response_format => { type => 'json_schema', json_schema => { name => $schema_name, strict => \1, schema => $schema } },
+          };
+
+    return $ua_fast->post_p($cfg->{endpoint} => $cfg->{headers} => json => $payload)->then(sub {
+        my $tx = shift;
+        return undef unless $tx->result && $tx->result->is_success;
+        my $raw = $cfg->{is_ollama}
+            ? ($tx->result->json('/message/content') // '')
+            : ($tx->result->json('/choices/0/message/content') // '');
+        my $data = clean_and_parse_json($raw);
+        return (ref $data eq 'HASH') ? $data : undef;
+    })->catch(sub {
+        my $err = shift;
+        $self->app->log->warn("[LLM JSON CALL FAILED] $schema_name: $err");
+        return undef;
+    });
+};
+
+# =========================================================
+# ASYNCHRONOUS DENSE VECTOR QUERY TRANSLATOR (MIT CACHE)
+# Rückgabe: Suchbegriff | '__NONE__' (kein kodierbares Konzept) | Fallback
+# =========================================================
 helper normalize_criterion_for_retrieval_async => sub {
     my ($self, $verbatim_text, $domain, $client_model) = @_;
     my $fallback = clean_term_for_vector_mapping($verbatim_text);
@@ -1177,6 +1280,24 @@ helper normalize_criterion_for_retrieval_async => sub {
     $user_prompt =~ s/\{\{domain\}\}/$domain/g;
     $user_prompt =~ s/\{\{verbatim_text\}\}/$verbatim_text/g;
 
+    # Cache-Schlüssel hängt an der Prompt-Version: ändert sich der Prompt,
+    # wird neu übersetzt. Kuratierte Einträge (curated = TRUE) gelten immer.
+    my $prompt_hash = md5_hex(encode('UTF-8', ($prompt_record->{system_prompt} // '') . "\x{1}" . ($prompt_record->{user_template} // '')));
+
+    if ($translation_cache_on) {
+        my $row = eval {
+            $self->pg->db->query(q{
+                SELECT query FROM public.translation_cache
+                 WHERE domain = ? AND target_language = ? AND source_text = ?
+                   AND (prompt_hash = ? OR curated)
+                 ORDER BY curated DESC LIMIT 1
+            }, $domain, $target_language, $verbatim_text, $prompt_hash)->hash;
+        };
+        if ($row && defined $row->{query} && length $row->{query}) {
+            return Mojo::Promise->resolve($row->{query} eq '-' ? '__NONE__' : $row->{query});
+        }
+    }
+
     my $translation_schema = {
         type => 'object',
         properties => {
@@ -1187,82 +1308,49 @@ helper normalize_criterion_for_retrieval_async => sub {
             },
             query => {
                 type => 'string',
-                description => "The most specific concise 1-4 word search query in $target_language."
+                description => "The most specific concise search query in $target_language, or a single hyphen '-' if the input carries no codable clinical concept."
             }
         },
         required => ['detected_language', 'query'],
         additionalProperties => \0
     };
 
-    my $llm_cfg         = resolve_llm_config($client_model);
-    my $active_model    = $llm_cfg->{model};
-    my $active_endpoint = $llm_cfg->{endpoint};
-    my $headers         = $llm_cfg->{headers};
-    my $is_local        = $llm_cfg->{is_ollama};
+    return $self->llm_json_call_async($sys_prompt, $user_prompt, $translation_schema, 'query_language_translation', $client_model)->then(sub {
+        my $data = shift;
+        return $fallback unless ref $data eq 'HASH' && defined $data->{query};
 
-    my $api_payload;
-    
-    if ($is_local) {
-        $api_payload = {
-            model    => $active_model,
-            messages => [
-                { role => 'system', content => $sys_prompt },
-                { role => 'user',   content => $user_prompt }
-            ],
-            format   => $translation_schema,
-            stream   => Mojo::JSON->false,
-            options  => {
-                temperature    => 0.0,
-                repeat_penalty => 1.15,
-                repeat_last_n  => 512,
-                num_predict    => 512,
-            }
-        };
-    } else {
-        $api_payload = {
-            model       => $active_model,
-            messages    => [
-                { role => 'system', content => $sys_prompt },
-                { role => 'user',   content => $user_prompt }
-            ],
-            temperature => 0.0,
-            response_format => {
-                type => 'json_schema',
-                json_schema => {
-                    name => "query_language_translation",
-                    strict => \1,
-                    schema => $translation_schema
-                }
-            }
-        };
-    }
-    
-    return $ua_fast->post_p($active_endpoint => $headers => json => $api_payload)->then(sub {
-        my $tx = shift;
-        if ($tx->result && $tx->result->is_success) {
-            my $raw_content = $is_local
-                ? ($tx->result->json('/message/content') // '')
-                : ($tx->result->json('/choices/0/message/content') // '');
+        my $raw_q    = $data->{query};
+        my $det_lang = lc($data->{detected_language} // 'unknown');
+        $raw_q =~ s/<think>.*?<\/think>//gs;
 
-            my $data = clean_and_parse_json($raw_content);
-            if (ref $data eq 'HASH' && defined $data->{query} && length($data->{query}) > 0) {
-                my $clean_query = $data->{query};
-                my $det_lang    = lc($data->{detected_language} // 'unknown');
-
-                $clean_query =~ s/<think>.*?<\/think>//gs;
-                $clean_query =~ s/^\s*["'\`\:\-\>\#\*\.]+|["'\`\.]+\s*$//g;
-                $clean_query =~ s/\s+/ /g;
-                $clean_query =~ s/^\s+|\s+$//g;
-
-                if (length($clean_query) > 1) {
-                    $self->app->log->info("[QUERY TRANSLATION] ($domain) Detected: '$det_lang' -> Target: '$target_language' | '$verbatim_text' -> '$clean_query'");
-                    return $clean_query;
-                }
-            }
+        # Das "-"-Signal VOR dem Säubern prüfen, sonst wird es zu einem leeren
+        # String und der Rohbegriff landet doch in der Vektorsuche.
+        (my $probe = $raw_q) =~ s/["'`\s]//g;
+        my $clean_query;
+        if ($probe =~ /^[-\x{2013}\x{2014}]$/) {
+            $clean_query = '-';
+        } else {
+            $clean_query = $raw_q;
+            $clean_query =~ s/^\s*["'\`\:\-\>\#\*\.]+|["'\`\.]+\s*$//g;
+            $clean_query =~ s/\s+/ /g;
+            $clean_query =~ s/^\s+|\s+$//g;
+            return $fallback unless length($clean_query) > 1;
         }
-        return $fallback;
-    })->catch(sub {
-        return $fallback;
+
+        if ($translation_cache_on) {
+            eval {
+                $self->pg->db->query(q{
+                    INSERT INTO public.translation_cache
+                           (domain, target_language, source_text, prompt_hash, query, detected_language)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (domain, target_language, source_text, prompt_hash) DO NOTHING
+                }, $domain, $target_language, $verbatim_text, $prompt_hash, $clean_query, $det_lang);
+            };
+            $self->app->log->warn("[TRANSLATION CACHE WRITE FAILED] $@") if $@;
+        }
+
+        $self->app->log->info("[QUERY TRANSLATION] ($domain) Detected: '$det_lang' -> Target: '$target_language' | '$verbatim_text' -> '$clean_query'");
+        return $clean_query eq '-' ? '__NONE__' : $clean_query;
     });
 };
 # =========================================================
@@ -1295,7 +1383,7 @@ helper get_domain_intercepts => sub {
 };
 
 helper check_database_intercept => sub {
-    my ($self, $domain, $text) = @_;
+    my ($self, $domain, $text, $context) = @_;
     return undef unless defined $text && length($text);
 
     my $intercepts = $self->get_domain_intercepts($domain);
@@ -1309,20 +1397,40 @@ helper check_database_intercept => sub {
             $self->app->log->warn("[INVALID REGEX IN DB] Domain: '$domain', Pattern: '$pattern' - $@");
             next;
         }
+        next unless $matched;
 
-        if ($matched) {
-            # Suppress-Regeln verwerfen den Begriff vollständig. Der Aufrufer
-            # muss auf { suppress => 1 } prüfen und die Zeile fallen lassen,
-            # OHNE auf den Vektor-Retrieval zurückzufallen.
-            if ($rule->{suppress}) {
-                $self->app->log->info("[INTERCEPT SUPPRESS] Domain '$domain': '$text' durch Regel '$rule->{code}' verworfen.");
-                return { suppress => 1, id => undef, label => $rule->{label} };
-            }
-            return {
-                id    => $rule->{code},
-                label => $rule->{label}
-            };
+        # Suppress-Regeln verwerfen den Begriff vollständig. Der Aufrufer
+        # muss auf { suppress => 1 } prüfen und die Zeile fallen lassen,
+        # OHNE auf den Vektor-Retrieval zurückzufallen.
+        if ($rule->{suppress}) {
+            $self->app->log->info("[INTERCEPT SUPPRESS] Domain '$domain': '$text' durch Regel '$rule->{code}' verworfen.");
+            return { suppress => 1, id => undef, label => $rule->{label}, source => 'intercept' };
         }
+
+        my $code = $rule->{code};
+
+        # Auch kuratierte Regeln laufen durch den Scope-Guard. Der Kontext
+        # (Verbatim-Text) liefert das Organ, das im kurzen Begriff fehlt:
+        # "Schmerzen" + "Oberarm rechts" darf nicht zu Ocular pain werden.
+        my $scope_text = (defined $context && length $context) ? "$text $context" : $text;
+        if ($domain =~ /^(?:icd10|hpo|ops)$/ && $self->has_scope_conflict($domain, $code, $scope_text)) {
+            $self->app->log->warn("[INTERCEPT SCOPE CONFLICT] Domain '$domain': '$text' -> $code widerspricht dem Kontext. Nächste Regel.");
+            next;
+        }
+
+        # Label immer aus der Ontologie, nicht aus der Intercept-Tabelle.
+        my $label = $rule->{label};
+        if ($domain eq 'hpo' || $domain eq 'icd10') {
+            (my $raw = $code // '') =~ s/^(?:HP|ICD10)://i;
+            my $db_label = $self->get_canonical_ontology_label($domain, $raw);
+            if (defined $db_label && length $db_label) {
+                $label = $db_label;
+            } else {
+                $self->app->log->debug("[INTERCEPT CODE NOT IN ONTOLOGY] $domain $code ('$rule->{label}')");
+            }
+        }
+
+        return { id => $code, label => $label, source => 'intercept', rule_label => $rule->{label} };
     }
     return undef;
 };
@@ -1515,10 +1623,11 @@ sub enrich_term_with_section_context {
     }
 
     # 8. Pupillenweite: Miosis vs. Mydriasis
-    if ($term =~ /\b(?:pupilleneng|pupillenverengung|miosis)\b/i) {
+    if ($term =~ /\b(?:pupilleneng\w*|pupillenverengung\w*|mios[ei]s|eng(?:e|gestellte)?\s+pupille\w*)/i
+        && $term !~ /\bmydria/i) {
         return "miosis";
     }
-    if ($term =~ /\b(?:pupillenweit|pupillenerweiterung|mydriasis)\b/i) {
+    if ($term =~ /\b(?:pupillenweit\w*|pupillenerweiterung\w*|mydriasis|weite\s+pupille\w*)/i) {
         return "mydriasis";
     }
 
@@ -1719,6 +1828,13 @@ sub enrich_term_with_section_context {
     # 2. AUSWERTUNG: NETZHAUT / MAKULA / OCT / FAG (RETINA)
     # ---------------------------------------------------------------------
     if ($is_retina) {
+        # Makulaödem darf niemals durch erwähnte Gliose überschrieben werden
+        if ($term =~ /\bmakula[öo]dem\b/i || $local_context =~ /^makula[öo]dem/i) {
+            if ($term =~ /\btraktiv\b/i || $combined =~ /\btraktiv\b/i) {
+                return "tractional macular edema";
+            }
+            return "macular edema";
+        }
         # Gliose
         if ($combined =~ /\b(?:glios\w*|glial\s*scarring)\b/i) {
             if ($combined =~ /\b(?:traktion|traction|epiretinal|pucker|makula|macula|fovea)\b/i) {
@@ -1933,12 +2049,13 @@ sub enrich_term_with_section_context {
     return $term;
 }
 helper map_to_hpo_async => sub {
-    my ($self, $term, $is_modifier, $doc_lang) = @_;
+    my ($self, $term, $is_modifier, $doc_lang, $opts) = @_;
+    $opts //= {};
     return Mojo::Promise->resolve(undef) unless defined $term && length($term);
     return Mojo::Promise->resolve(undef) if $term =~ /unknown/i;
 
     # 1. Check auf Originalbegriff
-    if (my $hit = $self->check_database_intercept('hpo', $term)) {
+    if (my $hit = $self->check_database_intercept('hpo', $term, $opts->{context})) {
         return Mojo::Promise->resolve(undef) if $hit->{suppress};
         $self->app->log->info("[HPO DB INTERCEPT] '$term' -> $hit->{id} ($hit->{label})");
         return Mojo::Promise->resolve($hit);
@@ -1952,9 +2069,14 @@ helper map_to_hpo_async => sub {
 
     return $p_query->then(sub {
         my $clean_query = shift;
+        if (!defined $clean_query || $clean_query eq '__NONE__') {
+            $self->app->log->info("[HPO NO CONCEPT] '$term' enthält kein kodierbares Konzept.");
+            return undef;
+        }
 
         # 2. Check auf übersetzten / bereinigten Suchbegriff
-        if (my $hit = $self->check_database_intercept('hpo', $clean_query)) {
+        if (my $hit = $self->check_database_intercept('hpo', $clean_query, $opts->{context})) {
+            return undef if $hit->{suppress};
             $self->app->log->info("[HPO DB INTERCEPT] '$clean_query' -> $hit->{id} ($hit->{label})");
             return $hit;
         }
@@ -1962,26 +2084,18 @@ helper map_to_hpo_async => sub {
         my $execute_call = sub {
             my $prompt_id = $is_modifier ? LLM_HPO_MODIFIER_RETRIEVAL_PROMPT_ID : LLM_HPO_RETRIEVAL_PROMPT_ID;
             my $url_retrieve = "$patchbay_url/LLM/run_stateless/" . $prompt_id;
-
-            my $encoded_payload = encode('UTF-8', $clean_query);
-
             return $ua_fast->post_p(
-                $url_retrieve => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => $encoded_payload
-            )->then(sub {
-                my $tx = shift;
-                if ($tx->result && $tx->result->is_success) {
-                    my $body = $tx->result->body;
-                    my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
-                    if (ref $matches eq 'ARRAY' && @$matches) {
-                        my $res = $self->_build_vector_res('hpo', $matches->[0], $clean_query);
-                        return $res if $res;
-                    }
-                }
-                # Kein Treffer oder verworfen: KEIN HP:0000118-Wurzelknoten zurückgeben.
-                return undef;
-            })->catch(sub { return undef; });
+                $url_retrieve => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => encode('UTF-8', $clean_query)
+            )->then(sub { return _decode_matches(shift) })
+             ->catch(sub { my $e = shift; $self->app->log->warn("[HPO RETRIEVAL ERROR] '$clean_query': $e"); return []; });
         };
-        return $self->enqueue_patchbay_call($execute_call, $clean_query);
+
+        # Reranking erst NACH der Patchbay-Queue, damit der Queue-Slot nicht
+        # während des LLM-Aufrufs blockiert.
+        return $self->enqueue_patchbay_call($execute_call, $clean_query)->then(sub {
+            my $matches = shift;
+            return $self->_select_vector_hit_async('hpo', $matches, $clean_query, $opts);
+        })->catch(sub { return undef; });
     });
 };
 
@@ -2007,48 +2121,80 @@ sub _extract_vector_dist_str {
     return "";
 }
 
-our $OCULAR_TERM_REGEX = qr{\b(?:
-    auge|augen|ocular|ophthalm\w*|bulbus|intraokular\w*|intraocular|
-    hornhaut|kornea|cornea|corneal|keratit\w*|keratopath\w*|keratoplast\w*|
-    bindehaut|konjunktiv\w*|conjunctiv\w*|
-    augenlid|lidrand|lidkante|lidspalte|eyelid|palpebr\w*|tarsus|kanthus|canthus|
-    iris|pupill\w*|pupil|synechi\w*|
-    linse|lens|katarakt|cataract|iol|hinterkammerlinse|kapselsack|
-    netzhaut|retina|retinal|makula|macula|macular|fovea|foveal|
-    aderhaut|choroid\w*|
-    papille|sehnerv|optic\s*(?:disc|nerve)|rnfl|bmo|
-    glask[öo]rper|vitre\w*|
-    skleral?|sclera\w*|
-    vorderkammer|anterior\s*chamber|kammerwinkel|trabekel\w*|
-    tr[äa]nen\w*|lacrimal|dakryo\w*|
-    orbita|orbital|
-    descemet|deszemet|endothel\w*|endotheli\w*|limbus|limbal|epithelstippung|
-    visus|sehsch[äa]rfe|visual\s*acuity|gesichtsfeld|visual\s*field|
-    skotom|scotoma|perimetr\w*|
-    glaukom|glaucoma|tensio|augeninnendruck|intraocular\s*pressure|
-    uveit\w*|amotio|ablatio\s*retinae|
-    sickerkissen|filterkissen|filtering\s*bleb|bleb
-    )\b}xi;
+# Okuläre Stämme OHNE abschließende Wortgrenze, damit deutsche Komposita
+# ("Narbenentropiumoperation", "Oberlidentropium", "Pupillenengheit") matchen.
+# Kurze oder mehrdeutige Stämme sind mit Wortgrenzen/Lookaheads abgesichert
+# (tarsal vs. metatarsal, Keratitis vs. Keratose, Sklera vs. Sklerose,
+#  Papille vs. Papillom, makulär vs. makulopapulös, tensio vs. Hypertension).
+our $OCULAR_TERM_REGEX = qr{(?:
+    \baug(?:e|en)|ocular|ophthalm|intraokul|intraocul|\bbulbus|
+    hornhaut|kornea|cornea|kerat(?:it|opath|oplast|okon|ektas|omil|otom|ometr)|descemet|deszemet|
+    hornhautendothel|endothelzell|endotheldystroph|limbus|limbal|
+    bindehaut|konjunktiv|conjunctiv|pingue|pterygi|chemos[ie]|chemotisch|hyposphagm|
+    (?:ober|unter|augen)lid|\blid(?:er|kante|rand|spalt|schwell|öd|hämat|schluss|haut|winkel|fehl|retrakt|tief|lamelle|ptos|rötung)|\blid\b|eyelid|palpebr|\btarsus|\btarsal|kanthus|canthus|
+    entropi|ektropi|ectropi|blepharo|chalazi|hordeol|symblephar|tarsorr|trichias|distichias|madaros|\bptos|dermatochalas|lagophth|
+    \biris|irid|pupill|\bpupil|synechi|rubeos|
+    linse\b|linsen(?:trüb|lux|sublux|disloz|kern|kapsel|implant|einnäh|berg|touch|pigment|affekt)|kontaktlinse|sklerallinse|verbandslinse|sulcuslinse|intraokularlinse|
+    \blens\b|katarakt|cataract|\biol\b|hinterkammerlinse|kapselsack|hinterkapsel|vorderkapsel|kapsulotom|nachstar|phako|aphak|pseudophak|
+    netzhaut|retin|makul(?!opapul|opapill)|macul(?!opapul)|fove|drusen|
+    aderhaut|chorioid|choroid|chorioretin|
+    papille\b|papillen(?:rand|exkav|öd|schwell|blut|atroph|bläss|leck|angiom|drus)|sehnerv|optikus|opticus|optic\s*(?:disc|nerve)|rnfl|\bbmo\b|
+    glaskörper|vitre|vitrekt|
+    sklera|skleral|sklerit|episkler|scler(?:a\b|al\b|itis)|
+    vorderkammer|anterior\s*chamber|kammerwinkel|trabek|zyklophoto|zyklokryo|ziliar|hyphäm|hypopyon|
+    tränen|lacrimal|dakryo|kanalikul|
+    \borbit|periorbit|exophthalm|enophthalm|
+    \bvisus|sehschärfe|visual\s*acuity|gesichtsfeld|visual\s*field|skotom|scotoma|perimetr|
+    glaukom|glaucoma|\btensio|augeninnendruck|intraocular\s*pressure|
+    uveit|iridozykl|amotio|ablatio\s*retinae|endophthalm|
+    sickerkissen|filterkissen|filtering\s*bleb|\bbleb|
+    schiel|strabism|esotrop|exotrop|heterophor|nystagm|diplop|doppelbild|
+    okulomot|oculomot|abduzens|abducens|trochlear|
+    retinopex|kryopex|\bivom|intravitreal|subkonjunktival|parabulbär|retrobulbär
+    )}xi;
 
-# Signalwörter für "der Begriff betrifft ausdrücklich NICHT das Auge".
-# Bewusst eng gehalten: nur Organe und Gefässgebiete, die im Augenbrief
-# eindeutig als Nebenbefund auftreten.
-our $EXTRAOCULAR_TERM_REGEX = qr{\b(?:
-    aorta|aorten\w*|aortal\w*|carotis|karotis|femoralis|
-    zerebral\w*|cerebral\w*|intrakraniell\w*|hirn\w*|
-    arterielle[rns]?\s+(?:hyperton|hypoton|verschluss)\w*|blutdruck|
-    magen|ventriculi|gastric|duoden\w*|darm|kolon|colon|appendix|
-    unterschenkel|cruris|\bbein\b|\bbeine\b|\bfu[ßs]\b|zehe|
-    \bhand\b|finger|\barm\b|schulter|
-    niere|renal|nephro\w*|blase|prostata|
-    leber|hepat\w*|
-    lunge|pulmonal\w*|bronchial\w*|
-    herz|kardial\w*|koronar\w*|myokard\w*|
-    mamma|uterus|ovar\w*|
-    schilddr[üu]se|thyreo\w*|
-    wirbels[äa]ule|knochen|gelenk|h[üu]fte|\bknie\b|
-    zahn|z[äa]hne|dens\b|kiefer
-    )\b}xi;
+# Extraokuläre Signalwörter, ebenfalls kompositafähig. Bewusst ohne "haut"
+# (Hornhaut, Bindehaut, Netzhaut, Aderhaut) und ohne "nas" (nasal = Position).
+our $EXTRAOCULAR_TERM_REGEX = qr{(?:
+    aorta|aorten|aortal|carotis|karotis|femoral|
+    zerebr|cerebr|intrakran|\bhirn(?!nerv)|gehirn|
+    arterielle[rns]?\s+(?:hyperton|hypoton|verschluss)|blutdruck|
+    magen|ventricul|gastr|duoden|darm|kolon|colon|rektum|append|galle|chole|
+    leber|hepat|niere|nephr|renal|harnblase|blasenkarzinom|blasen-ca|blasenentleer|prostat|zystoskop|zystektom|
+    lunge|pulmo|bronch|thorak|
+    \bherz|kardi|koronar|myokard|schrittmacher|bypass|mitral|aortenklapp|trikuspid|vorhof|
+    mamma|\bbrust|uterus|hyster|ovar|
+    schilddr|struma|
+    wirbel|knochen|gelenk|arthr|hüft|\bknie|menisk|
+    unterschenkel|cruris|\bbein|oberarm|unterarm|\barm\b|schulter|\bhand\b|finger|\bfu[ßs]|zehe|
+    zahn|zähne|kiefer|gaumen|zunge|wange|gesichtshälfte|schläfe|\bstirn\b|
+    \bohr|mittelohr|mastoid|pauken|tonsill|
+    hautkrebs|hautausschlag|hautläsion|dermat(?!ochalas)
+    )}xi;
+
+# Gehört ein Code zum okulären Bereich der jeweiligen Terminologie?
+# undef = für diese Domäne nicht bewertbar (atc, loinc).
+helper is_ocular_code => sub {
+    my ($self, $domain, $code) = @_;
+    return undef unless defined $code && length $code;
+    if ($domain eq 'icd10') {
+        my $c = uc($code); $c =~ s/^ICD10://;
+        return ($c =~ /^(?:H[0-5]\d|D31|C69|Q1[0-5]|Z96\.1|Z94\.7|T85\.2|T86\.83|B02\.3|B00\.5|S05|D09\.2|D22\.1|D23\.1|T26|T85\.3)/) ? 1 : 0;
+    }
+    if ($domain eq 'hpo') {
+        return ( $self->is_subclass_of($code, 'HP:0000478')  # Abnormality of the eye
+              || $self->is_subclass_of($code, 'HP:0000315') ) ? 1 : 0;   # orbital region
+    }
+    if ($domain eq 'ops') {
+        my $c = lc($code); $c =~ s/^ops://;
+        return ($c =~ /^5-(?:0[89]|1[0-6])/      # Augenchirurgie inkl. Lid und Tränenwege
+             || $c =~ /^1-2[0-4]/                # Augendiagnostik
+             || $c =~ /^1-840/                   # Diagnostische Punktion Auge
+             || $c =~ /^8-0(?:20|11)/            # Injektion Auge, Verbandlinse
+             || $c =~ /^8-170/) ? 1 : 0;         # Spülung Tränenwege
+    }
+    return undef;
+};
 
 # Gibt 1 zurück, wenn Begriff und Code einander widersprechen.
 helper has_scope_conflict => sub {
@@ -2059,87 +2205,470 @@ helper has_scope_conflict => sub {
     my $term_ocular      = ($term =~ $OCULAR_TERM_REGEX)      ? 1 : 0;
     my $term_extraocular = ($term =~ $EXTRAOCULAR_TERM_REGEX) ? 1 : 0;
 
-    # Kein Signal in beide Richtungen -> nicht bewerten, durchlassen.
+    # Kein Signal oder beide Signale ("Aderhautmetastase bei Mammakarzinom")
+    # -> nicht bewerten, durchlassen.
     return 0 unless $term_ocular || $term_extraocular;
-
-    # Beides genannt ("Aderhautmetastase bei Mammakarzinom",
-    # "Diabetische Retinopathie") -> nicht bewerten, durchlassen.
     return 0 if $term_ocular && $term_extraocular;
 
-    # Ist der CODE okulär?
-    my $code_ocular;
-    if ($domain eq 'icd10') {
-        my $c = uc($code); $c =~ s/^ICD10://;
-        $code_ocular = ($c =~ /^H[0-5]\d/) ? 1 : 0;      # Kapitel VII: H00-H59
-    }
-    elsif ($domain eq 'hpo') {
-        $code_ocular = ( $self->is_subclass_of($code, 'HP:0000478')
-        || $self->is_subclass_of($code, 'HP:0000315') ) ? 1 : 0;
-    }
-    elsif ($domain eq 'ops') {
-        my $c = lc($code); $c =~ s/^ops://;
-        $code_ocular = ($c =~ /^5-(?:0[89]|1[0-6])/     # Augenchirurgie
-        || $c =~ /^1-2[0-4]/               # Augendiagnostik
-        || $c =~ /^8-020/) ? 1 : 0;        # Injektion Auge
-    }
-    else {
-        return 0;   # atc, loinc: kein anatomischer Scope
-    }
+    my $code_ocular = $self->is_ocular_code($domain, $code);
+    return 0 unless defined $code_ocular;
 
     return 1 if $term_ocular      && !$code_ocular;   # Auge -> Fremdfach
     return 1 if $term_extraocular &&  $code_ocular;   # Fremdfach -> Auge
     return 0;
 };
 
+# Widerspruch zwischen dem vom LLM angegebenen anatomical_site und dem Code.
+# Nur HPO und OPS: im ICD-10 liegen viele okuläre Manifestationen außerhalb
+# von Kapitel VII (B02.3, C69, D31, T85.2, T86.83, S05, Q15 ...).
+helper site_conflict => sub {
+    my ($self, $domain, $code, $site, $sim) = @_;
+    return '' unless defined $site && length $site && $site ne 'none';
+    return '' unless $domain eq 'hpo' || $domain eq 'ops';
+    my $oc = $self->is_ocular_code($domain, $code);
+    return '' unless defined $oc;
+    if ($site eq 'systemic') {
+        return $oc ? 'systemischer Befund, okulärer Code' : '';
+    }
+    return '' if $oc;
+    return '' if defined $sim && $sim >= $ocular_prior_min_sim;   # nahezu exakter Treffer
+    return "okuläre Struktur '$site', nicht-okulärer Code";
+};
+
 # Einheitliche Treffer-Auswertung für HPO/OPS/ATC/LOINC:
 # Distanzschwelle + Scope-Guard + Label-Auflösung.
 # Gibt undef zurück, wenn der Treffer verworfen wird.
+# ---------------------------------------------------------
+# Hilfsfunktionen für die Trefferauswertung
+# ---------------------------------------------------------
+sub _match_sim {
+    my ($m) = @_;
+    return undef unless ref $m eq 'HASH';
+    my $s = $m->{similarity} // $m->{sim};
+    return $s + 0 if defined $s;
+    my $d = $m->{distance} // $m->{dist};
+    return defined $d ? 1.0 - $d : undef;
+}
+
+sub _decode_matches {
+    my ($tx) = @_;
+    return [] unless $tx && $tx->result && $tx->result->is_success;
+    my $body = $tx->result->body;
+    my $m = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
+    return (ref $m eq 'ARRAY') ? $m : [];
+}
+
+# Enthält der Vektorindex an dieser Stelle überhaupt eine gültige ID?
+# Früher wurde aus leeren/Freitext-Labels stillschweigend HP:0000118.
+sub is_plausible_code {
+    my ($domain, $raw) = @_;
+    return 0 unless defined $raw && length $raw;
+    my $c = $raw;
+    $c =~ s/^(?:HP|ICD10|OPS|ATC|LOINC)://i;
+    $c =~ s/^\s+|\s+$//g;
+    if ($domain eq 'hpo') {
+        (my $n = $c) =~ s/\D//g;
+        return 0 unless length $n && $c =~ /^(?:HP:?)?\d+$/i;
+        $n += 0;
+        return ($n > 0 && $n != 118) ? 1 : 0;
+    }
+    return ($c =~ /^[A-Z]\d{2}(?:\.[0-9A-Z\-]{1,4})?$/i)                  ? 1 : 0 if $domain eq 'icd10';
+    return ($c =~ /^\d-[0-9a-z]{2,3}(?:\.[0-9a-z]{1,3})?$/i)              ? 1 : 0 if $domain eq 'ops';
+    return ($c =~ /^[A-Z]{1,2}\d{2}(?:[A-Z]{1,2}(?:\d{2})?)?$/i)          ? 1 : 0 if $domain eq 'atc';
+    return ($c =~ /^(?:\d{1,7}-\d[a-z]?|LP\d+-\d|CLASS-.+)$/i)            ? 1 : 0 if $domain eq 'loinc';
+    return 1;
+}
+
+# Einheitliche Treffer-Auswertung für HPO/OPS/ATC/LOINC:
+# gültige ID + Distanzschwelle + Scope-/Site-Guard + okulärer Prior + Label.
+# $opts: quiet, context (Verbatim), site (anatomical_site)
 helper _build_vector_res => sub {
-    my ($self, $domain, $match, $term, $max_dist) = @_;
+    my ($self, $domain, $match, $term, $max_dist, $opts) = @_;
+    $opts //= {};
+    my $quiet = $opts->{quiet} ? 1 : 0;
+    my $log   = $self->app->log;
 
     # Schwellen je Domäne. ATC ist tolerant (Handelsnamen), HPO/OPS streng.
-    $max_dist //= { hpo => 0.12, ops => 0.10, atc => 0.18, loinc => 0.15 }->{$domain} // 0.12;
+    $max_dist //= { hpo => 0.055, ops => 0.055, atc => 0.07, loinc => 0.06 }->{$domain} // 0.055;
 
     return undef unless $match && defined $match->{label};
 
-    my $sim  = $match->{similarity} // $match->{sim};
-    my $dist = defined $sim ? (1.0 - $sim) : ($match->{distance} // $match->{dist} // 1.0);
+    my $raw_code = $match->{label};
+    $raw_code =~ s/^\s+|\s+$//g;
     my $dist_str = _extract_vector_dist_str($match);
 
-    if ($dist > $max_dist) {
-        $self->app->log->warn(
-        "[\U$domain\E SUPPRESSED]$dist_str '$term' -> $match->{label} "
-        . "überschreitet Max-Distanz ($dist > $max_dist). Treffer verworfen."
-        );
+    unless (is_plausible_code($domain, $raw_code)) {
+        $log->warn("[\U$domain\E INVALID INDEX ID]$dist_str '$term' -> '$raw_code' ist keine gültige ID. Verworfen.") unless $quiet;
         return undef;
     }
 
-    my $raw_code = $match->{label};
+    my $sim  = _match_sim($match);
+    my $dist = defined $sim ? (1.0 - $sim) : 1.0;
+
+    if ($dist > $max_dist) {
+        $log->warn("[\U$domain\E SUPPRESSED]$dist_str '$term' -> $raw_code überschreitet Max-Distanz ($dist > $max_dist). Treffer verworfen.") unless $quiet;
+        return undef;
+    }
+
     my $fmt = { hpo => 'format_hpo_id', ops => 'format_ops_id',
-        atc => 'format_atc_id', loinc => 'format_loinc_id' }->{$domain};
+                atc => 'format_atc_id', loinc => 'format_loinc_id' }->{$domain};
     my $matched_id = $self->$fmt($raw_code);
 
-    if ($self->has_scope_conflict($domain, $matched_id, $term)) {
-        $self->app->log->warn(
-        "[\U$domain\E SCOPE CONFLICT]$dist_str '$term' -> $matched_id "
-        . "widerspricht der im Begriff genannten Anatomie. Treffer verworfen."
-        );
+    if ($self->has_scope_conflict($domain, $matched_id, $term)
+        || (defined $opts->{context} && $self->has_scope_conflict($domain, $matched_id, $opts->{context}))) {
+        $log->warn("[\U$domain\E SCOPE CONFLICT]$dist_str '$term' -> $matched_id widerspricht der im Begriff genannten Anatomie. Treffer verworfen.") unless $quiet;
         return undef;
+    }
+
+    if (my $why = $self->site_conflict($domain, $matched_id, $opts->{site}, $sim)) {
+        $log->warn("[\U$domain\E SITE CONFLICT]$dist_str '$term' -> $matched_id: $why. Treffer verworfen.") unless $quiet;
+        return undef;
+    }
+
+    # Okulärer Prior für OPS: in Augenarztbriefen ist ein nicht-okulärer
+    # Eingriff ohne extraokuläres Signalwort nur bei nahezu exaktem Treffer
+    # glaubhaft (Schwenklappenplastik -> Herzklappe, Kryotherapie -> Hypothermie).
+    if ($ocular_prior_enabled && $domain eq 'ops'
+        && defined $sim && $sim < $ocular_prior_min_sim
+        && ($opts->{site} // '') ne 'systemic'
+        && $term !~ $EXTRAOCULAR_TERM_REGEX
+        && !(defined $opts->{context} && $opts->{context} =~ $EXTRAOCULAR_TERM_REGEX)) {
+        my $oc = $self->is_ocular_code($domain, $matched_id);
+        if (defined $oc && !$oc) {
+            $log->warn("[OPS OCULAR PRIOR]$dist_str '$term' -> $matched_id ist nicht-okulär, sim < $ocular_prior_min_sim, kein extraokuläres Signal. Treffer verworfen.") unless $quiet;
+            return undef;
+        }
     }
 
     my $db_label      = $self->get_canonical_ontology_label($domain, $raw_code);
     my $matched_label = $db_label // $match->{payload} // $term;
 
-    $self->app->log->info("[\U$domain\E RETRIEVAL]$dist_str '$term' -> $matched_id ($matched_label)");
-    return { id => $matched_id, label => $matched_label };
+    $log->info("[\U$domain\E RETRIEVAL]$dist_str '$term' -> $matched_id ($matched_label)") unless $quiet;
+    return { id => $matched_id, label => $matched_label, resolved => (defined $db_label ? 1 : 0),
+             sim => $sim, index_text => $match->{payload} };
 };
 
+# ---------------------------------------------------------
+# LABEL-GATE (PATCH 2026-09-24)
+# Ein hoher Similarity-Wert beweist nur, dass der Indexschlüssel zur Query
+# passt, nicht dass der Code stimmt. Ohne Reranking wird ein Treffer nur
+# übernommen, wenn die Query lexikalisch durch das kanonische Ontologie-Label
+# (oder ein HPO-Synonym, bei ATC auch den Handelsnamen) gedeckt ist.
+# ---------------------------------------------------------
+our %LABEL_GATE_STOPWORDS = map { $_ => 1 } qw(
+    sonstige sonstiger sonstiges sonstigen naher bezeichnet bezeichnete bezeichneter bezeichneten
+    angabe durch nach eines einer einem oder ohne affektionen affektion krankheit krankheiten zustand
+    abnormal abnormality morphology other unspecified with without left right links rechts beidseits
+    auge augen eye eyes
+);
+
+sub _gate_tokens {
+    my ($s) = @_;
+    $s = lc($s // '');
+    $s =~ tr/äöüß/aous/;
+    my @t;
+    for my $w (split /[^a-z0-9]+/, $s) {
+        next if length($w) < 4;
+        next if $LABEL_GATE_STOPWORDS{$w};
+        $w =~ s/(?:es|en|er|s|e|n)$// if length($w) > 6;   # grobe Endungskappung
+        push @t, $w;
+    }
+    return @t;
+}
+
+helper get_ontology_synonyms => sub {
+    my ($self, $domain, $code) = @_;
+    return [] unless $domain eq 'hpo' && defined $code;
+    state %cache;
+    (my $n = $code) =~ s/\D//g;
+    return [] unless length $n;
+    return $cache{$n} if exists $cache{$n};
+    my $rows = eval {
+        $self->pg->db->query('SELECT DISTINCT label FROM public.synonyms WHERE idterm = ?', int($n))
+             ->arrays->map(sub { $_->[0] })->to_array;
+    };
+    return $cache{$n} = (ref $rows eq 'ARRAY' ? $rows : []);
+};
+
+helper label_matches => sub {
+    my ($self, $domain, $term, $hit) = @_;
+    return 0 unless ref $hit eq 'HASH' && defined $term && length $term;
+
+    my @q = _gate_tokens($term);
+    return 0 unless @q;
+
+    my @labels = ($hit->{label});
+    push @labels, $hit->{index_text} if $domain eq 'atc';          # Handelsnamen sind bei ATC legitim
+    push @labels, @{ $self->get_ontology_synonyms($domain, $hit->{id}) };
+    my @l = map { _gate_tokens($_) } grep { defined && length } @labels;
+    return 0 unless @l;
+
+    my $covered = 0;
+    QT: for my $qt (@q) {
+        for my $lt (@l) {
+            if ($qt eq $lt
+                || (length($lt) >= 5 && index($qt, $lt) >= 0)     # Kompositum enthält Labelwort
+                || (length($qt) >= 5 && index($lt, $qt) >= 0)) {
+                $covered++;
+                next QT;
+            }
+        }
+    }
+    return ($covered / scalar(@q)) >= $label_gate_min_cov ? 1 : 0;
+};
+
+# Elternknoten für den Reranker (Kontext "Oberbegriff")
+helper get_parent_label => sub {
+    my ($self, $domain, $code) = @_;
+    return undef unless defined $code && length $code;
+    state %cache;
+    my $key = "$domain|$code";
+    return $cache{$key} if exists $cache{$key};
+
+    my $res;
+    eval {
+        if ($domain eq 'hpo') {
+            (my $n = $code) =~ s/\D//g;
+            my $r = $self->pg->db->query(q{
+                SELECT t.id, t.label FROM public.isas i JOIN public.terms t ON t.id = i.idparent
+                 WHERE i.idchild = ? LIMIT 1
+            }, int($n))->hash;
+            $res = sprintf('HP:%07d %s', $r->{id}, $r->{label}) if $r;
+        } else {
+            my %tab = (icd10 => 'public.icd10_terms', ops => 'public.ops_terms',
+                       atc   => 'public.atc_terms',   loinc => 'public.loinc_terms');
+            if (my $t = $tab{$domain}) {
+                (my $c = $code) =~ s/^(?:ICD10|OPS|ATC|LOINC)://i;
+                my $r = $self->pg->db->query(
+                    "SELECT p.id, p.label FROM $t c JOIN $t p ON p.id = c.parent_id WHERE lower(c.id) = lower(?) LIMIT 1",
+                    $c)->hash;
+                $res = "$r->{id} $r->{label}" if $r;
+            }
+        }
+    };
+    return $cache{$key} = $res;
+};
+
+# ---------------------------------------------------------
+# TOP-K-AUSWAHL MIT LLM-RERANKING IN DER GRAUZONE
+# Sehr sichere Treffer (sim >= $rerank_accept_sim) werden direkt übernommen,
+# alles darunter entscheidet ein kurzer, schema-gebundener LLM-Aufruf unter
+# den gültigen Top-k-Kandidaten (oder verwirft alle).
+# ---------------------------------------------------------
+helper _select_vector_hit_async => sub {
+    my ($self, $domain, $matches, $term, $opts) = @_;
+    $opts //= {};
+    return Mojo::Promise->resolve(undef) unless ref $matches eq 'ARRAY' && @$matches;
+
+    my $top = $self->_build_vector_res($domain, $matches->[0], $term, $opts->{max_dist}, $opts);
+    return Mojo::Promise->resolve(undef) unless $top;
+
+    my $sim = $top->{sim} // 0;
+    return Mojo::Promise->resolve($top) if !$rerank_enabled || $opts->{no_rerank};
+
+    # PATCH 2026-09-24: hoher Similarity-Wert allein reicht nicht mehr
+    if ($sim >= $rerank_accept_sim) {
+        return Mojo::Promise->resolve($top)
+            if $top->{resolved} && $self->label_matches($domain, $term, $top);
+        $self->app->log->info("[\U$domain\E LABEL GATE] '$term' -> $top->{id} ($top->{label}) sim $sim, aber Label deckt Query nicht. Reranking.");
+    }
+
+    my @cands = ($top);
+    my $last  = ($#$matches < $rerank_top_k - 1) ? $#$matches : $rerank_top_k - 1;
+    for my $i (1 .. $last) {
+        my $r = $self->_build_vector_res($domain, $matches->[$i], $term, $opts->{max_dist}, { %$opts, quiet => 1 });
+        next unless $r;
+        next if grep { $_->{id} eq $r->{id} } @cands;
+        push @cands, $r;
+    }
+    return $self->rerank_candidates_async($domain, $term, \@cands, $opts->{context});
+};
+
+helper rerank_candidates_async => sub {
+    my ($self, $domain, $term, $cands, $context) = @_;
+    return Mojo::Promise->resolve(undef) unless ref $cands eq 'ARRAY' && @$cands;
+    my $log = $self->app->log;
+
+    my $prompt = $self->get_llm_prompt('mapping_candidate_reranker');
+    unless ($prompt && $prompt->{system_prompt}) {
+        # PATCH 2026-09-24: ohne Prompt nur noch lexikalisch gedeckte Top-1-Treffer übernehmen
+        if ($self->label_matches($domain, $term, $cands->[0])) {
+            $log->warn("[\U$domain\E RERANK WARN] Prompt 'mapping_candidate_reranker' fehlt – Top-1 ($cands->[0]{id}) per Label-Gate übernommen.");
+            return Mojo::Promise->resolve($cands->[0]);
+        }
+        $log->warn("[\U$domain\E RERANK WARN] Prompt 'mapping_candidate_reranker' fehlt – '$term' ohne Label-Deckung verworfen.");
+        return Mojo::Promise->resolve(undef);
+    }
+
+    # -------------------------------------------------------------
+    # 1. KANDIDATENLISTE: Code | Ontologie-Label | Oberbegriff | Indextext
+    #    Das Ontologie-Label kommt aus der Terminologietabelle, nicht aus dem
+    #    Index-Payload. Der Indextext (z.B. Handelsname) steht nur zusätzlich da.
+    # -------------------------------------------------------------
+    my @lines;
+    for my $i (0 .. $#$cands) {
+        my $cd     = $cands->[$i];
+        my $parent = $self->get_parent_label($domain, $cd->{id}) // '-';
+        my $itext  = $cd->{index_text} // '-';
+        $itext = '-' if lc($itext) eq lc($cd->{label} // '');
+        push @lines, sprintf("%d: %s | %s | Oberbegriff: %s | Indextext: %s",
+            $i, $cd->{id}, $cd->{label} // '-', $parent, $itext);
+    }
+    my $list = join("\n", @lines);
+
+    my $cand_key    = join('|', map { $_->{id} } @$cands);
+    # Cache-Schlüssel hängt an Prompt-Version UND an den gezeigten Labels:
+    # ändert sich der Prompt oder die Ontologietabelle, wird neu entschieden.
+    my $prompt_hash = md5_hex(encode('UTF-8', join("\x{1}",
+        $prompt->{system_prompt} // '', $prompt->{user_template} // '', $list)));
+
+    # -------------------------------------------------------------
+    # 2. CACHE-LOOKUP
+    # -------------------------------------------------------------
+    my $cached = eval {
+        $self->pg->db->query(q{
+            SELECT chosen_id, relation, reason FROM public.mapping_rerank_cache
+             WHERE domain = ? AND query = ? AND candidate_ids = ? AND prompt_hash = ?
+        }, $domain, $term, $cand_key, $prompt_hash)->hash;
+    };
+    if ($cached) {
+        my $cid    = $cached->{chosen_id};
+        my $rel    = $cached->{relation} // '?';
+        my $reason = $cached->{reason} // 'Keine Begründung gespeichert';
+
+        if (defined $cid && length $cid) {
+            my ($hit) = grep { $_->{id} eq $cid } @$cands;
+            if ($hit) {
+                $log->info("[\U$domain\E RERANK CACHE HIT] '$term' -> $hit->{id} ($hit->{label}) [$rel]. Grund: $reason");
+                return Mojo::Promise->resolve($hit);
+            }
+        } else {
+            $log->warn("[\U$domain\E RERANK CACHE REJECT] '$term' -> keiner von [$cand_key] passt [$rel]. Grund: $reason");
+            return Mojo::Promise->resolve(undef);
+        }
+    }
+
+    # -------------------------------------------------------------
+    # 3. IN-FLIGHT-DEDUPLIZIERUNG
+    #    Parallele Anfragen mit identischem Schlüssel teilen sich ein Promise,
+    #    statt mehrfach (und mit unterschiedlichem Ergebnis) zu ranken.
+    # -------------------------------------------------------------
+    state %inflight;
+    my $flight_key = join("\x{1}", $domain, $term, $cand_key, $prompt_hash);
+    return $inflight{$flight_key} if $inflight{$flight_key};
+
+    my $ctx = (defined $context && length $context) ? $context : '-';
+    $ctx =~ s/\s+/ /g;
+    $ctx = substr($ctx, 0, 400);
+
+    my $cand_overview = join(', ', map { "$_->{id} ($_->{label})" } @$cands);
+    $log->info("[\U$domain\E RERANK EVAL] '$term' prüft " . scalar(@$cands) . " Kandidat(en): [$cand_overview]");
+
+    my $user = $prompt->{user_template}
+        // "Domäne: {{domain}}\nBegriff: \"{{term}}\"\nKontext: \"{{context}}\"\nKandidaten (Index: Code | Ontologie-Label | Oberbegriff | Indextext):\n{{candidates}}";
+    $user =~ s/\{\{domain\}\}/$domain/g;
+    $user =~ s/\{\{term\}\}/$term/g;
+    $user =~ s/\{\{context\}\}/$ctx/g;
+    $user =~ s/\{\{candidates\}\}/$list/g;
+
+    # relation vor choice: das Modell soll zuerst die Beziehung bestimmen.
+    my $schema = {
+        type => 'object',
+        properties => {
+            relation => { type => 'string', enum => [qw(exact broader narrower related unrelated)],
+                          description => 'Beziehung des Begriffs zum besten Kandidaten.' },
+            choice   => { type => 'integer', description => 'Index des besten Kandidaten, -1 wenn keiner exact oder broader ist.' },
+            reason   => { type => 'string',  description => 'Ein Satz, nur mit Angaben aus der Kandidatenliste.' },
+        },
+        required => ['relation', 'choice', 'reason'],
+        additionalProperties => \0,
+    };
+
+    # -------------------------------------------------------------
+    # 4. LLM-ENTSCHEIDUNG: nur exact|broader wird übernommen
+    # -------------------------------------------------------------
+    my $p = $self->llm_json_call_async($prompt->{system_prompt}, $user, $schema, 'mapping_rerank')->then(sub {
+        my $d = shift;
+        unless (ref $d eq 'HASH' && defined $d->{choice} && "$d->{choice}" =~ /^-?\d+$/) {
+            # Kein blindes Top-1 mehr: nur bei lexikalischer Deckung übernehmen. Nicht cachen.
+            if ($self->label_matches($domain, $term, $cands->[0])) {
+                $log->warn("[\U$domain\E RERANK FAILED] '$term' kein valides JSON – Top-1 ($cands->[0]{id}) per Label-Gate übernommen.");
+                return $cands->[0];
+            }
+            $log->warn("[\U$domain\E RERANK FAILED] '$term' kein valides JSON – verworfen.");
+            return undef;
+        }
+
+        my $choice   = $d->{choice} + 0;
+        my $relation = lc($d->{relation} // 'unrelated');
+        my $reason   = $d->{reason} // '';
+        my $picked   = ($choice >= 0 && $choice <= $#$cands) ? $cands->[$choice] : undef;
+        my $chosen   = ($picked && $relation =~ /^(?:exact|broader)$/) ? $picked : undef;
+
+        eval {
+            $self->pg->db->query(q{
+                INSERT INTO public.mapping_rerank_cache
+                       (domain, query, candidate_ids, prompt_hash, chosen_id, relation, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (domain, query, candidate_ids, prompt_hash) DO NOTHING
+            }, $domain, $term, $cand_key, $prompt_hash, ($chosen ? $chosen->{id} : undef), $relation, $reason);
+        };
+        $log->warn("[\U$domain\E RERANK CACHE WRITE FAILED] $@") if $@;
+
+        if ($chosen) {
+            $log->info("[\U$domain\E RERANK] '$term' -> $chosen->{id} ($chosen->{label}) [$relation] aus " . scalar(@$cands) . " Kandidaten. Begründung: $reason");
+        } elsif ($picked) {
+            $log->warn("[\U$domain\E RERANK REJECT] '$term' -> $picked->{id} ($picked->{label}) verworfen, Relation '$relation'. Begründung: $reason");
+        } else {
+            $log->warn("[\U$domain\E RERANK REJECT] '$term' -> alle verworfen [$cand_key]. Begründung: $reason");
+        }
+        return $chosen;
+    });
+
+    $inflight{$flight_key} = $p;
+    $p->finally(sub { delete $inflight{$flight_key} });
+    return $p;
+};
 
 # =========================================================================
 # ICD-10 ASYNCHRONOUS MAPPING ENGINE MIT DB-INTERCEPT & ATC-ALLERGIE-FIX
 # =========================================================================
+# Allergene ohne konkrete Substanz: kein ATC-Lookup.
+our $GENERIC_ALLERGEN_REGEX = qr/^(?:medikament\w*|arzneimittel\w*|augentropfen|tropfen|salbe|reaktion|allergische?\s*reaktion|unbekannt\w*|diverse\w*|mehrere\w*|alle\w*|substanz\w*)$/i;
+
+# Normalisiert einen String für den lexikalischen Plausibilitätsvergleich.
+sub _lex_norm {
+    my $x = lc(shift // '');
+    $x =~ tr/äöüß/aous/;
+    $x =~ s/[^a-z]//g;
+    return $x;
+}
+
+# Isoliert die Substanz aus "Arzneimittelallergie gegen Tilidin",
+# "Unverträglichkeit von Dorzo-Augentropfen", "Allergie auf Amoxicillin, Cefaclor".
+# Ohne führende Wortgrenze, damit Komposita ("...allergie", "...unverträglichkeit") greifen.
+sub extract_allergy_substance {
+    my ($t) = @_;
+    return '' unless defined $t && length($t);
+    my $s = $t;
+    $s =~ s/[-_]/ /g;
+    $s =~ s/^.*?(?:allergi\w*|unvertr(?:ä|a)glich\w*|intoleranz|überempfindlich\w*|anaphyla\w*)\s*(?:reaktion\s*)?(?:gegen(?:über)?|auf|von|nach|bei|g\/?g)?\s*:?\s*//i;
+    # Mehrere Substanzen: die erste nehmen (die übrigen sollten eigene Zeilen sein)
+    $s = (split /\s*(?:,|;|\/|\bund\b|\bsowie\b)\s*/i, $s)[0] // '';
+    $s =~ s/\b(?:in\s+der\s+eigenanamnese|eigenanamnese|anamnestisch|bekannte?r?s?)\b/ /gi;
+    $s =~ s/\b(?:i\.?\s*v\.?|oral|intravenös(?:e)?|therapie|gabe|behandlung|medikation|präparat|tabletten?|kapseln?|infusion)\b/ /gi;
+    $s =~ s/[^\p{L}\p{N}\s]+//g;
+    $s =~ s/\s+/ /g;
+    $s =~ s/^\s+|\s+$//g;
+    return $s;
+}
+
+# =========================================================================
+# ICD-10 ASYNCHRONOUS MAPPING ENGINE MIT DB-INTERCEPT & ATC-ALLERGIE-FIX
+# $opts: context (Verbatim), site, is_history
+# =========================================================================
 helper map_to_icd10_async => sub {
-    my ($self, $verbatim_term, $canonical_term, $doc_lang) = @_;
+    my ($self, $verbatim_term, $canonical_term, $doc_lang, $opts) = @_;
 
     # Fallback bei flexibler Parameterübergabe
     if (!defined $doc_lang && defined $canonical_term && $canonical_term =~ /^(?:de|en|other)$/i) {
@@ -2147,6 +2676,7 @@ helper map_to_icd10_async => sub {
         $canonical_term = undef;
     }
     $doc_lang = lc($doc_lang // 'de');
+    $opts //= {};
 
     return Mojo::Promise->resolve(undef) unless defined $verbatim_term && length($verbatim_term);
 
@@ -2160,125 +2690,100 @@ helper map_to_icd10_async => sub {
     my $fallback_term = ($primary_term eq $verbatim_term) ? $canonical_term : $verbatim_term;
 
     # --- HILFSFUNKTION: INTELLIGENTE ALLERGIE-TRENNUNG (ARZNEIMITTEL VS. ALLERGENE) ---
-        my $apply_allergy_atc_override = sub {
-            my ($res) = @_;
-            return Mojo::Promise->resolve($res) unless $res && $res->{id};
+    my $apply_allergy_atc_override = sub {
+        my ($res) = @_;
+        return Mojo::Promise->resolve($res) unless $res && $res->{id};
+        return Mojo::Promise->resolve($res) unless $is_allergy;
 
-            if ($is_allergy) {
-                my $t_check = lc("$verbatim_term " . ($canonical_term // ''));
+        my $t_check = lc("$verbatim_term " . ($canonical_term // ''));
 
-                # Eine Krankheit hinter "Allergie gegen" ist ein Extraktionsfehler,
-                # kein Allergen. Belegt im Audit: "Allergie gegen GvHD",
-                # "Allergie gegen Transplantatabstoßung", "Allergie gegen
-                # Limbusinsuffizienz". Diese dürfen weder in ATC noch nach Z88.8.
-                if ($t_check =~ /\b(?:gvhd|absto[ßs]ung|transplantat\w*|limbus\w*|ektropium|entropium|
-                    hornhaut|keratit\w*|glaukom|katarakt|amotio|uveiti\w*)/xi) {
-                    return Mojo::Promise->resolve($res);
-                }
+        # Eine Krankheit hinter "Allergie gegen" ist ein Extraktionsfehler, kein Allergen.
+        if ($t_check =~ /\b(?:gvhd|absto[ßs]ung|transplantat\w*|limbus\w*|ektropium|entropium|
+            hornhaut|keratit\w*|glaukom|katarakt|amotio|uveiti\w*)/xi) {
+            return Mojo::Promise->resolve($res);
+        }
 
-                # 1. Insekten- & Tiergifte (Dürfen NIEMALS in ATC!)
-                if ($t_check =~ /\b(?:biene|wespe|hornis|insekt|tierhaar|katze|hund|pferd|meerschwein)/i) {
-                    my $label = ($t_check =~ /biene/i)  ? 'Allergie gegen Bienengift'
-                              : ($t_check =~ /wespe/i)  ? 'Allergie gegen Wespengift'
-                              : 'Allergie gegen Tierhaare/Tiergifte';
-                    return Mojo::Promise->resolve({
-                        id    => 'ICD10:T63.4',
-                        label => $label
-                    });
-                }
+        # 1. Insekten- & Tiergifte (dürfen NIEMALS in ATC!)
+        if ($t_check =~ /\b(?:biene|wespe|hornis|insekt|tierhaar|katze|hund|pferd|meerschwein)/i) {
+            my $label = ($t_check =~ /biene/i)  ? 'Allergie gegen Bienengift'
+                      : ($t_check =~ /wespe/i)  ? 'Allergie gegen Wespengift'
+                      : 'Allergie gegen Tierhaare/Tiergifte';
+            return Mojo::Promise->resolve({ id => 'ICD10:T63.4', label => $label });
+        }
 
-                # 2. Pollen / Inhalationsallergien
-                if ($t_check =~ /\b(?:birke|gr[äa]ser|roggen|beifu[ßs]|pollen|heu(?:schnupfen)?|hausstaub|milbe|schimmel)/i) {
-                    return Mojo::Promise->resolve({
-                        id    => 'ICD10:J30.1',
-                        label => 'Allergische Rhinopathie durch Pollen/Inhalationsallergene'
-                    });
-                }
+        # 2. Pollen / Inhalationsallergien
+        if ($t_check =~ /\b(?:birke|gr[äa]ser|roggen|beifu[ßs]|pollen|heu(?:schnupfen)?|hausstaub|milbe|schimmel)/i) {
+            return Mojo::Promise->resolve({ id => 'ICD10:J30.1', label => 'Allergische Rhinopathie durch Pollen/Inhalationsallergene' });
+        }
 
-                # 3. Nahrungsmittelallergien
-                if ($t_check =~ /\b(?:haselnuss|n[üu]ss|soja|erdnuss|apfel|[äa]pfel|citrus|zitrus|zitrone|
-                    karotte|m[öo]hre|fisch|meeresfr[üu]cht|eiwei[ßs]|eigelb|h[üu]hnerei|
-                    weizen|gluten|laktose|fruktose|curry|ananas|kiwi|sellerie|senf|
-                    nahrungsmittel|lebensmittel|obst|gem[üu]se|gespritzte\s+fr[üu]chte)/xi) {
-                    return Mojo::Promise->resolve({
-                        id    => 'ICD10:T78.1',
-                        label => 'Sonstige unerwünschte Nebenwirkungen von Nahrungsmitteln'
-                    });
-                }
+        # 3. Nahrungsmittelallergien
+        if ($t_check =~ /\b(?:haselnuss|n[üu]ss|soja|erdnuss|apfel|[äa]pfel|citrus|zitrus|zitrone|
+            karotte|m[öo]hre|fisch|meeresfr[üu]cht|eiwei[ßs]|eigelb|h[üu]hnerei|
+            weizen|gluten|laktose|lactose|fruktose|fructose|curry|ananas|kiwi|sellerie|senf|
+            nahrungsmittel|lebensmittel|obst|gem[üu]se|gespritzte\s+fr[üu]chte)/xi) {
+            return Mojo::Promise->resolve({ id => 'ICD10:T78.1', label => 'Sonstige unerwünschte Nebenwirkungen von Nahrungsmitteln' });
+        }
 
-                # 4. Kontaktallergien & Hilfsstoffe
-                if ($t_check =~ /\b(?:pflaster|latex|nickel|perubalsam|duftstoff|konservier|kontakt|
-                    nahtmaterial|verbandmaterial|wollwachs|lanolin|chrom|kobalt)/xi) {
-                    return Mojo::Promise->resolve({
-                        id    => 'ICD10:L23.9',
-                        label => 'Allergische Kontaktdermatitis'
-                    });
-                }
+        # 4. Kontaktallergien & Hilfsstoffe
+        if ($t_check =~ /\b(?:pflaster|latex|nickel|perubalsam|duftstoff|konservier|kontakt|
+            nahtmaterial|verbandmaterial|wollwachs|lanolin|chrom|kobalt|gummi)/xi) {
+            return Mojo::Promise->resolve({ id => 'ICD10:L23.9', label => 'Allergische Kontaktdermatitis' });
+        }
 
-                # 5. NUR WENN ES SICH TATSÄCHLICH UM MEDIKAMENTE HANDELT -> ATC Lookup
-                my $is_specific_code = ($res->{id} =~ /^ICD10:Z88\.0/i);
-                my $is_unspecific    = (!$is_specific_code) && ($res->{id} =~ /^ICD10:(?:T88|T78|Z88)/i);
+        # 5. NUR WENN ES SICH TATSÄCHLICH UM MEDIKAMENTE HANDELT -> ATC Lookup
+        my $is_specific_code = ($res->{id} =~ /^ICD10:Z88\.0/i);
+        my $is_unspecific    = (!$is_specific_code) && ($res->{id} =~ /^ICD10:(?:T88|T78|Z88)/i);
+        return Mojo::Promise->resolve($res) unless $is_unspecific;
 
-                # Absoluter Schutz: Augenbefunde dürfen niemals als Arzneimittelallergie gewertet werden!
-                return Mojo::Promise->resolve($res) if $t_check =~ /\b(?:limbus|transplantat|ektropium|entropium|hornhaut)\b/i;
+        my $substance = extract_allergy_substance($canonical_term);
+        $substance = extract_allergy_substance($verbatim_term) unless length($substance) > 2;
+        $substance = 'Salbutamol' if $substance =~ /^subtamol$/i;   # Typo-Korrektur
 
-                if ($is_unspecific) {
-                    my $extract_substance = sub {
-                        my ($t) = @_;
-                        return '' unless defined $t && length($t);
-                        my $s = $t;
-                        $s =~ s/[-_]/ /g;
-                        $s =~ s/\b(?:allergie\s*(?:gegen|auf|g\/?g)?|unvertr(?:ä|a)glichkeit\s*(?:gegen|auf)?|intoleranz\s*(?:gegen|auf)?|anaphylaktische\s*reaktion\s*(?:auf|nach)?|anaphylaxie\s*(?:auf|nach|gegen)?|überempfindlichkeit\s*(?:gegen|auf)?)\s*:\s*/ /gi;
-                        $s =~ s/\b(?:allergie\s*(?:gegen|auf|g\/?g)?|unvertr(?:ä|a)glichkeit\s*(?:gegen|auf)?|intoleranz\s*(?:gegen|auf)?|anaphylaktische\s*reaktion\s*(?:auf|nach)?|anaphylaxie\s*(?:auf|nach|gegen)?|überempfindlichkeit\s*(?:gegen|auf)?)\b/ /gi;
-                        $s =~ s/\b(?:in\s+der\s+eigenanamnese|eigenanamnese|anamnestisch|bekannte?r?s?)\b/ /gi;
-                        $s =~ s/\b(?:i\.?\s*v\.?|oral|intravenös(?:e)?|therapie|gabe|behandlung|medikation|arzneimittel|medikament|präparat|tabletten?|tropfen|kapseln?|infusion)\b/ /gi;
-                        $s =~ s/[^\p{L}\p{N}\s]+//g;
-                        $s =~ s/\s+/ /g;
-                        $s =~ s/^\s+|\s+$//g;
-                        return $s;
-                    };
+        return Mojo::Promise->resolve($res) unless length($substance) > 2;
+        return Mojo::Promise->resolve($res) if $substance =~ $GENERIC_ALLERGEN_REGEX;
 
-                    my $substance = $extract_substance->($canonical_term);
-                    $substance = $extract_substance->($verbatim_term) unless length($substance) > 2;
+        my $klartext = (uc($substance) eq $substance) ? $substance : ucfirst(lc($substance));
 
-                    # Typo-Korrekturen für gängige Medikamente
-                    $substance = 'Salbutamol' if $substance =~ /^subtamol$/i;
+        # Strengere Schwelle als bei Medikationslisten und kein Reranking: für
+        # Allergene zählt nur ein eindeutiger Treffer.
+        return $self->map_to_atc_async($substance, $doc_lang, { max_dist => 0.045, no_rerank => 1 })->then(sub {
+            my $atc_hit = shift;
 
-                    if (length($substance) > 2) {
-                        return $self->map_to_atc_async($substance, $doc_lang)->then(sub {
-                            my $atc_hit = shift;
-                            my $klartext = (uc($substance) eq $substance) ? $substance : ucfirst(lc($substance));
-
-                            # Nur verknüpfen, wenn ein spezifischer ATC-Code gefunden wurde (kein V03AX-Fallback!)
-                            if ($atc_hit && $atc_hit->{id}) {
-                                $self->app->log->info("[ICD10 DRUG ALLERGY OVERRIDE] '$substance' -> ICD10:Z88.8 ($atc_hit->{id} ($klartext))");
-                                return {
-                                    id    => 'ICD10:Z88.8',
-                                    label => "$atc_hit->{id} ($klartext)"
-                                };
-                            } else {
-                                return {
-                                    id    => 'ICD10:Z88.8',
-                                    label => "Allergie gegen $klartext"
-                                };
-                            }
-                        });
-                    }
+            # Lexikalische Plausibilität für Vektortreffer (Intercepts sind kuratiert):
+            # verhindert "Tilidin -> Allergie-Augentropfen", "Phenyendiamin -> Phenindamin".
+            if ($atc_hit && ($atc_hit->{source} // '') ne 'intercept') {
+                my $a = _lex_norm($substance);
+                my $b = _lex_norm($atc_hit->{label});
+                my $n = length($a) < 5 ? length($a) : 5;
+                my $ok = ($n >= 3 && index($b, substr($a, 0, $n)) >= 0)
+                      || (length($b) >= 5 && index($a, substr($b, 0, 5)) >= 0);
+                unless ($ok) {
+                    $self->app->log->warn("[ICD10 DRUG ALLERGY] '$substance' -> $atc_hit->{id} ($atc_hit->{label}) lexikalisch unplausibel. Ohne ATC-Bezug.");
+                    $atc_hit = undef;
                 }
             }
-            return Mojo::Promise->resolve($res);
-        };    # 2. DB-Intercepts prüfen (MIT ATC-ANREICHERUNG BEI ALLERGIEN!)
-    for my $cand ($verbatim_term, $primary_term, $canonical_term) {
-        next unless defined $cand && length($cand);
+
+            if ($atc_hit && $atc_hit->{id}) {
+                $self->app->log->info("[ICD10 DRUG ALLERGY OVERRIDE] '$substance' -> ICD10:Z88.8 ($atc_hit->{id} ($klartext))");
+                return { id => 'ICD10:Z88.8', label => "$atc_hit->{id} ($klartext)" };
+            }
+            return { id => 'ICD10:Z88.8', label => "Allergie gegen $klartext" };
+        });
+    };
+
+    # 2. DB-Intercepts prüfen (mit ATC-Anreicherung bei Allergien)
+    # PATCH 2026-09-24: kanonischer Begriff zuerst, Verbatim nur noch als letzte Stufe
+    my %seen_cand;
+    for my $cand (grep { defined && length && !$seen_cand{$_}++ } ($canonical_term, $primary_term, $verbatim_term)) {
         my $clean = lc(clean_term_for_vector_mapping($cand));
-        
-        if (my $hit = $self->check_database_intercept('icd10', $clean) || $self->check_database_intercept('icd10', $cand)) {
+
+        if (my $hit = $self->check_database_intercept('icd10', $clean, $opts->{context})
+                   || $self->check_database_intercept('icd10', $cand,  $opts->{context})) {
+            return Mojo::Promise->resolve(undef) if $hit->{suppress};
             $self->app->log->info("[ICD10 DB INTERCEPT] '$cand' -> $hit->{id} ($hit->{label})");
-            # Wenn es KEINE Medikamentenallergie ist (z.B. Pflaster, Latex), Intercept unverändert belassen!
-            if ($hit->{label} =~ /pflaster|verband|latex|kontakt/i || $cand =~ /pflaster|latex/i) {
+            if (($hit->{rule_label} // $hit->{label} // '') =~ /pflaster|verband|latex|kontakt/i || $cand =~ /pflaster|latex/i) {
                 return Mojo::Promise->resolve($hit);
             }
-            # Wenn es eine Allergie ist, ATC-Code anhängen!
             return $apply_allergy_atc_override->($hit);
         }
     }
@@ -2291,59 +2796,75 @@ helper map_to_icd10_async => sub {
             : $self->normalize_criterion_for_retrieval_async($t, 'icd10');
     };
 
-    my $fetch_match = sub {
+    # Liefert jetzt die komplette Trefferliste (für Top-k-Reranking)
+    my $fetch_matches = sub {
         my ($q) = @_;
         my $call = sub {
             my $url = "$patchbay_url/LLM/run_stateless/" . LLM_ICD10_RETRIEVAL_PROMPT_ID;
-            my $payload = Encode::encode('UTF-8', $q);
             return $ua_fast->post_p(
-                $url => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => $payload
-            )->then(sub {
-                my $tx = shift;
-                if ($tx->result && $tx->result->is_success) {
-                    my $body = $tx->result->body;
-                    my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
-                    return $matches->[0] if ref $matches eq 'ARRAY' && @$matches;
-                }
-                return undef;
-            });
+                $url => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => Encode::encode('UTF-8', $q)
+            )->then(sub { return _decode_matches(shift) })
+             ->catch(sub { my $e = shift; $self->app->log->warn("[ICD10 RETRIEVAL ERROR] '$q': $e"); return []; });
         };
         return $self->enqueue_patchbay_call($call, $q);
+    };
+
+    my $finalize = sub {
+        my ($matches, $q) = @_;
+        return Mojo::Promise->resolve(undef) unless ref $matches eq 'ARRAY' && @$matches;
+        my $top = $self->_build_icd10_res($matches->[0], $q, undef, $opts);
+        return Mojo::Promise->resolve(undef) unless $top;
+        my $sim = _match_sim($matches->[0]) // 0;
+        return Mojo::Promise->resolve($top) if !$rerank_enabled;
+        # PATCH 2026-09-24: Bypass nur mit Label-Deckung
+        if ($sim >= $rerank_accept_sim) {
+            return Mojo::Promise->resolve($top) if $self->label_matches('icd10', $q, $top);
+            $self->app->log->info("[ICD10 LABEL GATE] '$q' -> $top->{id} ($top->{label}) sim $sim, aber Label deckt Query nicht. Reranking.");
+        }
+
+        my @c = ($top);
+        my $last = ($#$matches < $rerank_top_k - 1) ? $#$matches : $rerank_top_k - 1;
+        for my $i (1 .. $last) {
+            my $r = $self->_build_icd10_res($matches->[$i], $q, undef, { %$opts, quiet => 1 });
+            push @c, $r if $r && !grep { $_->{id} eq $r->{id} } @c;
+        }
+        return $self->rerank_candidates_async('icd10', $q, \@c, $opts->{context});
     };
 
     # 4. Vektorsuche mit Fallback und abschließender Allergie-Anreicherung
     return $normalize->($primary_term)->then(sub {
         my $clean_query = shift;
+        if (!defined $clean_query || $clean_query eq '__NONE__') {
+            $self->app->log->info("[ICD10 NO CONCEPT] '$primary_term' enthält keine Diagnose.");
+            return undef;
+        }
 
-        return $fetch_match->($clean_query)->then(sub {
-            my $top_match = shift;
-            my $sim  = $top_match ? ($top_match->{similarity} // $top_match->{sim}) : 0;
-            my $dist = defined $sim ? (1.0 - $sim) : ($top_match->{distance} // 1.0);
+        return $fetch_matches->($clean_query)->then(sub {
+            my $m1   = shift // [];
+            my $top  = $m1->[0];
+            my $sim  = $top ? (_match_sim($top) // 0) : 0;
+            my $dist = 1.0 - $sim;
 
             my $fb_clean = defined $fallback_term ? clean_term_for_vector_mapping($fallback_term) : '';
 
             if ($dist > 0.035 && length($fb_clean) > 1 && lc($fb_clean) ne lc($clean_query)) {
                 $self->app->log->info("[ICD10 FALLBACK TRIGGERED] Dist $dist > 0.035 für '$clean_query'. Prüfe Fallback: '$fb_clean'");
-
-                return $fetch_match->($fb_clean)->then(sub {
-                    my $fb_match = shift;
-                    if ($fb_match && defined $fb_match->{label}) {
-                        my $fb_sim  = $fb_match->{similarity} // $fb_match->{sim};
-                        my $fb_dist = defined $fb_sim ? (1.0 - $fb_sim) : ($fb_match->{distance} // 1.0);
-
-                        if (!defined $top_match || $fb_dist < $dist) {
-                            return $self->_build_icd10_res($fb_match, $fb_clean);
-                        }
-                    }
-                    return $self->_build_icd10_res($top_match, $clean_query);
+                return $fetch_matches->($fb_clean)->then(sub {
+                    my $m2 = shift // [];
+                    my $fb_sim = $m2->[0] ? (_match_sim($m2->[0]) // 0) : 0;
+                    return $finalize->($m2, $fb_clean) if $m2->[0] && (!$top || $fb_sim > $sim);
+                    return $finalize->($m1, $clean_query);
                 });
             }
-
-            return $self->_build_icd10_res($top_match, $clean_query);
+            return $finalize->($m1, $clean_query);
         });
     })->then(sub {
         my $res = shift;
         return $apply_allergy_atc_override->($res);
+    })->catch(sub {
+        my $e = shift;
+        $self->app->log->warn("[ICD10 MAPPING ERROR] '$verbatim_term': $e");
+        return undef;
     });
 };
 
@@ -2351,66 +2872,89 @@ helper map_to_icd10_async => sub {
 # Helper zur Auswertung & harten Unterdrückung (Cut-off bei Distanz > xxxx)
 # -------------------------------------------------------------------------
 helper _build_icd10_res => sub {
-    my ($self, $match, $term, $max_allowed_dist) = @_;
-    
+    my ($self, $match, $term, $max_allowed_dist, $opts) = @_;
+    $opts //= {};
+    my $quiet = $opts->{quiet} ? 1 : 0;
+    my $log   = $self->app->log;
+
     $max_allowed_dist //= 0.05;
 
     return undef unless $match && defined $match->{label};
 
-    my $sim  = $match->{similarity} // $match->{sim};
-    my $dist = defined $sim ? (1.0 - $sim) : ($match->{distance} // 1.0);
+    my $raw_code = $match->{label};
+    $raw_code =~ s/^\s+|\s+$//g;
+    my $dist_str = _extract_vector_dist_str($match);
 
-    # HARTE UNTERDRÜCKUNG: Wenn der Treffer über dem Schwellenwert liegt
-    if ($dist > $max_allowed_dist) {
-        my $dist_str = _extract_vector_dist_str($match);
-        $self->app->log->warn("[ICD10 SUPPRESSED]$dist_str '$term' -> $match->{label} überschreitet Max-Distanz ($dist > $max_allowed_dist). Diagnose wird unterdrückt.");
+    unless (is_plausible_code('icd10', $raw_code)) {
+        $log->warn("[ICD10 INVALID INDEX ID]$dist_str '$term' -> '$raw_code' ist kein ICD-10-Code. Verworfen.") unless $quiet;
         return undef;
     }
 
-    my $raw_code      = $match->{label};
-    my $matched_id    = $self->format_icd10_id($raw_code);
-    my $db_label      = $self->get_canonical_ontology_label('icd10', $raw_code);
-    my $matched_label = $db_label // $match->{payload} // $term;
-    my $dist_str      = _extract_vector_dist_str($match);
+    my $sim  = _match_sim($match);
+    my $dist = defined $sim ? (1.0 - $sim) : 1.0;
 
-    # --- SCOPE-GUARD ---
-    if ($self->has_scope_conflict('icd10', $matched_id, $term)) {
-        $self->app->log->warn("[ICD10 SCOPE CONFLICT]$dist_str '$term' -> $matched_id widerspricht der im Begriff genannten Anatomie. Verworfen.");
+    # HARTE UNTERDRÜCKUNG: Wenn der Treffer über dem Schwellenwert liegt
+    if ($dist > $max_allowed_dist) {
+        $log->warn("[ICD10 SUPPRESSED]$dist_str '$term' -> $raw_code überschreitet Max-Distanz ($dist > $max_allowed_dist). Diagnose wird unterdrückt.") unless $quiet;
+        return undef;
+    }
+
+    my $matched_id    = $self->format_icd10_id($raw_code);
+    # PATCH 2026-09-24: mit dem normalisierten Code nachschlagen und Phantomcodes verwerfen
+    my $db_label      = $self->get_canonical_ontology_label('icd10', $matched_id);
+    if ($icd_require_resolved && !defined $db_label) {
+        $log->warn("[ICD10 UNRESOLVED]$dist_str '$term' -> $matched_id nicht in icd10_terms. Verworfen.") unless $quiet;
+        return undef;
+    }
+    my $matched_label = $db_label // $match->{payload} // $term;
+
+    # --- SCOPE-GUARD (Begriff und Verbatim-Kontext) ---
+    if ($self->has_scope_conflict('icd10', $matched_id, $term)
+        || (defined $opts->{context} && $self->has_scope_conflict('icd10', $matched_id, $opts->{context}))) {
+        $log->warn("[ICD10 SCOPE CONFLICT]$dist_str '$term' -> $matched_id widerspricht der im Begriff genannten Anatomie. Verworfen.") unless $quiet;
+        return undef;
+    }
+
+    # --- ANAMNESE-/BEOBACHTUNGSCODES ---
+    # Der Index enthält Routinekodierungen wie "Meningeom -> Z87.8",
+    # "Sepsis -> Z03.8", "ANA -> Z01.7", "Traktion -> Z98.8". Nur zulassen,
+    # wenn die Zeile tatsächlich Vorgeschichte ist.
+    if (defined $opts->{is_history} && !$opts->{is_history}
+        && $matched_id =~ /^ICD10:Z(?:0[0-4]|8[5-7]|98)/i
+        && $term !~ /\b(?:z\.?\s*n\.?|zustand\s+nach|anamnes\w*|vorgeschichte|history)\b/i) {
+        $log->warn("[ICD10 BLOCKED] Anamnese-/Beobachtungscode $matched_id für aktuellen Befund '$term' abgewiesen.") unless $quiet;
         return undef;
     }
 
     # --- TRAUMA-FILTER (S-Codes) ---
-    # S-Codes nur dann abweisen, wenn der Begriff ABSOLUT KEIN Trauma/Verletzung darstellt
     if ($matched_id =~ /^ICD10:S/i) {
         my $is_trauma_term = ($term =~ /(?:trauma\w*|unfall\w*|verletz\w*|fraktur\w*|\bfx\b|trümmer\w*|luxation\w*|perforat\w*|ruptur\w*|prolaps\w*|h[äa]matom\w*|monokel\w*|ri[ßs]s?\w*|wunde\w*|quetsch\w*|prell\w*|fremdkörper\w*|kontusion\w*|sturz\w*|schnitt\w*|verätzung\w*|verbrennung\w*|erosio)/i);
-
         unless ($is_trauma_term) {
-            $self->app->log->warn("[ICD10 BLOCKED] Trauma-Code $matched_id für nichttraumatischen Begriff '$term' abgewiesen.");
+            $log->warn("[ICD10 BLOCKED] Trauma-Code $matched_id für nichttraumatischen Begriff '$term' abgewiesen.") unless $quiet;
             return undef;
         }
     }
 
     # --- AMPUTATIONS-FILTER (Z89-Codes abfangen) ---
-    # Verhindert, dass Augenbefunde wie "IOL-Verlust" als Zehen-/Fußverlust kodiert werden!
     if ($matched_id =~ /^ICD10:Z89/i) {
         unless ($term =~ /\b(?:amputation|verlust\s+(?:finger|hand|fu[ßs]|zehe|gliedma[ßs]))\b/i) {
-            $self->app->log->warn("[ICD10 BLOCKED] Amputations-Code $matched_id für '$term' abgewiesen.");
+            $log->warn("[ICD10 BLOCKED] Amputations-Code $matched_id für '$term' abgewiesen.") unless $quiet;
             return undef;
         }
     }
-    
-    $self->app->log->info("[ICD10 RETRIEVAL]$dist_str '$term' -> $matched_id ($matched_label)");
-    return { id => $matched_id, label => $matched_label };
+
+    $log->info("[ICD10 RETRIEVAL]$dist_str '$term' -> $matched_id ($matched_label)") unless $quiet;
+    return { id => $matched_id, label => $matched_label, sim => $sim,
+             resolved => (defined $db_label ? 1 : 0), index_text => $match->{payload} };
 };
 
 helper map_to_ops_async => sub {
-    my ($self, $term, $doc_lang) = @_;
+    my ($self, $term, $doc_lang, $opts) = @_;
+    $opts //= {};
     return Mojo::Promise->resolve(undef) unless defined $term && length($term);
 
-    my $clean = $term;
-
-    # 1. Check Dynamic Database Intercepts (cleaned and verbatim term)
-    if (my $hit = $self->check_database_intercept('ops', $clean) || $self->check_database_intercept('ops', $term)) {
+    if (my $hit = $self->check_database_intercept('ops', $term, $opts->{context})) {
+        return Mojo::Promise->resolve(undef) if $hit->{suppress};
         $self->app->log->info("[OPS DB INTERCEPT] '$term' -> $hit->{id} ($hit->{label})");
         return Mojo::Promise->resolve($hit);
     }
@@ -2424,46 +2968,45 @@ helper map_to_ops_async => sub {
 
     return $p_query->then(sub {
         my $clean_query = shift;
+        if (!defined $clean_query || $clean_query eq '__NONE__') {
+            $self->app->log->info("[OPS NO CONCEPT] '$term' enthält kein kodierbares Konzept.");
+            return undef;
+        }
 
         my $execute_call = sub {
             my $url_retrieve = "$patchbay_url/LLM/run_stateless/" . LLM_OPS_RETRIEVAL_PROMPT_ID;
-
-            my $encoded_payload = encode('UTF-8', $clean_query);
-
             return $ua_fast->post_p(
-                $url_retrieve => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => $encoded_payload
-            )->then(sub {
-                my $tx = shift;
-                if ($tx->result && $tx->result->is_success) {
-                    my $body = $tx->result->body;
-                    my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
-                    if (ref $matches eq 'ARRAY' && @$matches) {
-                        my $res = $self->_build_vector_res('ops', $matches->[0], $clean_query);
-                        # Ein OPS-Code, der sich nicht in ops_terms auflösen lässt, ist
-                        # ein Phantomkode ("Inoffizieller Code") und wird verworfen.
-                        if ($res && $res->{label} && $res->{label} ne $clean_query) {
-                            return $res;
-                        }
-                        if ($res) {
-                            $self->app->log->warn("[OPS UNRESOLVED] '$clean_query' -> $res->{id} nicht in ops_terms. Verworfen.");
-                        }
-                    }
-                }
-                return undef;
-            })->catch(sub { return undef; });
+                $url_retrieve => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => encode('UTF-8', $clean_query)
+            )->then(sub { return _decode_matches(shift) })
+             ->catch(sub { my $e = shift; $self->app->log->warn("[OPS RETRIEVAL ERROR] '$clean_query': $e"); return []; });
         };
-        return $self->enqueue_patchbay_call($execute_call, $clean_query);
+
+        return $self->enqueue_patchbay_call($execute_call, $clean_query)->then(sub {
+            my $matches = shift;
+            return $self->_select_vector_hit_async('ops', $matches, $clean_query, $opts);
+        })->then(sub {
+            my $res = shift;
+            return undef unless $res;
+            # Ein OPS-Code, der sich nicht in ops_terms auflösen lässt, ist ein
+            # Phantomkode ("5-156.9Y (Tropf, RA: Triamcinolon)") und wird verworfen.
+            unless ($res->{resolved}) {
+                $self->app->log->warn("[OPS UNRESOLVED] '$clean_query' -> $res->{id} nicht in ops_terms. Verworfen.");
+                return undef;
+            }
+            return $res;
+        })->catch(sub { return undef; });
     });
 };
 
 helper map_to_atc_async => sub {
-    my ($self, $term, $doc_lang) = @_;
+    my ($self, $term, $doc_lang, $opts) = @_;
+    $opts //= {};
     return Mojo::Promise->resolve(undef) unless defined $term && length($term);
 
     my $clean_term = clean_atc_term($term);
 
-    # 1. Check Dynamic Database Intercepts (raw and cleaned term)
     if (my $hit = $self->check_database_intercept('atc', $term) || $self->check_database_intercept('atc', $clean_term)) {
+        return Mojo::Promise->resolve(undef) if $hit->{suppress};
         $self->app->log->info("[ATC DB INTERCEPT] '$term' -> $hit->{id} ($hit->{label})");
         return Mojo::Promise->resolve($hit);
     }
@@ -2471,42 +3014,58 @@ helper map_to_atc_async => sub {
     $doc_lang = lc($doc_lang // 'de');
     my $search_payload = uc $clean_term;
 
-    # Target: GERMAN ('de'). If doc is already German ('de'), skip translation!
     my $p_query = ($doc_lang eq 'de')
         ? Mojo::Promise->resolve(clean_term_for_vector_mapping($search_payload))
         : $self->normalize_criterion_for_retrieval_async($search_payload, 'atc');
 
     return $p_query->then(sub {
         my $clean_query = shift;
+        if (!defined $clean_query || $clean_query eq '__NONE__') {
+            $self->app->log->info("[ATC NO CONCEPT] '$term' enthält keinen Wirkstoff.");
+            return undef;
+        }
 
         my $execute_call = sub {
             my $url_retrieve = "$patchbay_url/LLM/run_stateless/" . LLM_ATC_RETRIEVAL_PROMPT_ID;
-
-            my $encoded_payload = encode('UTF-8', $clean_query);
-
             return $ua_fast->post_p(
-                $url_retrieve => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => $encoded_payload
-            )->then(sub {
-                my $tx = shift;
-                if ($tx->result && $tx->result->is_success) {
-                    my $body = $tx->result->body;
-                    my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
-                    if (ref $matches eq 'ARRAY' && @$matches) {
-                        my $res = $self->_build_vector_res('atc', $matches->[0], $clean_query);
-                        return $res if $res;
-                    }
-                }
-                # V03AX war bisher der Sammelcode für alles Unerkannte und hat
-                # im Allergie-Override als "spezifischer Treffer" gegolten.
-                return undef;
-            })->catch(sub { return undef; });
+                $url_retrieve => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => encode('UTF-8', $clean_query)
+            )->then(sub { return _decode_matches(shift) })
+             ->catch(sub { my $e = shift; $self->app->log->warn("[ATC RETRIEVAL ERROR] '$clean_query': $e"); return []; });
         };
-        return $self->enqueue_patchbay_call($execute_call, $clean_query);
+
+        # Kein V03AX-Sammelcode mehr: kein Treffer -> undef.
+        return $self->enqueue_patchbay_call($execute_call, $clean_query)->then(sub {
+            my $matches = shift;
+            return $self->_select_vector_hit_async('atc', $matches, $clean_query, $opts);
+        })->catch(sub { return undef; });
     });
 };
 
+# Baut die LOINC-Vektorquery aus dem (übersetzten) Analytnamen.
+# Früher wurde prepare_loinc_search_term ein zweites Mal mit Rohtext + Übersetzung
+# aufgerufen ("Leukozyten 6,27 Tsd/µl Leukozyten Leukocyte count", sim 0.90).
+sub build_loinc_payload_query {
+    my ($prepared_term, $distilled) = @_;
+    $prepared_term //= '';
+    $distilled     //= '';
+    return $prepared_term if $prepared_term =~ /^LOINC:/i;
+
+    my ($eye) = $prepared_term =~ /^\s*((?:left|right)\s+eye)\b/i;
+    my $core  = length($distilled) > 1 ? $distilled : $prepared_term;
+    $core =~ s/^\s*(?:left|right)\s+eye\s+//i;
+    $core = strip_lab_values($core);
+
+    my $with_eye = $eye ? "$eye $core" : $core;
+    # Die feste Zuordnungslogik greift jetzt auch auf den englischen Analytnamen,
+    # aber ohne Rohtext, Werte oder Einheiten.
+    my $p = prepare_loinc_search_term($with_eye, $core);
+    return $p if $p =~ /^(?:LOINC:)?\d+-\d/i;
+    return strip_lab_values($p);
+}
+
 helper map_to_loinc_async => sub {
-    my ($self, $term, $doc_lang) = @_;
+    my ($self, $term, $doc_lang, $opts) = @_;
+    $opts //= {};
     return Mojo::Promise->resolve(undef) unless defined $term && length($term);
     return Mojo::Promise->resolve(undef) if $term =~ /unknown/i;
 
@@ -2515,50 +3074,48 @@ helper map_to_loinc_async => sub {
         return Mojo::Promise->resolve({ id => $1, label => ($2 || $term) });
     }
 
-    # 1. Check Dynamic Database Intercepts (raw term)
     if (my $hit = $self->check_database_intercept('loinc', $term)) {
+        return Mojo::Promise->resolve(undef) if $hit->{suppress};
         $self->app->log->info("[LOINC DB INTERCEPT] '$term' -> $hit->{id} ($hit->{label})");
         return Mojo::Promise->resolve($hit);
     }
 
     $doc_lang = lc($doc_lang // 'de');
 
-    # Target: ENGLISH ('en'). If doc is already English ('en'), skip translation!
     my $p_query = ($doc_lang eq 'en')
         ? Mojo::Promise->resolve(clean_term_for_vector_mapping($term))
         : $self->normalize_criterion_for_retrieval_async($term, 'loinc');
 
     return $p_query->then(sub {
         my $distilled_query = shift;
-        my $loinc_payload_query = prepare_loinc_search_term($term, $distilled_query);
+        if (!defined $distilled_query || $distilled_query eq '__NONE__') {
+            $self->app->log->info("[LOINC NO CONCEPT] '$term' enthält keinen Messparameter.");
+            return undef;
+        }
 
-        # Secondary intercept check on the prepared payload query
+        my $loinc_payload_query = build_loinc_payload_query($term, $distilled_query);
+
+        if ($loinc_payload_query =~ /^(LOINC:\d+-\w*)\s*(.*)$/i) {
+            return { id => $1, label => ($2 || $loinc_payload_query) };
+        }
         if (my $hit = $self->check_database_intercept('loinc', $loinc_payload_query)) {
+            return undef if $hit->{suppress};
             $self->app->log->info("[LOINC DB INTERCEPT] '$loinc_payload_query' -> $hit->{id} ($hit->{label})");
             return $hit;
         }
 
         my $execute_call = sub {
             my $url_retrieve = "$patchbay_url/LLM/run_stateless/" . LLM_LOINC_RETRIEVAL_PROMPT_ID;
-
-            my $encoded_payload = encode('UTF-8', $loinc_payload_query);
-
             return $ua_fast->post_p(
-                $url_retrieve => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => $encoded_payload
-            )->then(sub {
-                my $tx = shift;
-                if ($tx->result && $tx->result->is_success) {
-                    my $body = $tx->result->body;
-                    my $matches = eval { decode_json($body) } // eval { from_json(decode('UTF-8', $body)) } // [];
-                    if (ref $matches eq 'ARRAY' && @$matches) {
-                        my $res = $self->_build_vector_res('loinc', $matches->[0], $loinc_payload_query);
-                        return $res if $res;
-                    }
-                }
-                return undef;
-            })->catch(sub { return undef; });
+                $url_retrieve => { 'Content-Type' => 'text/plain; charset=UTF-8', Accept => '*/*' } => encode('UTF-8', $loinc_payload_query)
+            )->then(sub { return _decode_matches(shift) })
+             ->catch(sub { my $e = shift; $self->app->log->warn("[LOINC RETRIEVAL ERROR] '$loinc_payload_query': $e"); return []; });
         };
-        return $self->enqueue_patchbay_call($execute_call, $loinc_payload_query);
+
+        return $self->enqueue_patchbay_call($execute_call, $loinc_payload_query)->then(sub {
+            my $matches = shift;
+            return $self->_select_vector_hit_async('loinc', $matches, $loinc_payload_query, $opts);
+        })->catch(sub { return undef; });
     });
 };
 
@@ -2598,6 +3155,9 @@ sub clean_atc_term {
     $clean =~ s/^\s+|\s+$//g;
     $clean =~ s/^z\.\s*n\.?//ig;
 
+    # Darreichungsformen und Zusätze entfernen, die den Wirkstoff-Vektor verfälschen
+    $clean =~ s/\b(?:augentropfen|augensalbe|augengel|tropfen|salbe|gel|at|as|edo|sine|ophtiole\w*)\b//gi;
+
     return length($clean) > 1 ? $clean : $term;
 }
 
@@ -2626,7 +3186,7 @@ sub split_into_clinical_section_chunks {
         (?:exclusion(?:\s+criteria)?|ausschluss(?:kriterien)?|key\s+exclusion)|
         (?:study\s+eye(?:\s+criteria)?|fellow\s+eye(?:\s+criteria)?|studienauge|partnerauge)|
         (?:general\s+criteria|allgemeine\s+kriterien|safety\s+criteria)|
-        (?:diagnosen?|anamnese|ivom(?:[\s\-]anamnese)?|therapie|aktuelle\s+(?:ophthalmologische\s+)?therapie|lokaltherapie|medikation|dauermedikation|blutverd[üu]nnung|vorgeschichte|allgemein(?:erkrankungen(?:\/medikation)?)?|allergien?)$lat_pattern?|
+        (?:diagnosen?|anamnese|ivom(?:[\s\-]anamnese)?|therapie|aktuelle\s+(?:ophthalmologische\s+)?therapie|lokaltherapie|medikation|dauermedikation|systemmedikation|blutverd[üu]nnung|vorgeschichte|allgemein(?:erkrankungen(?:\/medikation)?)?|allergien?)$lat_pattern?|
         (?:visus|refraktion|skiaskopie|brille|fernvisus|nahvisus|orthoptik|binokularsehen|motilit[äa]t|stereosehen|tensio|druck|tonometrie|icare|goldmann|pachymetrie|cct|pentacam|topographie|gf|gesichtsfeld|perimetrie|hertel|iol[\s\-]?master|biometrie|endothel(?:zell\w*)?|ecd|ezd)$lat_pattern?|
         (?:vaa|vorderabschnitt|spaltlampe|hornhaut|cornea|fundus|papille|makula|macula|nh[\s\-]oct|rnfl(?:[\s\-]oct)?|oct|bmo[\s\-]oct|gcl(?:[\s\-]oct)?|vaa[\s\-]oct|fag|fla|fl[\s\-]angio|angiograph\w*)$lat_pattern?|
         (?:lebensalter|geschlecht|alter|befund|prozeduren?|operationen?|orderheute|bemerkungen)
@@ -2882,6 +3442,59 @@ helper is_normal_physiological_finding => sub {
 # =========================================================
 # STEP 1: ATOMIC EXTRACTION WITH LANGUAGE DETECTION
 # =========================================================
+# =========================================================
+# DETERMINISTISCHE VERANKERUNG KANONISCHER BEGRIFFE (Prompt-Regel 3.1)
+# Nackte Morphologie-Nomen werden mit der vom LLM gelieferten Struktur
+# ergänzt ("Narbe" + cornea -> "Narbe der Hornhaut") oder verworfen.
+# =========================================================
+our %SITE_GENITIVE = (
+    eyelid => 'des Augenlides', conjunctiva => 'der Bindehaut', cornea => 'der Hornhaut',
+    sclera => 'der Sklera', anterior_chamber => 'der Vorderkammer', iris => 'der Iris',
+    lens => 'der Linse', vitreous => 'des Glaskörpers', retina => 'der Netzhaut',
+    macula => 'der Makula', choroid => 'der Aderhaut', optic_disc => 'der Papille',
+    orbit => 'der Orbita', lacrimal => 'der Tränenwege', visual_field => 'des Gesichtsfeldes',
+    ocular_motility => 'der Augenmotilität', ocular_other => 'des Auges',
+);
+
+our $BARE_NOUN_REGEX = qr/^(?:ausdünnung|verdünnung|ansammlung|filtration|infiltrat(?:e|ion)?|transplantat|aneurysma|ulcus|ulkus|narben?|knoten|delle|falten?|ödem|oedem|pigment|zellen?|blutung(?:en)?|perforation|dehiszenz|degeneration|einziehung|implantat|stent|schleimauflagerung|kerbe|ring|konus|haze|reizung|reiz|defekte?|entzündung|aktivität|staining|foramen|foramina|aufhellung(?:en)?|verdichtung(?:en)?|atrophie|läsion(?:en)?|schwellung|zysten?|verkalkung|trübung(?:en)?|granulom(?:e)?|traktion|restflüssigkeit|flüssigkeit|exsudation|exsudat(?:e)?|leckage|glitzern|abschattung|verhärtung|neovaskularisation|membran|nekrose|ischämie|tortuosität|teleangiektasien?|avaskularität|rötung|schleim|restblut|beschläge?|ablagerung(?:en)?|spaltbildung)$/i;
+
+our $NO_CONCEPT_REGEX = qr/^(?:befund|zustand|einblick|untersuchbarkeit|beurteilbarkeit|fehlmessung|messfehler|artefakt|duplikatur|befestigung|ansatz)$/i;
+
+our $DOSAGE_FORM_REGEX = qr/^(?:salbe|augensalbe|tropfen|augentropfen|gel|augengel|at|as|edo|sine|creme|spray|tabletten?|kapseln?|spritze|infusion)$/i;
+
+sub ground_canonical_term {
+    my ($item, $log) = @_;
+    my $domain = lc($item->{domain} // '');
+    return 1 if $domain eq 'demographic';
+
+    my $ct = $item->{canonical_term} // '';
+    (my $core = $ct) =~ s/^\s+|\s+$//g;
+    return 1 unless length $core;
+
+    if ($domain eq 'atc' && $core =~ $DOSAGE_FORM_REGEX) {
+        $log->info("[UNGROUNDED ROW DROPPED] Darreichungsform ohne Wirkstoff: '$ct'");
+        return 0;
+    }
+
+    (my $probe = $core) =~ s/^(?:(?:alte[rsn]?|kleine[rsn]?|große[rsn]?|zentrale[rsn]?|periphere[rsn]?|multiple|diffuse[rsn]?|frische[rsn]?|einzelne|vereinzelte|dezente[rsn]?|milde[rsn]?)\s+)+//i;
+
+    if ($probe =~ $NO_CONCEPT_REGEX) {
+        $log->info("[UNGROUNDED ROW DROPPED] Kein kodierbares Konzept: '$ct'");
+        return 0;
+    }
+    return 1 unless $probe =~ $BARE_NOUN_REGEX;
+
+    my $site = lc($item->{anatomical_site} // '');
+    if (my $gen = $SITE_GENITIVE{$site}) {
+        $item->{canonical_term} = "$core $gen";
+        $log->info("[CANONICAL GROUNDED] '$ct' -> '$item->{canonical_term}'");
+        return 1;
+    }
+    return 1 if $site eq 'systemic';   # systemische Befunde bleiben systemisch
+
+    $log->info("[UNGROUNDED ROW DROPPED] '$ct' ohne anatomische Struktur (site='$site')");
+    return 0;
+}
 helper extract_atomic_criteria_async => sub {
     my ($self, $text, $mode, $client_model, $deep_mode, $task_id) = @_;
     $mode //= 'fhir';
@@ -2900,6 +3513,12 @@ helper extract_atomic_criteria_async => sub {
     $text =~ s/&nbsp;/ /g;
     $text =~ s/&amp;/&/g;
     $text =~ s/<\/?[a-zA-Z][^>]*>/ /g;
+
+    $text =~ s/\bRZA\b/Riesenzellarteriitis (RZA)/g;
+    $text =~ s/\bAAION\b/Arteriitische anteriore ischämische Optikusneuropathie (AAION)/g;
+    $text =~ s/\bNAION\b/Nicht-arteriitische anteriore ischämische Optikusneuropathie (NAION)/g;
+    $text =~ s/\bPDR\b/Proliferative diabetische Retinopathie (PDR)/g;
+    $text =~ s/\bNPDR\b/Nicht-proliferative diabetische Retinopathie (NPDR)/g;
 
     if ($mode eq 'phenopacket') {
         $mode_context = qq|
@@ -3047,19 +3666,32 @@ $reasoning_trace
 
                 $item->{verbatim_text} = $v;
 
-                if ($self->is_uncodable_or_future_rule($v) || $self->is_uncodable_or_future_rule($item->{canonical_term})) {
-                    $self->app->log->info("[UNCODABLE / ADMINISTRATIVE RULE FILTERED] '$v' (Term: '$item->{canonical_term}')");
-                    next;
-                }
+                # DEMOGRAFIE-SCHUTZ: Alter und Geschlecht NIEMALS als unkodierbar verwerfen!
+                my $is_demo = (
+                    ($item->{domain} // '') eq 'demographic'
+                    || ($item->{demographic_type} // '') =~ /^(?:age|sex)$/i
+                    || $v =~ /\b(?:lebensalter|geschlecht)\b/i
+                ) ? 1 : 0;
 
-                if ($self->is_normal_physiological_finding($v) || $self->is_normal_physiological_finding($item->{canonical_term})) {
-                    $self->app->log->info("[NORMAL PHYSIOLOGICAL FINDING FILTERED] '$v'");
-                    next;
-                }
+                unless ($is_demo) {
+                    my $ct = $item->{canonical_term} // '';
+                    if ((length($ct) && $self->is_uncodable_or_future_rule($ct))
+                        || (length($v) && $self->is_uncodable_or_future_rule($v))) {
+                        $self->app->log->info("[UNCODABLE / ADMINISTRATIVE RULE FILTERED] '$v' (Term: '$ct')");
+                        next;
+                    }
 
+                    if ((length($ct) && $self->is_normal_physiological_finding($ct))
+                        || (length($v) && $self->is_normal_physiological_finding($v))) {
+                        $self->app->log->info("[NORMAL PHYSIOLOGICAL FINDING FILTERED] '$v'");
+                        next;
+                    }
+                }
                 if (defined $item->{disjunction_group_id} && $item->{disjunction_group_id} =~ /^(?:none|null|n\/?a|0|\s*)$/i) {
                     $item->{disjunction_group_id} = '';
                 }
+
+                next unless ground_canonical_term($item, $self->app->log);
 
                 push @all_criteria, $item;
             }
@@ -3080,36 +3712,45 @@ sub extract_event_date {
     my ($text, $ref_date_str) = @_;
     return undef unless defined $text && $text ne '';
 
+    # Vergleichs- und Vorbefundsfloskeln maskieren (z. B. "stabil zu 04/24", "Vergleich zu 04/2024")
+    my $clean_date_text = $text;
+    $clean_date_text =~ s/\b(?:stabil\s+(?:zu|ggü\.?|gegenüber)|progredient\s+(?:zu|ggü\.?|gegenüber)|(?:im\s+)?vergleich\s+zu|vgl\.?\s*zu|kontrolle\s+zu|vorbefund(?:\s+vom)?)\s*(?:(?:0?[1-9]|1[0-2])[\/\.](?:19|20)?\d{2}|(?:19|20)\d{2})\b/ /gi;
+
     # 0. Bereits ISO
-    if ($text =~ /\b((?:19|20)\d{2}-[0-1]\d-[0-3]\d)\b/) { return $1; }
-    if ($text =~ /\b((?:19|20)\d{2}-[0-1]\d)\b/)          { return $1; }
+    if ($clean_date_text =~ /\b((?:19|20)\d{2}-[0-1]\d-[0-3]\d)\b/) { return $1; }
+    if ($clean_date_text =~ /\b((?:19|20)\d{2}-[0-1]\d)\b/)          { return $1; }
 
     # 1. Vollständiges deutsches Datum: DD.MM.YYYY
-    if ($text =~ /\b([0-3]?\d)\.([0-1]?\d)\.((?:19|20)\d{2})\b/) {
+    if ($clean_date_text =~ /\b([0-3]?\d)\.([0-1]?\d)\.((?:19|20)\d{2})\b/) {
         return sprintf("%04d-%02d-%02d", $3, $2, $1);
     }
 
     # 2. Monat / Jahr (MM/YYYY)
-    if ($text =~ /\b(0?[1-9]|1[0-2])[\/\.]((?:19|20)\d{2})\b/) {
+    if ($clean_date_text =~ /\b(0?[1-9]|1[0-2])[\/\.]((?:19|20)\d{2})\b/) {
         return sprintf("%04d-%02d", $2, $1);
     }
-
-    # 3. Vierstelliges Einzeljahr (19xx oder 20xx)
-    if ($text =~ /\b((?:19|20)\d{2})\b/) {
-        return sprintf("%04d", $1);
-    }
-
-    # 4. Relative Zeitangaben auflösen (z.B. "vor über 20 Jahre", "vor ca. 3 Monaten")
-    if ($text =~ /\b(?:vor|seit)\s+(?:über|mehr\s+als|knapp|ca\.?|etwa)?\s*(\d+)\s*(tage?n?|wochen?|monate?n?|jahre?n?|d|wk|mo|y)\b/i) {
-        return calculate_absolute_date($ref_date_str, "$1 $2");
-    }
-
-    if ($text =~ /\b(?:ED|EM|Erstdiagnose|Erstmanifestation)\s*:?\s*(0?[1-9]|1[0-2])[\/\.](\d{2})\b/i) {
+    # 2b. Monat / zweistelliges Jahr (M/YY oder MM/YY), z.B. "8/21", "09/21", "10/13"
+    if ($clean_date_text =~ /\b(0?[1-9]|1[0-2])\/(\d{2})\b/) {
         my ($m, $y) = ($1, $2 + 0);
         my $full_year = ($y < 70) ? (2000 + $y) : (1900 + $y);
         return sprintf("%04d-%02d", $full_year, $m);
     }
-    if ($text =~ /\b(?:ED|EM|Erstdiagnose|Erstmanifestation)\s*:?\s*((?:19|20)?\d{2})\b/i) {
+    # 3. Vierstelliges Einzeljahr (19xx oder 20xx)
+    if ($clean_date_text =~ /\b((?:19|20)\d{2})\b/) {
+        return sprintf("%04d", $1);
+    }
+
+    # 4. Relative Zeitangaben auflösen (z.B. "vor über 20 Jahre", "vor ca. 3 Monaten")
+    if ($clean_date_text =~ /\b(?:vor|seit)\s+(?:über|mehr\s+als|knapp|ca\.?|etwa)?\s*(\d+)\s*(tage?n?|wochen?|monate?n?|jahre?n?|d|wk|mo|y)\b/i) {
+        return calculate_absolute_date($ref_date_str, "$1 $2");
+    }
+
+    if ($clean_date_text =~ /\b(?:ED|EM|Erstdiagnose|Erstmanifestation)\s*:?\s*(0?[1-9]|1[0-2])[\/\.](\d{2})\b/i) {
+        my ($m, $y) = ($1, $2 + 0);
+        my $full_year = ($y < 70) ? (2000 + $y) : (1900 + $y);
+        return sprintf("%04d-%02d", $full_year, $m);
+    }
+    if ($clean_date_text =~ /\b(?:ED|EM|Erstdiagnose|Erstmanifestation)\s*:?\s*((?:19|20)?\d{2})\b/i) {
         my $y = $1 + 0;
         $y = ($y < 70) ? (2000 + $y) : ($y < 100 ? 1900 + $y : $y);
         return sprintf("%04d", $y);
@@ -3391,6 +4032,13 @@ helper get_canonical_ontology_label => sub {
         $table = 'public.icd10_terms';
         $clean_code =~ s/^ICD10://i;
         $clean_code =~ s/^\s+|\s+$//g;
+        (my $no_dot = $clean_code) =~ s/\.//g;
+        
+        my $row = $self->pg->db->query(
+            "SELECT label FROM public.icd10_terms WHERE id = ? OR id = ? LIMIT 1",
+            $clean_code, $no_dot
+        )->hash;
+        return $row->{label} if $row;
     } elsif ($domain eq 'ops') {
         $table = 'public.ops_terms';
         $clean_code =~ s/^OPS://i;
@@ -3407,12 +4055,21 @@ helper get_canonical_ontology_label => sub {
 
     return undef unless $table && length $clean_code;
 
+    state $label_cache = {};
+    my $cache_key = "$domain|$clean_code";
+    return $label_cache->{$cache_key} if exists $label_cache->{$cache_key};
+
+    # OPS-Codes liegen in ops_terms kleingeschrieben ("5-144.5a"), die
+    # Vektorsuche liefert sie teils groß ("5-144.5A") -> case-insensitiv suchen.
     my $label = eval {
-        my $row = $self->pg->db->select($table, ['label'], { id => $clean_code })->hash;
+        my $row = ($domain eq 'ops' || $domain eq 'atc')
+            ? $self->pg->db->query("SELECT label FROM $table WHERE lower(id) = lower(?) LIMIT 1", $clean_code)->hash
+            : $self->pg->db->select($table, ['label'], { id => $clean_code })->hash;
         return $row->{label} if $row && defined $row->{label} && length $row->{label};
         return undef;
     };
 
+    $label_cache->{$cache_key} = $label unless $@;
     return $label;
 };
 
@@ -3422,8 +4079,10 @@ helper is_uncodable_or_future_rule => sub {
         $text = $self;
         $self = app();
     }
-    return 1 unless defined $text && length($text);
+    # Leerer Text darf NICHT als Filter-Hit (1) gewertet werden!
+    return 0 unless defined $text && length($text);
     $text =~ s/^\s+|\s+$//g;
+    return 0 unless length($text);
 
     my $rules = eval { $self->get_filter_rules() } // {};
 
@@ -3487,6 +4146,39 @@ sub clean_term_for_vector_mapping {
 # =========================================================
 # LOINC SEARCH TERM PREPARATION WITH OPHTHALMIC INTERCEPTS
 # =========================================================
+# Entfernt Messwerte, Einheiten, Ergebniswörter und doppelte Wörter aus einer
+# Labor-/Messquery. Analytnamen mit Ziffern (HbA1c, fT4, B12, HLA-B27, IL-2)
+# bleiben erhalten, weil sie mit einem Buchstaben beginnen.
+sub strip_lab_values {
+    my ($s) = @_;
+    return '' unless defined $s;
+    my $orig = $s;
+    $s =~ s/\([^)]*\)//g;
+    my $UNIT = qr{^(?:%|‰|[µu]?[mnp]?(?:g|mol|l|iu|u|e)(?:/\S+)?|m?iu/\S+|ie/\S+|tsd(?:/\S+)?|mio(?:/\S+)?|ml/\S+|mmhg|cmh2o|[µu]m|mm[²23]?|cm|s|sek|dpt|dptr|zellen/\S+|qm)$}i;
+    my %RESULT = map { $_ => 1 } qw(positiv negativ pos neg normwertig niedrig erhöht hoch grenzwertig
+                                    unauffällig nachweisbar ++ + - bei von ca ca. um aktuell aktueller letzter geschätzt titer);
+    my @tok = grep { length } split /\s+/, $s;
+    my (@out, %seen);
+    for (my $i = 0; $i <= $#tok; $i++) {
+        my $t  = $tok[$i];
+        (my $lt = lc $t) =~ s/[,:;]+$//;
+        # Zahl (auch "5,9%", "151mg/l", "1:800", "6,3-6,7") am Tokenanfang
+        if ($lt =~ /^[<>=~]*[+-]?\d/) {
+            my $is_value = ($lt =~ /[.,:%\/]/ || $lt =~ /^\D*\d{3,}/ || $lt =~ /\d[a-zµ%]/);
+            my $next = $i < $#tok ? lc($tok[$i + 1]) : '';
+            $is_value ||= ($next =~ $UNIT);
+            next if $is_value;          # Messwert verwerfen
+        }
+        next if $lt =~ $UNIT;
+        next if $RESULT{$lt};
+        next if $seen{$lt}++;
+        push @out, $t;
+    }
+    my $r = join ' ', @out;
+    $r =~ s/[,:;]+$//;
+    $r =~ s/^\s+|\s+$//g;
+    return length($r) > 1 ? $r : $orig;
+}
 sub prepare_loinc_search_term {
     my ($raw_text, $clean_term, $item_laterality) = @_;
     $raw_text   //= '';
@@ -3540,7 +4232,9 @@ sub prepare_loinc_search_term {
         return "LOINC:9654-5 Interleukin 2 Receptor Soluble in Serum or Plasma";
     }
     if ($combined_context =~ /\b(?:desmoglein|dmsg\s*1|dmsg\s*3|ana|anca|crp|hba1c|ace|leukozyten|erythrozyten|thrombozyten|creatinin|gfr|tsh|ft3|ft4)\b/i) {
-        return clean_term_for_vector_mapping($combined_context);
+        # Nur der Analytname – ohne Messwert, Einheit, Ergebniswort und ohne
+        # Verdopplung aus "$raw_text $clean_term".
+        return strip_lab_values(length($clean_term) > 2 ? $clean_term : $raw_text);
     }
 
     # -------------------------------------------------------------
@@ -3989,7 +4683,8 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
 
             # --- OPS Procedures ---
             if ($domain eq 'ops') {
-                my $p_ops = $c->map_to_ops_async($clean_search_term, $doc_lang)->then(sub {
+                my $p_ops = $c->map_to_ops_async($clean_search_term, $doc_lang,
+                    { context => $v_text, site => $item->{anatomical_site} })->then(sub {
                     my $mapped = shift;
 
                     return undef unless $mapped && $mapped->{id};
@@ -4028,7 +4723,8 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
             # --- HPO Symptoms & Phenotypes (Default) ---
             my $enriched_term = enrich_term_with_section_context($clean_search_term, $v_text, $text_content);
 
-            my $p_hpo = $c->map_to_hpo_async($enriched_term, 0, $doc_lang)->then(sub {
+            my $p_hpo = $c->map_to_hpo_async($enriched_term, 0, $doc_lang,
+                { context => $v_text, site => $item->{anatomical_site} })->then(sub {
                 my $mapped = shift;
 
                 return undef unless $mapped && $mapped->{id};
@@ -4236,24 +4932,29 @@ helper generate_phenopacket_impl => sub {
         print STDERR ">>> [PHENOPACKET STEP 1 COMPLETED] Language: '$doc_lang' | Items count: " . scalar(@$atomic_items) . "\n";
 
         # -------------------------------------------------------------
-        # Konfliktlösung (Ausschluss sticht Verdacht)
+        # Konfliktlösung (Ausschluss sticht Verdacht) - LATERAL & TEMPORAL GEBUNDEN
         # -------------------------------------------------------------
-        my %excluded_phrases;
-        my %excluded_tokens;
+        my %excluded_by_eye;
 
         foreach my $it (@$atomic_items) {
             if (to_bool($it->{is_exclusion})) {
+                my $lat     = lc($it->{laterality} // 'none');
+                my $ev_date = $it->{event_date} // '';
+                my $v_raw   = lc($it->{verbatim_text} // '');
+
+                # Historische Befunde ("03/2026", "2025", "früher") dürfen NIEMALS
+                # eine aktuelle Diagnose als Ausschluss überschreiben:
+                next if length($ev_date) && $ev_date =~ /(?:19|20)\d{2}/;
+                next if $v_raw =~ /\b(?:zuletzt|früher|vormonat|\d{1,2}\/\d{2,4})\b/;
+
                 for my $raw ($it->{canonical_term}, $it->{verbatim_text}) {
                     next unless defined $raw && length($raw);
                     my $clean = lc(clean_term_for_vector_mapping($raw));
-                    $clean =~ s/\b(?:kein[enms]?|ohne|hinweis|auf|nicht|frei|ausschluss)\b//gi;
+                    $clean =~ s/\b(?:kein[enms]?|ohne|hinweis|auf|nicht|frei|ausschluss|signifikant\w*)\b//gi;
                     $clean =~ s/^\s+|\s+$//g;
 
                     if (length($clean) > 3) {
-                        $excluded_phrases{$clean} = 1;
-                        foreach my $token (split(/[^\p{L}\p{N}]+/, $clean)) {
-                            $excluded_tokens{$token} = 1 if length($token) >= 5;
-                        }
+                        $excluded_by_eye{$lat}{$clean} = 1;
                     }
                 }
             }
@@ -4267,25 +4968,20 @@ helper generate_phenopacket_impl => sub {
             my $matched_reason = "";
 
             if ($is_suspected) {
+                my $lat = lc($it->{laterality} // 'none');
+
                 for my $cand ($it->{canonical_term}, $it->{verbatim_text}) {
                     next unless defined $cand && length($cand);
                     my $clean = lc(clean_term_for_vector_mapping($cand));
                     $clean =~ s/\b(?:v\.?\s*a\.?|verdacht|fraglich)\b//gi;
                     $clean =~ s/^\s+|\s+$//g;
 
-                    if ($excluded_phrases{$clean}) {
+                    # Nur droppen, wenn auf DEMSELBEN Auge (oder explizit bilateral) ausgeschlossen!
+                    if ($excluded_by_eye{$lat}{$clean} || $excluded_by_eye{'bilateral'}{$clean}) {
                         $should_drop = 1;
-                        $matched_reason = "Phrase '$clean'";
+                        $matched_reason = "Eye '$lat' Phrase '$clean'";
                         last;
                     }
-                    foreach my $token (split(/[^\p{L}\p{N}]+/, $clean)) {
-                        if (length($token) >= 5 && $excluded_tokens{$token}) {
-                            $should_drop = 1;
-                            $matched_reason = "Token '$token'";
-                            last;
-                        }
-                    }
-                    last if $should_drop;
                 }
             }
 
@@ -4296,7 +4992,29 @@ helper generate_phenopacket_impl => sub {
                 1;
             }
         } @$atomic_items;
+        
+        # -------------------------------------------------------------
+        # Anatomie-Schutz & Syntaktische Fehlinterpretationen korrigieren
+        # -------------------------------------------------------------
+        foreach my $item (@$atomic_items) {
+            my $v = lc($item->{verbatim_text} // '');
+            my $c = lc($item->{canonical_term} // '');
 
+            # 1. Anatomie-Fix: Retinale Befunde dürfen niemals Iris/Cornea/Lid sein
+            if ($c =~ /\b(?:retin\w*|makula|macula|fovea|photorezept\w*|glios\w*|foramen|drusen)\b/i
+                || $v =~ /\b(?:nh[- ]oct|oct|fundus|retina|intraretinal|subretinal)\b/i) {
+                if (($item->{anatomical_site} // '') =~ /^(?:iris|cornea|lens|anterior_chamber|eyelid|ocular_other)$/) {
+                    $item->{anatomical_site} = ($c =~ /\b(?:makula|macula|fovea)\b/i) ? 'macula' : 'retina';
+                }
+            }
+
+            # 2. Syntaktischer Fix: "DD traktiv bei epiretinaler Gliose" ist ein Makulaödem, keine Amotio
+            if ($c =~ /traktiv.*netzhautabl/i && $v =~ /\b(?:makula|gliose|traktiv)\b/i && $v !~ /\b(?:amotio|ablatio|ablösung)\b/i) {
+                $item->{canonical_term} = 'Traktives Makulaödem';
+                $item->{domain}         = 'hpo';
+            }
+        }
+        
         # -------------------------------------------------------------
         # Domain-Korrektur & Administrative Filterung
         # -------------------------------------------------------------
@@ -4341,7 +5059,7 @@ helper generate_phenopacket_impl => sub {
                     $item->{canonical_term} = 'Hornhauttransplantatabstoßung';
                 }
             }
-            if ($v =~ /\b(?:re[- ]?dmek|re[- ]?dsaek|re[- ]?keratoplastik)\b/i || $c =~ /\bre[- ]?dmek\b/i) {
+            if ($v =~ /\b(?:re[- ]?dmek|re[- ]?dsaek)\b/i || $c =~ /\bre[- ]?dmek\b/i) {
                 $item->{domain}         = 'ops';
                 $item->{canonical_term} = 'Re-DMEK';
             }
@@ -4365,6 +5083,10 @@ helper generate_phenopacket_impl => sub {
             # Atrophiekonus / myoper Konus / peripapilläre Atrophie ist ein HPO-Phänotyp, kein ICD-10!
             if ($item->{domain} eq 'icd10' && $v =~ /\b(?:atrophiekonus|myoper\s+konus|peripapill[äa]re\s+atrophie)\b/i) {
                 $item->{domain} = 'hpo';
+            }
+            # Verhindert Extraktion von OPs, die nur reevaluiert/geplant wurden
+            if ($item->{domain} eq 'ops' && $v =~ /\b(?:reevaluation|evaluation|planung|erwägung|geplant|option)\s+(?:einer?|zur?)\b/i) {
+                $item->{domain} = 'skip';
             }
             if ($v =~ /\bhinterkapsel\s+(?:eröffnet|gefenstert)\b/i) {
                 # Entweder als Zustand nach Kapsulotomie führen:
@@ -4420,15 +5142,23 @@ helper generate_phenopacket_impl => sub {
 
             my $time_from_verb  = extract_event_date($v_text, $reference_date);
             my $time_from_event = extract_event_date($event_date, $reference_date);
-            my $date_source;
-            if ($time_from_verb && $time_from_event) {
-                $date_source = (length($time_from_verb) >= length($time_from_event))
-                    ? $time_from_verb : $time_from_event;
-            } else {
-                $date_source = $time_from_verb // $time_from_event // $event_date // $v_text;
-            }
-            my $item_timestamp = extract_event_date($date_source, $reference_date);
+            my $item_timestamp  = $time_from_event // $time_from_verb;
 
+            # STUFE 1: Satz-Kontext durchsuchen, falls das LLM den Kriterientext verkürzt hat
+            # Sucht in einem 250-Zeichen-Fenster im selben Absatz (kein vorzeitiger Abbruch bei Punkten wie "Z.n." oder "+9,0 D")
+            if (!$item_timestamp && length($v_text) > 3) {
+                if ($text_content =~ /([^\n\r]{0,250}\Q$v_text\E[^\n\r]{0,250})/i) {
+                    my $surrounding_clause = $1;
+                    $item_timestamp = extract_event_date($surrounding_clause, $reference_date);
+                }
+            }
+            # STUFE 2: Pseudodatum-Fallback für alle historischen Einträge (is_history = true)
+            # Verhindert, dass alte Diagnosen wie Endophthalmitis ohne Datum als "akut" fehlinterpretiert werden!
+            if (!$item_timestamp && to_bool($item->{is_history})) {
+                $item_timestamp = "PAST-UK-Uk";
+                $self->app->log->info("[HISTORICAL PSEUDODATE] '$canon_term' (is_history=1) erhält Pseudodatum $item_timestamp");
+            }
+            
             my $item_lat = lc($item->{laterality} // 'none');
             if ($item_lat eq 'none' || !$item_lat) {
                 if ($v_text =~ /\b(?:RA|OD|rechts?|right|R\b|R:|diagnosen\s*R|fundus\s*R|vaa\s*R|visus\s*R|tensio\s*R|oct\s*R)\b/i) {
@@ -4644,9 +5374,20 @@ helper generate_phenopacket_impl => sub {
                 my $lat_code    = $self->get_laterality_hpo_object($item_lat, $context_str);
 
                 my $search_icd = (defined $canon_term && length($canon_term) > 1) ? $canon_term : $v_text;
-                $search_icd = enrich_term_with_section_context($search_icd, "$v_text $canon_term", $text_content);
+                # enrich liefert überwiegend englische HPO-Suchbegriffe. Für den deutschen
+                # ICD-Index nur übernehmen, wenn ein kuratierter ICD-Intercept darauf greift.
+                my $enriched_icd = enrich_term_with_section_context($search_icd, "$v_text $canon_term", $text_content);
+                if (defined $enriched_icd && $enriched_icd ne $search_icd
+                    && $self->check_database_intercept('icd10', $enriched_icd, $v_text)) {
+                    $search_icd = $enriched_icd;
+                }
+                my $icd_opts = {
+                    context    => $v_text,
+                    site       => $item->{anatomical_site},
+                    is_history => to_bool($item->{is_history}),
+                };
 
-                my $p = $self->map_to_icd10_async($search_icd, $canon_term, $doc_lang)->then(sub {
+                my $p = $self->map_to_icd10_async($search_icd, $canon_term, $doc_lang, $icd_opts)->then(sub {
                     my $mapped = shift;
                     return undef unless defined $mapped && defined $mapped->{id};
 
@@ -4698,7 +5439,8 @@ helper generate_phenopacket_impl => sub {
                     push @medication_promises, $p_atc_auto;
                 }
 
-                my $p = $self->map_to_ops_async($search_proc, $doc_lang)->then(sub {
+                my $p = $self->map_to_ops_async($search_proc, $doc_lang,
+                    { context => $v_text, site => $item->{anatomical_site} })->then(sub {
                     my $mapped = shift;
                     return undef unless $mapped && $mapped->{id};
 
@@ -4721,13 +5463,24 @@ helper generate_phenopacket_impl => sub {
             }
             # --- ATC MEDICATIONS ---
             elsif ($domain eq 'atc') {
-                my $direct_hit = $self->check_database_intercept('atc', $v_text);
-                $direct_hit //= $self->check_database_intercept('atc', $canon_term) if defined $canon_term;
+                # PATCH 2026-09-24: kanonischen Begriff zuerst prüfen. Bei Kombinationszeilen
+                # ("Vigamox, Kanamycin und Voriconazol") würde sonst die erste passende Regel
+                # des Verbatim-Textes für jeden Wirkstoff der Zeile gelten.
+                my $direct_hit;
+                if (defined $canon_term && length($canon_term) > 1) {
+                    $direct_hit = $self->check_database_intercept('atc', $canon_term);
+                    $direct_hit //= $self->check_database_intercept('atc', $v_text)
+                        unless $v_text =~ /,|;|\s\/\s|\w\/\p{L}|\b(?:und|sowie|bzw\.?|im\s+Wechsel|i\.\s*W\.)\b/i;
+                } else {
+                    $direct_hit = $self->check_database_intercept('atc', $v_text);
+                }
+                next if $direct_hit && $direct_hit->{suppress};
 
                 if ($direct_hit) {
-                    $self->app->log->info("[ATC DB INTERCEPT OVERRIDE] '$v_text' -> $direct_hit->{id} ($direct_hit->{label})");
+                    $self->app->log->info("[ATC DB INTERCEPT OVERRIDE] '" . ($canon_term // '') . " / $v_text' -> $direct_hit->{id} ($direct_hit->{label})");
                     my $med_obj = { agent => { id => $direct_hit->{id}, label => $direct_hit->{label} } };
                     $med_obj->{performedTime} = $item_timestamp if defined $item_timestamp;
+                    $med_obj->{bodySite}      = $lat_code if defined $lat_code;
                     push @medication_promises, Mojo::Promise->resolve($med_obj);
                     next;
                 }
@@ -4749,17 +5502,23 @@ helper generate_phenopacket_impl => sub {
 
                     my $med_obj = { agent => { id => $mapped->{id}, label => $chosen_label } };
                     $med_obj->{performedTime} = $item_timestamp if defined $item_timestamp;
+                    $med_obj->{bodySite}      = $lat_code if defined $lat_code;
                     return $med_obj;
                 });
                 push @medication_promises, $p;
             }
             # --- HPO PHENOTYPES ---
             else {
+                # Intercepts nur auf den kanonischen Begriff. Der Verbatim-Text enthält oft
+                # weitere Befunde ("keine Hautausschläge ... Sehverschlechterung") und dient
+                # nur noch als Kontext für den Scope-Guard.
                 my $direct_hit;
                 if (defined $canon_term && length($canon_term) > 1) {
-                    $direct_hit = $self->check_database_intercept('hpo', $canon_term);
+                    $direct_hit = $self->check_database_intercept('hpo', $canon_term, $v_text);
+                } else {
+                    $direct_hit = $self->check_database_intercept('hpo', $v_text);
                 }
-                $direct_hit //= $self->check_database_intercept('hpo', $v_text);
+                next if $direct_hit && $direct_hit->{suppress};
 
                 my $search_term = (defined $canon_term && length($canon_term) > 1) ? $canon_term : $v_text;
                 $search_term = enrich_term_with_section_context($search_term, "$v_text $canon_term", $text_content);
@@ -4782,7 +5541,8 @@ helper generate_phenopacket_impl => sub {
                     next;
                 }
 
-                my $p = $self->map_to_hpo_async($search_term, 0, $doc_lang)->then(sub {
+                my $p = $self->map_to_hpo_async($search_term, 0, $doc_lang,
+                    { context => $v_text, site => $item->{anatomical_site} })->then(sub {
                     my $mapped = shift;
                     return undef unless $mapped && $mapped->{id};
 
@@ -4853,6 +5613,28 @@ helper generate_phenopacket_impl => sub {
                 }
             }
 
+            # Deduplizierung der Messwerte (verhindert z. B. doppelte Tensio-Messungen)
+            my %seen_measurements;
+            my @deduped_measurements;
+            foreach my $m (@final_measurements) {
+                next unless $m && $m->{assay} && $m->{assay}{id};
+                my $assay_id = $m->{assay}{id};
+                my $val = defined $m->{value}{quantity}{value}
+                        ? $m->{value}{quantity}{value}
+                        : ($m->{value}{ontologyClass}{id} // '');
+                my $lat = 'none';
+                foreach my $mod (@{$m->{modifiers} // []}) {
+                    if ($mod->{id} =~ /^HP:001283[245]$/) {
+                        $lat = $mod->{id};
+                        last;
+                    }
+                }
+                my $time = $m->{timeOfCollection}{timestamp} // '';
+                my $sig = "$assay_id|$lat|$val|$time";
+                push @deduped_measurements, $m unless $seen_measurements{$sig}++;
+            }
+            @final_measurements = @deduped_measurements;
+
             my @raw_diseases     = grep { defined } map { $_->[0] } @$i_res;
             my @raw_procedures   = grep { defined } map { $_->[0] } @$pr_res;
             my @raw_medications  = grep { defined } map { $_->[0] } @$m_res;
@@ -4904,11 +5686,15 @@ helper generate_phenopacket_impl => sub {
             my %diseases_by_code;
             foreach my $d (@raw_diseases) {
                 next unless $d && $d->{term}{id};
-                my $key = $d->{term}{id};
-                if ($key =~ /^ICD10:(?:Z88|T88\.7|T78\.4)/i) {
-                    my $clean_label = lc($d->{term}{label} // '');
-                    $clean_label =~ s/\b(?:allergie\s*(?:gegen)?|unvertr\w*)\b//gi;
-                    $clean_label =~ s/^\s+|\s+$//g;
+                my $code = $d->{term}{id};
+                my $is_excluded = to_bool($d->{excluded}) ? 1 : 0;
+                
+                # Bei H35.38 oder Sammelcodes den klinischen Begriff anhängen:
+                my $clean_label = lc($d->{term}{label} // '');
+                $clean_label =~ s/[^\p{L}\p{N}]+//g;
+                
+                my $key = "$code|$is_excluded";
+                if ($code =~ /^ICD10:(?:H35|H26|Z88|T88|T78|M06)/i) {
                     $key .= "|$clean_label";
                 }
                 push @{$diseases_by_code{$key}}, $d;
@@ -5031,6 +5817,9 @@ helper generate_phenopacket_impl => sub {
                 my $treatment_obj = { agent => $med->{agent} };
                 if ($med->{performedTime}) {
                     $treatment_obj->{performedTime} = $med->{performedTime};
+                }
+                if ($med->{bodySite}) {
+                    $treatment_obj->{bodySite} = $med->{bodySite};
                 }
                 push @medical_actions, { treatment => $treatment_obj };
             }
