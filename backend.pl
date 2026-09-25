@@ -94,6 +94,13 @@ my $translation_cache_on = $ENV{ONTOTRIAL_TRANSLATION_CACHE}     // 1;
 # PATCH 2026-09-24: Label-Gate und ICD-Auflösungspflicht
 my $label_gate_min_cov   = $ENV{ONTOTRIAL_LABEL_GATE_MIN_COVERAGE} // 0.67;  # Anteil gedeckter Query-Wörter
 my $icd_require_resolved = $ENV{ONTOTRIAL_ICD_REQUIRE_RESOLVED}    // 1;     # ICD-Code muss in icd10_terms stehen
+# PATCH 2026-09-25: Grauzone, okulärer ICD-Prior, Intercept-Validierung, Elternknoten
+my $rerank_gray_floor    = { hpo => 0.08, ops => 0.08, loinc => 0.08, atc => 0.07, icd10 => 0.07 }; # max. Distanz, wenn gerankt wird
+my $icd_ocular_prior     = $ENV{ONTOTRIAL_ICD_OCULAR_PRIOR}         // 1;
+my $block_history_zcodes = $ENV{ONTOTRIAL_BLOCK_HISTORY_ZCODES}     // 1;     # Z85–Z87 nie vergeben
+my $intercept_validate   = $ENV{ONTOTRIAL_INTERCEPT_VALIDATE}       // 1;     # Intercepts mit unbekanntem Code ignorieren
+my $parent_candidate_on  = $ENV{ONTOTRIAL_PARENT_CANDIDATE}         // 1;     # Elternknoten als Rerank-Kandidat
+my $ground_generic       = $ENV{ONTOTRIAL_GROUND_GENERIC}           // 1;     # Organ an Begriffe ohne okuläres Signal anhängen
 
 
 # Concurrency throttling configuration for Patchbay
@@ -1372,7 +1379,9 @@ helper get_domain_intercepts => sub {
                   ORDER BY priority ASC, id ASC",
                 $domain
             )->hashes->to_array;
-            $cache->{$domain} = $rows // [];
+            # PATCH 2026-09-25: Regeln mit unbekanntem Code nicht verwenden
+            $rows = $self->_validate_intercepts($domain, $rows // []);
+            $cache->{$domain} = $rows;
             $last_fetch->{$domain} = $now;
         };
         if ($@) {
@@ -1416,6 +1425,18 @@ helper check_database_intercept => sub {
         if ($domain =~ /^(?:icd10|hpo|ops)$/ && $self->has_scope_conflict($domain, $code, $scope_text)) {
             $self->app->log->warn("[INTERCEPT SCOPE CONFLICT] Domain '$domain': '$text' -> $code widerspricht dem Kontext. Nächste Regel.");
             next;
+        }
+
+        # PATCH 2026-09-25: Richtungs-Guard. "Explantation/Entfernung/Bergung" darf nicht
+        # auf einen Einführungs- oder Deckungscode fallen.
+        if ($domain eq 'ops') {
+            state $rm_term = qr/(?:entfern|explant|bergung|ablass|ausschneid|k[üu]rz|fadenzug|\bzug\b|abtrag)/i;
+            state $rm_code = qr/(?:entfern|explant|revision|wechsel|l[öo]sung|exzision|destruktion|extraktion|abtragung|keratektomie|kapsulotomie|abrasio)/i;
+            my $olabel = $self->get_canonical_ontology_label('ops', $code) // $rule->{label} // '';
+            if ($text =~ $rm_term && $olabel !~ $rm_code) {
+                $self->app->log->warn("[INTERCEPT DIRECTION CONFLICT] '$text' -> $code ($olabel): Entfernung auf Einführungscode. Nächste Regel.");
+                next;
+            }
         }
 
         # Label immer aus der Ontologie, nicht aus der Intercept-Tabelle.
@@ -2166,7 +2187,7 @@ our $EXTRAOCULAR_TERM_REGEX = qr{(?:
     mamma|\bbrust|uterus|hyster|ovar|
     schilddr|struma|
     wirbel|knochen|gelenk|arthr|hüft|\bknie|menisk|
-    unterschenkel|cruris|\bbein|oberarm|unterarm|\barm\b|schulter|\bhand\b|finger|\bfu[ßs]|zehe|
+    unterschenkel|cruris|\bbein|oberarm|unterarm|\barm\b|schulter|\bhand\b|finger(?!print|abdruck)|\bfu[ßs]|zehe|
     zahn|zähne|kiefer|gaumen|zunge|wange|gesichtshälfte|schläfe|\bstirn\b|
     \bohr|mittelohr|mastoid|pauken|tonsill|
     hautkrebs|hautausschlag|hautläsion|dermat(?!ochalas)
@@ -2179,7 +2200,8 @@ helper is_ocular_code => sub {
     return undef unless defined $code && length $code;
     if ($domain eq 'icd10') {
         my $c = uc($code); $c =~ s/^ICD10://;
-        return ($c =~ /^(?:H[0-5]\d|D31|C69|Q1[0-5]|Z96\.1|Z94\.7|T85\.2|T86\.83|B02\.3|B00\.5|S05|D09\.2|D22\.1|D23\.1|T26|T85\.3)/) ? 1 : 0;
+        # PATCH 2026-09-25: B58.0, A18.5, E1x.3, B30, T15, Z44.2, C43.1, C44.1 ergänzt
+        return ($c =~ /^(?:H[0-5]\d|D31|C69|Q1[0-5]|Z96\.1|Z94\.7|T85\.2|T86\.83|B02\.3|B00\.5|S05|D09\.2|D22\.1|D23\.1|T26|T85\.3|B58\.0|A18\.5|E1[0-4]\.3|B30|T15|Z44\.2|C43\.1|C44\.1)/) ? 1 : 0;
     }
     if ($domain eq 'hpo') {
         return ( $self->is_subclass_of($code, 'HP:0000478')  # Abnormality of the eye
@@ -2210,6 +2232,18 @@ helper has_scope_conflict => sub {
     return 0 unless $term_ocular || $term_extraocular;
     return 0 if $term_ocular && $term_extraocular;
 
+    # PATCH 2026-09-25: Allergie-/Unverträglichkeits- und Migränecodes sind organunabhängig
+    return 0 if $domain eq 'icd10' && $code =~ /^ICD10:(?:T78|T88|Z88|Z91|G43)/i;
+
+    # PATCH 2026-09-25: Lidhaut ist Gesichtshaut – Haut-/Gesichtsbefunde am Lid sind kein Widerspruch
+    if ($domain eq 'hpo' && $term_ocular) {
+        state $eyelid_re = qr/(?:ober|unter|augen)lid|\blid(?:haut|rand|kante)?\b|eyelid|palpebr|kanthus|canthus/i;
+        if ($term =~ $eyelid_re
+            && ($self->is_subclass_of($code, 'HP:0000271') || $self->is_subclass_of($code, 'HP:0000951'))) {
+            return 0;
+        }
+    }
+
     my $code_ocular = $self->is_ocular_code($domain, $code);
     return 0 unless defined $code_ocular;
 
@@ -2233,6 +2267,119 @@ helper site_conflict => sub {
     return '' if $oc;
     return '' if defined $sim && $sim >= $ocular_prior_min_sim;   # nahezu exakter Treffer
     return "okuläre Struktur '$site', nicht-okulärer Code";
+};
+
+# ---------------------------------------------------------
+# PATCH 2026-09-25: Hilfsfunktionen für Intercept-Validierung,
+# Reranking-Guards und Elternknoten-Kandidaten
+# ---------------------------------------------------------
+
+# Levenshtein-Distanz für kurze Strings (Handelsnamen, Tippfehler)
+sub _lev {
+    my ($s, $t) = @_;
+    my @s = split //, $s;
+    my @t = split //, $t;
+    return scalar(@t) unless @s;
+    return scalar(@s) unless @t;
+    my @prev = (0 .. scalar(@t));
+    for my $i (1 .. scalar(@s)) {
+        my @cur = ($i);
+        for my $j (1 .. scalar(@t)) {
+            my $cost = ($s[$i - 1] eq $t[$j - 1]) ? 0 : 1;
+            my $v = $prev[$j] + 1;
+            $v = $cur[$j - 1] + 1      if $cur[$j - 1] + 1 < $v;
+            $v = $prev[$j - 1] + $cost if $prev[$j - 1] + $cost < $v;
+            push @cur, $v;
+        }
+        @prev = @cur;
+    }
+    return $prev[-1];
+}
+
+# Lexikalische Plausibilität eines ATC-Treffers: Wirkstoff oder Handelsname
+# muss zum Begriff passen (Tippfehler bis 25 % toleriert).
+helper atc_lexical_ok => sub {
+    my ($self, $term, $hit) = @_;
+    return 0 unless ref $hit eq 'HASH';
+    my $q = _lex_norm($term);
+    return 1 if length($q) < 4;    # Kürzel wie ASS, MTX: nicht lexikalisch prüfbar
+    my @names;
+    for my $s ($hit->{label}, $hit->{index_text}) {
+        next unless defined $s && length $s;
+        push @names, _lex_norm($s);
+        push @names, map { _lex_norm($_) } grep { length($_) >= 4 } split /[^\p{L}]+/, $s;
+    }
+    for my $n (grep { length($_) >= 3 } @names) {
+        return 1 if index($n, $q) >= 0;
+        return 1 if length($n) >= 5 && index($q, $n) >= 0;
+        my $max = length($q) > length($n) ? length($q) : length($n);
+        return 1 if _lev($q, $n) / $max <= 0.25;
+    }
+    return 0;
+};
+
+# Intercepts, deren Code nicht in der Terminologie steht, werden ignoriert
+# (einmalige Warnung pro Regel).
+helper _validate_intercepts => sub {
+    my ($self, $domain, $rows) = @_;
+    return $rows unless $intercept_validate && ref $rows eq 'ARRAY';
+    state %warned;
+    my @ok;
+    for my $r (@$rows) {
+        if ($r->{suppress}) { push @ok, $r; next; }
+        my $code   = $r->{code} // '';
+        my $fmt_ok = ($code =~ /^(?:HP|ICD10|OPS|ATC|LOINC):\S+$/i) ? 1 : 0;
+        my $label  = $fmt_ok ? eval { $self->get_canonical_ontology_label($domain, $code) } : undef;
+        if (defined $label && length $label && $label !~ /^\s*(?:obsolete|deprecated)\b/i) {
+            push @ok, $r;
+            next;
+        }
+        my $why = !$fmt_ok ? 'ungültiges Format' : !defined $label ? 'nicht in der Terminologie' : 'veraltet';
+        $self->app->log->warn("[INTERCEPT INVALID] Domain '$domain': '$code' ($r->{label}) $why – Regel ignoriert.")
+            unless $warned{"$domain|$code|" . ($r->{pattern} // '')}++;
+    }
+    return \@ok;
+};
+
+# Gemeinsamer Elternknoten der Kandidaten (ICD/OPS) als zusätzlicher
+# "broader"-Kandidat für den Reranker.
+helper common_parent_candidate => sub {
+    my ($self, $domain, $cands) = @_;
+    return undef unless $parent_candidate_on;
+    return undef unless $domain =~ /^(?:icd10|ops)$/ && ref $cands eq 'ARRAY' && @$cands > 1;
+    my $table  = $domain eq 'icd10' ? 'public.icd10_terms' : 'public.ops_terms';
+    my $prefix = $domain eq 'icd10' ? 'ICD10:' : 'OPS:';
+    my (@chains, %count);
+    for my $c (@$cands) {
+        (my $id = $c->{id} // '') =~ s/^(?:ICD10|OPS)://i;
+        next unless length $id;
+        my $rows = eval {
+            $self->pg->db->query(qq{
+                WITH RECURSIVE up AS (
+                    SELECT id, parent_id, label, 0 AS d FROM $table WHERE lower(id) = lower(?)
+                    UNION ALL
+                    SELECT p.id, p.parent_id, p.label, up.d + 1
+                      FROM $table p JOIN up ON p.id = up.parent_id
+                     WHERE up.d < 10
+                )
+                SELECT id, label FROM up ORDER BY d
+            }, $id)->hashes->to_array;
+        } // [];
+        next unless @$rows;
+        push @chains, $rows;
+        my %seen;
+        $count{ lc $_->{id} }++ for grep { !$seen{ lc $_->{id} }++ } @$rows;
+    }
+    return undef unless @chains > 1 && @chains == @$cands;
+    my %cand_ids = map { lc(($_->{id} // '') =~ s/^(?:ICD10|OPS)://ir) => 1 } @$cands;
+    for my $n (@{ $chains[0] }) {
+        next unless ($count{ lc $n->{id} } // 0) == @chains;
+        return undef if $cand_ids{ lc $n->{id} };                  # Oberbegriff ist schon Kandidat
+        return undef unless is_plausible_code($domain, $n->{id});  # keine Kapitel/Bereiche
+        return { id => $prefix . $n->{id}, label => $n->{label}, resolved => 1,
+                 sim => 0, index_text => undef, is_parent => 1 };
+    }
+    return undef;
 };
 
 # Einheitliche Treffer-Auswertung für HPO/OPS/ATC/LOINC:
@@ -2289,7 +2436,15 @@ helper _build_vector_res => sub {
     my $log   = $self->app->log;
 
     # Schwellen je Domäne. ATC ist tolerant (Handelsnamen), HPO/OPS streng.
-    $max_dist //= { hpo => 0.055, ops => 0.055, atc => 0.07, loinc => 0.06 }->{$domain} // 0.055;
+    # PATCH 2026-09-25: Grauzone. Mit Reranking dürfen Kandidaten bis zur Floor-Distanz
+    # durch; entschieden wird dann im Reranker statt per harter Schwelle.
+    unless (defined $max_dist) {
+        $max_dist = { hpo => 0.055, ops => 0.055, atc => 0.07, loinc => 0.06 }->{$domain} // 0.055;
+        if ($rerank_enabled && !$opts->{no_rerank}) {
+            my $g = $rerank_gray_floor->{$domain} // $max_dist;
+            $max_dist = $g if $g > $max_dist;
+        }
+    }
 
     return undef unless $match && defined $match->{label};
 
@@ -2342,6 +2497,12 @@ helper _build_vector_res => sub {
 
     my $db_label      = $self->get_canonical_ontology_label($domain, $raw_code);
     my $matched_label = $db_label // $match->{payload} // $term;
+
+    # PATCH 2026-09-25: obsolete HPO-Terme und veraltete LOINC-Codes nie vergeben
+    if (defined $db_label && $db_label =~ /^\s*(?:obsolete|deprecated)\b/i) {
+        $log->warn("[\U$domain\E OBSOLETE]$dist_str '$term' -> $matched_id ($db_label) ist veraltet. Verworfen.") unless $quiet;
+        return undef;
+    }
 
     $log->info("[\U$domain\E RETRIEVAL]$dist_str '$term' -> $matched_id ($matched_label)") unless $quiet;
     return { id => $matched_id, label => $matched_label, resolved => (defined $db_label ? 1 : 0),
@@ -2481,11 +2642,14 @@ helper _select_vector_hit_async => sub {
         next if grep { $_->{id} eq $r->{id} } @cands;
         push @cands, $r;
     }
-    return $self->rerank_candidates_async($domain, $term, \@cands, $opts->{context});
+    # PATCH 2026-09-25: gemeinsamer Elternknoten als broader-Kandidat, Flags für den Cache
+    my $parent = $self->common_parent_candidate($domain, \@cands);
+    push @cands, $parent if $parent;
+    return $self->rerank_candidates_async($domain, $term, \@cands, $opts->{context}, $opts);
 };
 
 helper rerank_candidates_async => sub {
-    my ($self, $domain, $term, $cands, $context) = @_;
+    my ($self, $domain, $term, $cands, $context, $flags) = @_;   # PATCH 2026-09-25: $flags (is_history, site)
     return Mojo::Promise->resolve(undef) unless ref $cands eq 'ARRAY' && @$cands;
     my $log = $self->app->log;
 
@@ -2519,8 +2683,13 @@ helper rerank_candidates_async => sub {
     my $cand_key    = join('|', map { $_->{id} } @$cands);
     # Cache-Schlüssel hängt an Prompt-Version UND an den gezeigten Labels:
     # ändert sich der Prompt oder die Ontologietabelle, wird neu entschieden.
+    # PATCH 2026-09-25: Vorgeschichte und Struktur gehören zum Cache-Schlüssel,
+    # sonst wird eine "Z.n."-Entscheidung auf aktuelle Befunde übertragen.
+    my $flag_str = (ref $flags eq 'HASH')
+        ? join(';', 'hist=' . ($flags->{is_history} ? 1 : 0), 'site=' . ($flags->{site} // ''))
+        : '';
     my $prompt_hash = md5_hex(encode('UTF-8', join("\x{1}",
-        $prompt->{system_prompt} // '', $prompt->{user_template} // '', $list)));
+        $prompt->{system_prompt} // '', $prompt->{user_template} // '', $list, $flag_str)));
 
     # -------------------------------------------------------------
     # 2. CACHE-LOOKUP
@@ -2604,6 +2773,22 @@ helper rerank_candidates_async => sub {
         my $reason   = $d->{reason} // '';
         my $picked   = ($choice >= 0 && $choice <= $#$cands) ? $cands->[$choice] : undef;
         my $chosen   = ($picked && $relation =~ /^(?:exact|broader)$/) ? $picked : undef;
+
+        # PATCH 2026-09-25: deterministische ATC-Guards
+        # - broader nur auf Klassenebene (< 7 Stellen), nie ein anderes Präparat
+        # - exact nur mit lexikalischer Deckung (Wirkstoff oder Handelsname, Tippfehler toleriert)
+        if ($chosen && $domain eq 'atc') {
+            (my $ac = $chosen->{id}) =~ s/^ATC://i;
+            if ($relation eq 'broader' && length($ac) >= 7) {
+                $reason   = "[Guard] broader auf Präparatebene ($chosen->{id}) nicht zulässig. " . $reason;
+                $relation = 'unrelated';
+                $chosen   = undef;
+            } elsif ($relation eq 'exact' && !$self->atc_lexical_ok($term, $chosen)) {
+                $reason   = "[Guard] keine lexikalische Deckung zwischen '$term' und $chosen->{id}. " . $reason;
+                $relation = 'related';
+                $chosen   = undef;
+            }
+        }
 
         eval {
             $self->pg->db->query(q{
@@ -2828,7 +3013,10 @@ helper map_to_icd10_async => sub {
             my $r = $self->_build_icd10_res($matches->[$i], $q, undef, { %$opts, quiet => 1 });
             push @c, $r if $r && !grep { $_->{id} eq $r->{id} } @c;
         }
-        return $self->rerank_candidates_async('icd10', $q, \@c, $opts->{context});
+        # PATCH 2026-09-25: gemeinsamer Elternknoten als broader-Kandidat, Flags für den Cache
+        my $parent = $self->common_parent_candidate('icd10', \@c);
+        push @c, $parent if $parent;
+        return $self->rerank_candidates_async('icd10', $q, \@c, $opts->{context}, $opts);
     };
 
     # 4. Vektorsuche mit Fallback und abschließender Allergie-Anreicherung
@@ -2877,7 +3065,8 @@ helper _build_icd10_res => sub {
     my $quiet = $opts->{quiet} ? 1 : 0;
     my $log   = $self->app->log;
 
-    $max_allowed_dist //= 0.05;
+    # PATCH 2026-09-25: Grauzone wie bei den anderen Domänen
+    $max_allowed_dist //= ($rerank_enabled && !$opts->{no_rerank}) ? ($rerank_gray_floor->{icd10} // 0.05) : 0.05;
 
     return undef unless $match && defined $match->{label};
 
@@ -2924,6 +3113,28 @@ helper _build_icd10_res => sub {
         && $term !~ /\b(?:z\.?\s*n\.?|zustand\s+nach|anamnes\w*|vorgeschichte|history)\b/i) {
         $log->warn("[ICD10 BLOCKED] Anamnese-/Beobachtungscode $matched_id für aktuellen Befund '$term' abgewiesen.") unless $quiet;
         return undef;
+    }
+
+    # --- ANAMNESE-SAMMELCODES (PATCH 2026-09-25) ---
+    # Z85–Z87 verlieren die eigentliche Erkrankung; die Vorgeschichte wird über onset/is_history abgebildet.
+    if ($block_history_zcodes && $matched_id =~ /^ICD10:Z8[5-7]/i) {
+        $log->warn("[ICD10 BLOCKED] Anamnese-Sammelcode $matched_id für '$term' abgewiesen (Erkrankung selbst kodieren).") unless $quiet;
+        return undef;
+    }
+
+    # --- OKULÄRER PRIOR FÜR ICD-10 (PATCH 2026-09-25) ---
+    # Bei okulärer Struktur ist ein nicht-okulärer Code ohne extraokuläres Signal
+    # nur bei nahezu exaktem Treffer glaubhaft (Shieldulcus -> Ulcus ventriculi, Pannus -> Phlegmone).
+    if ($ocular_prior_enabled && $icd_ocular_prior
+        && defined $sim && $sim < $ocular_prior_min_sim
+        && ($opts->{site} // '') !~ /^(?:systemic|none|)$/
+        && $term !~ $EXTRAOCULAR_TERM_REGEX
+        && !(defined $opts->{context} && $opts->{context} =~ $EXTRAOCULAR_TERM_REGEX)) {
+        my $oc = $self->is_ocular_code('icd10', $matched_id);
+        if (defined $oc && !$oc) {
+            $log->warn("[ICD10 OCULAR PRIOR]$dist_str '$term' -> $matched_id ist nicht-okulär bei Struktur '$opts->{site}'. Verworfen.") unless $quiet;
+        return undef;
+    }
     }
 
     # --- TRAUMA-FILTER (S-Codes) ---
@@ -3482,7 +3693,21 @@ sub ground_canonical_term {
         $log->info("[UNGROUNDED ROW DROPPED] Kein kodierbares Konzept: '$ct'");
         return 0;
     }
-    return 1 unless $probe =~ $BARE_NOUN_REGEX;
+    unless ($probe =~ $BARE_NOUN_REGEX) {
+        # PATCH 2026-09-25: generische Verankerung. Okuläre Struktur, aber kein okuläres
+        # Signal im Begriff ("Pannus", "Shieldulcus", "Hypotonie") -> Organ anhängen.
+        my $site_g = lc($item->{anatomical_site} // '');
+        my $lang   = lc($item->{_doc_lang} // 'de');
+        if ($ground_generic && $lang eq 'de' && $domain =~ /^(?:hpo|icd10)$/
+            && (my $gen = $SITE_GENITIVE{$site_g})
+            && $core !~ $OCULAR_TERM_REGEX
+            && $core !~ $EXTRAOCULAR_TERM_REGEX
+            && $core !~ /\b(?:des|der|am|an|im)\b/i) {
+            $item->{canonical_term} = "$core $gen";
+            $log->info("[CANONICAL GROUNDED] '$ct' -> '$item->{canonical_term}' (generisch, site=$site_g)");
+        }
+        return 1;
+    }
 
     my $site = lc($item->{anatomical_site} // '');
     if (my $gen = $SITE_GENITIVE{$site}) {
@@ -3691,6 +3916,8 @@ $reasoning_trace
                     $item->{disjunction_group_id} = '';
                 }
 
+                # PATCH 2026-09-25: Dokumentsprache für die generische Verankerung
+                $item->{_doc_lang} = (ref $res eq 'HASH') ? lc($res->{document_language} // 'de') : 'de';
                 next unless ground_canonical_term($item, $self->app->log);
 
                 push @all_criteria, $item;
@@ -4602,7 +4829,7 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
                 }
 
                 my $loinc_search_term = prepare_loinc_search_term($v_text, $clean_search_term);
-                my $p_loinc = $c->map_to_loinc_async($loinc_search_term, $doc_lang);
+                my $p_loinc = $c->map_to_loinc_async($loinc_search_term, $doc_lang, { context => $v_text });   # PATCH 2026-09-25
                 my $p_hpo   = $c->map_to_hpo_async($clean_search_term, 0, $doc_lang);
 
                 my $p_combined = Mojo::Promise->all($p_loinc, $p_hpo)->then(sub {
@@ -4664,7 +4891,12 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
 
             # --- ICD-10 Diagnoses ---
             if ($domain eq 'icd10') {
-                my $p_icd = $c->map_to_icd10_async($clean_search_term, $doc_lang)->then(sub {
+                # PATCH 2026-09-25: kanonischer Begriff und Kontext statt Sprach-Fallback
+                my $p_icd = $c->map_to_icd10_async($clean_search_term, $canon_term, $doc_lang, {
+                    context    => $v_text,
+                    site       => $item->{anatomical_site},
+                    is_history => to_bool($item->{is_history}),
+                })->then(sub {
                     my $mapped = shift;
 
                     return undef unless $mapped && $mapped->{id};
@@ -4703,7 +4935,7 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
 
             # --- ATC Medications ---
             if ($domain eq 'atc') {
-                my $p_atc = $c->map_to_atc_async($clean_search_term, $doc_lang)->then(sub {
+                my $p_atc = $c->map_to_atc_async($clean_search_term, $doc_lang, { context => $v_text })->then(sub {   # PATCH 2026-09-25
                     my $mapped = shift;
 
                     return undef unless $mapped && $mapped->{id};
@@ -5333,7 +5565,7 @@ helper generate_phenopacket_impl => sub {
 
                 my $loinc_search_term = prepare_loinc_search_term($v_text, $canon_term, $item_lat);
 
-                my $p = $self->map_to_loinc_async($loinc_search_term, $doc_lang)->then(sub {
+                my $p = $self->map_to_loinc_async($loinc_search_term, $doc_lang, { context => $v_text })->then(sub {   # PATCH 2026-09-25
                     my $mapped = shift;
                     return [] unless defined $mapped && defined $mapped->{id};
 
@@ -5424,7 +5656,7 @@ helper generate_phenopacket_impl => sub {
 
                 if ($v_text =~ /\b(avastin|bevacizumab|lucentis|ranibizumab|eylea|aflibercept|vabysmo|faricimab|beovu|brolucizumab|ozurdex|dexamethason|vitreal[\s\-]*s|triamcinolon)\b/i) {
                     my $substance = $1;
-                    my $p_atc_auto = $self->map_to_atc_async($substance, $doc_lang)->then(sub {
+                    my $p_atc_auto = $self->map_to_atc_async($substance, $doc_lang, { context => $v_text })->then(sub {   # PATCH 2026-09-25
                         my $mapped_atc = shift;
                         return undef unless $mapped_atc && $mapped_atc->{id};
 
@@ -5486,7 +5718,7 @@ helper generate_phenopacket_impl => sub {
                 }
 
                 my $search_med = (defined $canon_term && length($canon_term) > 1) ? $canon_term : $v_text;
-                my $p = $self->map_to_atc_async($search_med, $doc_lang)->then(sub {
+                my $p = $self->map_to_atc_async($search_med, $doc_lang, { context => $v_text })->then(sub {   # PATCH 2026-09-25
                     my $mapped = shift;
                     return undef unless $mapped && $mapped->{id};
 
