@@ -2,21 +2,30 @@
 # =========================================================
 # update_catalogs.pl – Katalog-Aktualisierung für OntoTrial
 #
+# Anleitung mit Bezugsquellen, Dateinamen und Reihenfolge:
+#   perl update_catalogs.pl help
+#
+# Kurzübersicht:
 #   perl update_catalogs.pl inventory
-#   perl update_catalogs.pl hpo   hp.obo                [--dry-run] [--keep-synonyms]
-#   perl update_catalogs.pl icd10 icd10gm2027syst.xml   [--dry-run] [--version 2027]
-#   perl update_catalogs.pl ops   ops2027syst.xml       [--dry-run] [--version 2027]
-#   perl update_catalogs.pl atc   atc_amtlich.csv       [--dry-run] [--version 2027]
+#   perl update_catalogs.pl hpo   hp.obo                  [--dry-run] [--keep-synonyms]
+#   perl update_catalogs.pl icd10 icd10gm2026syst_claml*.xml [--dry-run] [--kodes icd10gm2026syst_kodes.txt]
+#   perl update_catalogs.pl ops   ops2026syst_claml*.xml     [--dry-run] [--kodes ops2026syst_kodes.txt]
+#   perl update_catalogs.pl atc   atc_amtlich.csv         [--dry-run] [--version 2026]
+#   perl update_catalogs.pl loinc Loinc_2.83.zip          [--dry-run] [--md5 PRÜFSUMME]
+#   perl update_catalogs.pl loinc-verify Loinc_2.83.zip   [MD5]
 #   perl update_catalogs.pl check [ontotrial.pl]
 #
 # Optionen:
 #   --db URL            Postgres-URL (Default: $ONTOTRIAL_DB oder localhost/hpo)
 #   --dry-run           parsen, prüfen, schreiben – dann Rollback
+#   --version V         Versionsangabe für catalog_versions (sonst aus der Datei)
 #   --keep-synonyms     HPO: vorhandene (z. B. deutsche) Synonyme behalten, neue ergänzen
 #   --structure / --no-structure
 #                       ICD/OPS: Kapitel und Gruppen mit importieren
 #                       (Default: so wie in der bisherigen Tabelle)
 #   --no-modifiers      ICD/OPS: keine Kodes aus ClaML-Modifikatoren erzeugen
+#   --md5 SUMME         LOINC: erwartete MD5 des ZIPs (für andere Versionen als 2.83)
+#   --kodes DATEI       ICD/OPS: *_kodes.txt aus den BfArM-Metadaten zur Gegenprobe
 #   --force             Plausibilitätsprüfungen nur warnen statt abbrechen
 #
 # Jeder Import sichert die Zieltabellen vorher als <tabelle>_bak_<zeitstempel>
@@ -43,19 +52,27 @@ my $keep_syn = 0;
 my $force    = 0;
 my $no_mod   = 0;
 my $structure;    # undef = wie bisherige Tabelle
+my $kodes_file;
+my $md5_expected;
 
 GetOptions(
-           'db=s'          => \$db_url,
-           'version=s'     => \$version,
-           'dry-run'       => \$dry,
-           'keep-synonyms' => \$keep_syn,
-           'force'         => \$force,
-           'no-modifiers'  => \$no_mod,
-           'structure!'    => \$structure,
-           ) or usage();
+    'db=s'          => \$db_url,
+    'version=s'     => \$version,
+    'dry-run'       => \$dry,
+    'keep-synonyms' => \$keep_syn,
+    'force'         => \$force,
+    'no-modifiers'  => \$no_mod,
+    'structure!'    => \$structure,
+    'kodes=s'       => \$kodes_file,
+    'md5=s'         => \$md5_expected,
+) or usage();
 
 my ($cmd, $file) = @ARGV;
 usage() unless $cmd;
+
+# Befehle ohne Datenbank
+if ($cmd eq 'help' || $cmd eq '--help' || $cmd eq '-h') { print_help(); exit 0 }
+if ($cmd eq 'loinc-verify') { loinc_verify($file, $ARGV[2]); exit 0 }
 
 my $pg = Mojo::Pg->new($db_url);
 my $db = $pg->db;
@@ -66,6 +83,7 @@ elsif ($cmd eq 'hpo')       { need_file(); import_hpo($file) }
 elsif ($cmd eq 'icd10')     { need_file(); import_claml('icd10', $file) }
 elsif ($cmd eq 'ops')       { need_file(); import_claml('ops', $file) }
 elsif ($cmd eq 'atc')       { need_file(); import_atc($file) }
+elsif ($cmd eq 'loinc')     { need_file(); import_loinc($file) }
 elsif ($cmd eq 'check')     { check_codes($file) }
 else                        { usage() }
 
@@ -73,7 +91,8 @@ else                        { usage() }
 # ALLGEMEINE HILFSFUNKTIONEN
 # =========================================================
 sub usage {
-    print STDERR "Aufruf: $0 inventory|hpo|icd10|ops|atc|check [DATEI] [--dry-run] [--force] ...\n";
+    print STDERR "Aufruf: $0 inventory|hpo|icd10|ops|atc|loinc|check|loinc-verify|help [DATEI] [Optionen]\n"
+               . "Ausführliche Anleitung: $0 help\n";
     exit 1;
 }
 
@@ -91,19 +110,19 @@ sub sanity {
 sub ensure_meta_tables {
     $db->query(q{
         CREATE TABLE IF NOT EXISTS public.catalog_versions (
-        id          SERIAL PRIMARY KEY,
-        catalog     TEXT NOT NULL,
-        version     TEXT,
-        source_file TEXT,
-        n_codes     INTEGER,
-        imported_at TIMESTAMPTZ DEFAULT now()
+            id          SERIAL PRIMARY KEY,
+            catalog     TEXT NOT NULL,
+            version     TEXT,
+            source_file TEXT,
+            n_codes     INTEGER,
+            imported_at TIMESTAMPTZ DEFAULT now()
         )});
     # Veraltete/zusammengelegte HPO-Terme -> Nachfolger (für Migration von Studienkriterien)
     $db->query(q{
         CREATE TABLE IF NOT EXISTS public.hpo_replacements (
-        old_id INTEGER PRIMARY KEY,
-        new_id INTEGER NOT NULL,
-        kind   TEXT NOT NULL      -- alt_id | replaced_by | consider
+            old_id INTEGER PRIMARY KEY,
+            new_id INTEGER NOT NULL,
+            kind   TEXT NOT NULL      -- alt_id | replaced_by | consider
         )});
 }
 
@@ -118,25 +137,33 @@ sub backup_table {
 sub record_version {
     my ($catalog, $ver, $src, $n) = @_;
     $db->query('INSERT INTO public.catalog_versions (catalog, version, source_file, n_codes) VALUES (?, ?, ?, ?)',
-    $catalog, $ver, $src, $n);
+        $catalog, $ver, $src, $n);
 }
 
 sub finish {
-    my ($tx) = @_;
+    my ($tx, $catalog) = @_;
     if ($dry) {
-        say "Dry-run: alle Änderungen werden zurückgerollt.";
+        say "Dry-run: alle Änderungen werden zurückgerollt. Ohne --dry-run erneut aufrufen, um zu übernehmen.";
         return;    # $tx wird beim Verlassen des Aufrufers verworfen -> Rollback
     }
     $tx->commit;
-    say "Übernommen. Danach: hypnotoad und Minion-Worker neu starten, Vektorindex neu aufbauen, 'check' laufen lassen.";
+    my %prompt = (hpo => '51/52', icd10 => '64', ops => '65', atc => '66', loinc => '69');
+    say "Übernommen. Nächste Schritte:";
+    say "  1. hypnotoad und Minion-Worker neu starten (Label- und Hierarchie-Caches haben keine Ablaufzeit).";
+    say "  2. Vektorindex in Patchbay neu aufbauen (Prompt-ID $prompt{$catalog})." if $catalog && $prompt{$catalog};
+    say "  3. perl $0 check ontotrial.pl  – veraltete/fehlende Codes in Studien, Intercepts, Quellcode.";
+    say "  4. Studienkriterien mit gemeldeten Codes korrigieren, dann Kandidaten per Tag neu extrahieren"
+      . " (/BBB/candidates/recompute_by_tag) und /BBB/run_all_matches ausführen.";
+    say "  Hinweis HPO: veraltete HPO-Terme in Studien matchen keine Unterbegriffe mehr – zuerst prüfen."
+        if ($catalog // '') eq 'hpo';
 }
 
 sub icd_id_format {
     my $r = eval {
         $db->query(q{
             SELECT count(*) FILTER (WHERE id ~ '^[A-Z][0-9]{2}\.[0-9]') AS dotted,
-            count(*) FILTER (WHERE id ~ '^[A-Z][0-9]{3,}')        AS dotless
-            FROM public.icd10_terms})->hash;
+                   count(*) FILTER (WHERE id ~ '^[A-Z][0-9]{3,}')        AS dotless
+              FROM public.icd10_terms})->hash;
     } // {};
     return (($r->{dotless} // 0) > ($r->{dotted} // 0)) ? 'dotless' : 'dotted';
 }
@@ -145,8 +172,8 @@ sub has_structure {
     my ($table, $domain) = @_;
     return $structure if defined $structure;
     my $re = $domain eq 'icd10'
-    ? q{^[A-Z][0-9]{2}-[A-Z][0-9]{2}$|^[IVXL]+$}   # Gruppen A00-A09, Kapitel I..XXII
-    : q{\.\.\.|^[0-9]$};                          # Gruppen 5-08...5-16, Kapitel 1..9
+        ? q{^[A-Z][0-9]{2}-[A-Z][0-9]{2}$|^[IVXL]+$}   # Gruppen A00-A09, Kapitel I..XXII
+        : q{\.\.\.|^[0-9]$};                          # Gruppen 5-08...5-16, Kapitel 1..9
     my $n = eval { $db->query("SELECT count(*) FROM public.$table WHERE id ~ ?", $re)->array->[0] } // 0;
     return $n > 0 ? 1 : 0;
 }
@@ -176,11 +203,11 @@ sub replace_flat_table {
         my ($id, $label, undef, $fmt, $level, $terminal) = @$r;
         if ($is_icd) {
             $db->query(q{INSERT INTO public.icd10_terms (id, label, parent_id, code_formatted, level, terminal)
-                VALUES (?, ?, NULL, ?, ?, ?)},
-            $id, $label, $fmt, $level, ($terminal ? 'true' : 'false'));
+                         VALUES (?, ?, NULL, ?, ?, ?)},
+                $id, $label, $fmt, $level, ($terminal ? 'true' : 'false'));
         } else {
             $db->query("INSERT INTO public.$table (id, label, parent_id, code_formatted) VALUES (?, ?, NULL, ?)",
-            $id, $label, $fmt);
+                $id, $label, $fmt);
         }
     }
     my $n_link = 0;
@@ -201,7 +228,7 @@ sub icd_level_offset {
         next unless $entry->{$probe};
         my $old = eval { $db->query('SELECT level FROM public.icd10_terms WHERE id = ?', $to_id->($probe))->array };
         return ($old->[0] - $depth_of->($probe), "übernommen vom bisherigen Wert für $probe")
-        if $old && defined $old->[0];
+            if $old && defined $old->[0];
     }
     my ($p) = grep { $entry->{$_} } qw(A00 H35);
     return ((defined $p ? 3 - $depth_of->($p) : 3), 'Standard: Dreisteller = 3');
@@ -220,7 +247,7 @@ sub inventory {
     say "\nLetzte Importe laut catalog_versions:";
     my $rows = $db->query(q{
         SELECT DISTINCT ON (catalog) catalog, version, imported_at::date AS d, n_codes
-        FROM public.catalog_versions ORDER BY catalog, imported_at DESC})->hashes;
+          FROM public.catalog_versions ORDER BY catalog, imported_at DESC})->hashes;
     if ($rows->size) { say "  $_->{catalog}: $_->{version} ($_->{d}, $_->{n_codes} Codes)" for @$rows }
     else             { say "  (keine Einträge – bisherige Stände sind nicht protokolliert)" }
 
@@ -259,8 +286,8 @@ sub parse_obo {
             $in_header = 0;
             push @terms, $cur if $cur;
             $cur = ($1 eq 'Term')
-            ? { is_a => [], syn => [], xref => [], alt => [], replaced => [], consider => [], subset => [] }
-            : undef;
+                ? { is_a => [], syn => [], xref => [], alt => [], replaced => [], consider => [], subset => [] }
+                : undef;
             next;
         }
         next unless $cur;
@@ -291,12 +318,12 @@ sub import_hpo {
 
     say "HPO $ver: " . scalar(@$terms) . " Terme, davon " . scalar(@active) . " aktiv";
     sanity(@active > 15000 && $ids{1} && $ids{118},
-    'HPO-Datei unvollständig (erwartet > 15000 aktive Terme sowie HP:0000001 und HP:0000118)');
+        'HPO-Datei unvollständig (erwartet > 15000 aktive Terme sowie HP:0000001 und HP:0000118)');
 
     my $de = $db->query(q{SELECT count(*) FROM public.synonyms WHERE label ~ '[äöüÄÖÜß]'})->array->[0];
     if ($de > 50 && !$keep_syn && !$force) {
         die "Abbruch: $de Synonyme enthalten Umlaute (vermutlich deutsche Übersetzungen). "
-        . "Mit --keep-synonyms bleiben sie erhalten, mit --force werden sie ersetzt.\n";
+          . "Mit --keep-synonyms bleiben sie erhalten, mit --force werden sie ersetzt.\n";
     }
 
     my $tx = $db->begin;
@@ -312,11 +339,11 @@ sub import_hpo {
         $label = "obsolete $label" if $t->{obsolete} && $label !~ /^obsolete\b/i;
         my $subset = @{ $t->{subset} } ? join(', ', @{ $t->{subset} }) : undef;
         my $n = $db->query('UPDATE public.terms SET label = ?, definition = ?, comment = ?, subset = ? WHERE id = ?',
-        $label, $t->{def}, $t->{comment}, $subset, $t->{id})->rows;
+            $label, $t->{def}, $t->{comment}, $subset, $t->{id})->rows;
         if ($n) { $upd++ }
         else {
             $db->query('INSERT INTO public.terms (id, label, definition, comment, subset) VALUES (?, ?, ?, ?, ?)',
-            $t->{id}, $label, $t->{def}, $t->{comment}, $subset);
+                $t->{id}, $label, $t->{def}, $t->{comment}, $subset);
             $ins++;
         }
     }
@@ -340,9 +367,9 @@ sub import_hpo {
     my $n_cl = $db->query(q{
         INSERT INTO public.hpo_closure (idchild, idparent)
         WITH RECURSIVE c(idchild, idparent) AS (
-        SELECT idchild, idparent FROM public.isas
-        UNION
-        SELECT c.idchild, i.idparent FROM c JOIN public.isas i ON i.idchild = c.idparent
+            SELECT idchild, idparent FROM public.isas
+            UNION
+            SELECT c.idchild, i.idparent FROM c JOIN public.isas i ON i.idchild = c.idparent
         )
         SELECT idchild, idparent FROM c
     })->rows;
@@ -357,7 +384,7 @@ sub import_hpo {
                 $n_syn += $db->query(q{
                     INSERT INTO public.synonyms (idterm, label)
                     SELECT ?::int, ?::text
-                    WHERE NOT EXISTS (SELECT 1 FROM public.synonyms WHERE idterm = ?::int AND label = ?::text)
+                     WHERE NOT EXISTS (SELECT 1 FROM public.synonyms WHERE idterm = ?::int AND label = ?::text)
                 }, $t->{id}, $s, $t->{id}, $s)->rows;
             } else {
                 $db->query('INSERT INTO public.synonyms (idterm, label) VALUES (?, ?)', $t->{id}, $s);
@@ -383,7 +410,7 @@ sub import_hpo {
     my $add_repl = sub {
         my ($old, $new, $kind) = @_;
         $n_r += $db->query('INSERT INTO public.hpo_replacements (old_id, new_id, kind) VALUES (?, ?, ?) ON CONFLICT (old_id) DO NOTHING',
-        $old, $new, $kind)->rows;
+            $old, $new, $kind)->rows;
     };
     for my $t (@$terms) {
         $add_repl->($_, $t->{id}, 'alt_id') for @{ $t->{alt} };
@@ -394,7 +421,7 @@ sub import_hpo {
     say "  hpo_replacements: $n_r";
 
     record_version('hpo', $ver, $f, scalar @active);
-    finish($tx);
+    finish($tx, 'hpo');
 }
 
 # =========================================================
@@ -488,10 +515,29 @@ sub import_claml {
     my $n_cat = grep { $entry{$_}{kind} eq 'category' } @order;
     my $min   = $domain eq 'icd10' ? 10000 : 20000;
     say "\U$domain\E $ver: $n_cat Kodes"
-    . ($n_gen ? " (davon $n_gen aus Modifikatoren erzeugt – Stichprobe gegen die BfArM-Systematik prüfen!)" : '')
-    . ", Kapitel/Gruppen: " . ($with_struct ? 'ja' : 'nein') . ", ID-Format: $id_fmt";
+      . ($n_gen ? " (davon $n_gen aus Modifikatoren erzeugt – Stichprobe gegen die BfArM-Systematik prüfen!)" : '')
+      . ", Kapitel/Gruppen: " . ($with_struct ? 'ja' : 'nein') . ", ID-Format: $id_fmt";
     say "  Hinweis: " . scalar(@modified) . " Klassen tragen Modifikatoren, --no-modifiers aktiv" if @modified && $no_mod;
     sanity($n_cat > $min, "nur $n_cat Kodes gefunden (erwartet > $min)");
+
+    # Vorabfassungen können sich bis zur Endfassung noch ändern
+    my $title_text = $title ? join(' ', grep { defined } $title->attr('name'), $title->attr('version'), $title->text) : '';
+    if ($title_text =~ /vorab/i || $f =~ /vorab/i) {
+        sanity(0, "Datei ist offenbar eine VORABFASSUNG – bitte die Endfassung abwarten");
+    }
+
+    # Gegenprobe gegen die Metadaten-Datei *_kodes.txt (eine Zeile pro Kode)
+    if (defined $kodes_file) {
+        die "Kodes-Datei nicht lesbar: $kodes_file\n" unless -r $kodes_file;
+        my $n_meta = grep { /\S/ } split /\r?\n/, path($kodes_file)->slurp;
+        my $diff   = $n_cat - $n_meta;
+        my $pct    = $n_meta ? abs($diff) / $n_meta * 100 : 100;
+        say sprintf("  Gegenprobe: ClaML %d Kodes, Metadaten %d Zeilen (Differenz %+d, %.1f %%)", $n_cat, $n_meta, $diff, $pct);
+        if ($pct > 2) {
+            sanity(0, "Kodezahl weicht um mehr als 2 % von den Metadaten ab – "
+                . ($diff < 0 ? "Modifikator-Kodes fehlen vermutlich" : "Modifikatoren erzeugen vermutlich zu viel (--no-modifiers testen)"));
+        }
+    }
 
     # Kinder zählen (terminal) und Tiefe im neuen Baum bestimmen (Wurzel = 0)
     my (%has_child, %depth);
@@ -517,13 +563,13 @@ sub import_claml {
 
     my @rows = map {
         [ $to_id->($_), $entry{$_}{label}, $to_id->($entry{$_}{parent}), $_,
-        $depth_of->($_) + $off, ($has_child{$_} ? 0 : 1) ]
+          $depth_of->($_) + $off, ($has_child{$_} ? 0 : 1) ]
     } @order;
 
     my $tx = $db->begin;
     replace_flat_table($table, \@rows);
     record_version($domain, $ver, $f, $n_cat);
-    finish($tx);
+    finish($tx, $domain);
 }
 
 # =========================================================
@@ -566,7 +612,7 @@ sub import_atc {
     my $tx = $db->begin;
     replace_flat_table('atc_terms', \@rows);
     record_version('atc', $ver, $f, scalar @order);
-    finish($tx);
+    finish($tx, 'atc');
 }
 
 # =========================================================
@@ -579,7 +625,7 @@ sub code_info {
 
     my ($sys, $c) = split /:/, $code, 2;
     my $row = eval {
-        $sys eq 'HP'    ? $db->query('SELECT label FROM public.terms WHERE id = ?', $c + 0)->hash
+          $sys eq 'HP'    ? $db->query('SELECT label FROM public.terms WHERE id = ?', $c + 0)->hash
         : $sys eq 'ICD10' ? $db->query('SELECT label FROM public.icd10_terms WHERE id = ? OR id = ? LIMIT 1', $c, ($c =~ s/\.//gr))->hash
         : $sys eq 'OPS'   ? $db->query('SELECT label FROM public.ops_terms WHERE lower(id) = lower(?) LIMIT 1', $c)->hash
         : $sys eq 'ATC'   ? $db->query('SELECT label FROM public.atc_terms WHERE upper(id) = upper(?) LIMIT 1', $c)->hash
@@ -589,13 +635,13 @@ sub code_info {
     my $flag = '';
     if (!$row) { $flag = 'fehlt' }
     elsif (($row->{label} // '') =~ /^\s*(?:obsolete|deprecated)\b/i
-    || ($row->{status} // '') =~ /^(?:DEPRECATED|DISCOURAGED)$/i) { $flag = 'veraltet' }
+        || ($row->{status} // '') =~ /^(?:DEPRECATED|DISCOURAGED)$/i) { $flag = 'veraltet' }
 
     my $hint = '';
     if ($flag && $sys eq 'HP') {
         my $r = eval {
             $db->query(q{SELECT r.new_id, r.kind, t.label FROM public.hpo_replacements r
-                LEFT JOIN public.terms t ON t.id = r.new_id WHERE r.old_id = ?}, $c + 0)->hash;
+                         LEFT JOIN public.terms t ON t.id = r.new_id WHERE r.old_id = ?}, $c + 0)->hash;
         };
         $hint = sprintf(' -> %s HP:%07d (%s)', $r->{kind}, $r->{new_id}, $r->{label} // '?') if $r;
     }
@@ -620,8 +666,8 @@ sub check_codes {
     # Fest verdrahtete HPO-Nummern (ohne "HP:"-Präfix) in der SQL-Funktion stemmed_hpo_code
     my $fn = eval {
         $db->query(q{SELECT p.proname, pg_get_functiondef(p.oid) AS def
-            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE n.nspname = 'public' AND p.proname = 'stemmed_hpo_code'})->hashes;
+                       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                      WHERE n.nspname = 'public' AND p.proname = 'stemmed_hpo_code'})->hashes;
     } // [];
     for my $f (@$fn) {
         my $d = $f->{def};
@@ -648,4 +694,223 @@ sub check_codes {
     say "Geprüft: " . scalar(keys %where) . " verschiedene Codes, " . ($ok // 0) . " in Ordnung, " . scalar(@bad) . " auffällig.";
     say "(Lokale LOINC-Codes wie 86290-4a sind nur ok, wenn sie in loinc_terms stehen.)";
     say $_ for @bad;
+}
+
+# =========================================================
+# LOINC (Download-ZIP von loinc.org oder entpackte Loinc.csv)
+# =========================================================
+# Bekannte Prüfsummen von loinc.org/downloads
+my %LOINC_MD5 = ('Loinc_2.83.zip' => '057ddf203164705d5a4c3604257060a4');   # Release 2026-08-19
+
+sub file_md5 {
+    my ($f) = @_;
+    require Digest::MD5;
+    open my $fh, '<:raw', $f or die "Kann $f nicht öffnen: $!\n";
+    my $md5 = Digest::MD5->new->addfile($fh)->hexdigest;
+    close $fh;
+    return $md5;
+}
+
+# Pfad von LoincTable/Loinc.csv im ZIP (unzip muss installiert sein)
+sub loinc_csv_in_zip {
+    my ($zip) = @_;
+    my @list = qx{unzip -Z1 "$zip" 2>/dev/null};
+    die "Kann den Inhalt von $zip nicht lesen ('unzip' installiert?)\n" unless @list;
+    my ($csv) = grep { m{(?:^|/)LoincTable/Loinc\.csv\s*$}i } @list;
+    die "LoincTable/Loinc.csv nicht im ZIP gefunden\n" unless $csv;
+    chomp $csv;
+    return $csv;
+}
+
+sub loinc_verify {
+    my ($zip, $expected) = @_;
+    die "Aufruf: $0 loinc-verify Loinc_2.83.zip [MD5]\n" unless defined $zip && -r $zip;
+    $expected //= $LOINC_MD5{ path($zip)->basename };
+    my $md5 = file_md5($zip);
+    say "MD5 $zip: $md5";
+    if    (!defined $expected)       { say "  keine erwartete Prüfsumme bekannt – mit loinc.org/downloads vergleichen." }
+    elsif (lc $md5 eq lc $expected)  { say "  stimmt mit der erwarteten Prüfsumme überein." }
+    else                             { say "  WEICHT AB von $expected – Download wiederholen." }
+    my $csv = eval { loinc_csv_in_zip($zip) };
+    say $csv ? "Tabellendatei im ZIP: $csv" : "Tabellendatei: $@";
+    say "Import: perl $0 loinc $zip --dry-run";
+}
+
+sub import_loinc {
+    my ($f) = @_;
+    require Text::CSV;
+
+    # 1. Quelle öffnen: ZIP (mit Prüfsumme) oder CSV
+    my ($fh, $ver, $src);
+    if ($f =~ /\.zip$/i) {
+        my $expected = $md5_expected // $LOINC_MD5{ path($f)->basename };
+        if (defined $expected) {
+            my $md5 = file_md5($f);
+            sanity(lc $md5 eq lc $expected, "MD5 von $f ist $md5, erwartet $expected");
+            say "MD5 geprüft: $md5";
+        } else {
+            say "Hinweis: keine Prüfsumme bekannt – mit --md5 angeben (Wert von loinc.org/downloads).";
+        }
+        my $csv = loinc_csv_in_zip($f);
+        open $fh, '-|:encoding(UTF-8)', 'unzip', '-p', $f, $csv or die "Kann $csv nicht entpacken: $!\n";
+        ($ver) = path($f)->basename =~ /(\d+\.\d+)/;
+        $src = "$f:$csv";
+    } else {
+        open $fh, '<:encoding(UTF-8)', $f or die "Kann $f nicht öffnen: $!\n";
+        ($ver) = $f =~ /(\d+\.\d+)/;
+        $src = $f;
+    }
+    $ver = $version if length $version;
+    $ver //= '';
+
+    # 2. CSV lesen
+    my $csv = Text::CSV->new({ binary => 1, auto_diag => 1, allow_loose_quotes => 1 })
+        or die "Text::CSV: " . Text::CSV->error_diag() . "\n";
+    my $hdr = $csv->getline($fh) or die "Keine Kopfzeile in $src\n";
+    my %col = map { $hdr->[$_] => $_ } 0 .. $#$hdr;
+    die "Spalte LOINC_NUM fehlt – ist das LoincTable/Loinc.csv?\n" unless exists $col{LOINC_NUM};
+
+    my $get = sub { my ($row, $name) = @_; exists $col{$name} ? $row->[ $col{$name} ] : undef };
+    my $cut = sub { my ($v, $n) = @_; (defined $v && length $v > $n) ? substr($v, 0, $n) : $v };
+
+    my (@rows, %classes, %status);
+    while (my $r = $csv->getline($fh)) {
+        my $id = $get->($r, 'LOINC_NUM');
+        next unless defined $id && length $id;
+        my $component = $get->($r, 'COMPONENT');
+        my $class     = $get->($r, 'CLASS') || 'OTHER';
+        my $st        = $get->($r, 'STATUS') || 'ACTIVE';
+        my $label     = $get->($r, 'LONG_COMMON_NAME') || $get->($r, 'DisplayName') || $component || "LOINC $id";
+        my $parent    = 'CLASS-' . uc($class);
+        $classes{$parent} //= $class;
+        $status{$st}++;
+        push @rows, [
+            $id, $label, $cut->($component, 255), $cut->($get->($r, 'PROPERTY'), 100),
+            $cut->($get->($r, 'TIME_ASPCT'), 100), $cut->($get->($r, 'SYSTEM'), 255),
+            $cut->($get->($r, 'SCALE_TYP'), 100), $cut->($get->($r, 'METHOD_TYP'), 255),
+            $cut->($class, 100), $parent, $id, $cut->($st, 50),
+            $cut->($get->($r, 'EXAMPLE_UCUM_UNITS'), 100),
+        ];
+    }
+    close $fh;
+    unshift @rows, map { [ $_, "LOINC Class: $classes{$_}", undef, undef, undef, undef, undef, undef,
+                           $cut->($classes{$_}, 100), undef, $_, 'ACTIVE', undef ] } sort keys %classes;
+
+    my $n_codes = @rows - keys %classes;
+    say "LOINC $ver: $n_codes Codes in " . scalar(keys %classes) . " Klassen; Status: "
+      . join(', ', map { "$_=$status{$_}" } sort { $status{$b} <=> $status{$a} } keys %status);
+    sanity($n_codes > 90000, "nur $n_codes LOINC-Codes gelesen (erwartet > 90000)");
+
+    # 3. Vergleich mit dem bisherigen Stand (lokale Erweiterungscodes bleiben unangetastet)
+    my $local_re = qr/^[0-9]+-[0-9][a-z]$/;
+    my %old = map { $_->[0] => 1 } grep { $_->[0] !~ $local_re && $_->[0] !~ /^CLASS-/ }
+              @{ $db->query('SELECT id FROM public.loinc_terms')->arrays };
+    my %new = map { $_->[0] => 1 } grep { $_->[0] !~ /^CLASS-/ } @rows;
+    my @gone  = grep { !$new{$_} } keys %old;
+    my @added = grep { !$old{$_} } keys %new;
+    say "  gegenüber bisher: " . scalar(@added) . " neu, " . scalar(@gone) . " entfallen";
+    my $n_local = $db->query(q{SELECT count(*) FROM public.loinc_terms WHERE id ~ '^[0-9]+-[0-9][a-z]$'})->array->[0];
+    say "  lokale Erweiterungscodes (bleiben erhalten): $n_local";
+
+    # 4. Schreiben: DELETE statt TRUNCATE ... CASCADE, Mehrzeilen-INSERTs
+    my $tx = $db->begin;
+    backup_table('loinc_terms');
+    $db->query(q{DELETE FROM public.loinc_terms WHERE id !~ '^[0-9]+-[0-9][a-z]$'});
+    my @cols = qw(id label component property time_aspect system scale_type method_type
+                  class_name parent_id code_formatted status example_ucum_units);
+    my $one  = '(' . join(',', ('?') x @cols) . ')';
+    my $batch = 500;
+    for (my $i = 0; $i < @rows; $i += $batch) {
+        my @chunk = @rows[ $i .. ($i + $batch - 1 < $#rows ? $i + $batch - 1 : $#rows) ];
+        $db->query('INSERT INTO public.loinc_terms (' . join(',', @cols) . ') VALUES '
+                 . join(',', ($one) x @chunk)
+                 . ' ON CONFLICT (id) DO NOTHING', map { @$_ } @chunk);
+    }
+    say "  loinc_terms: " . scalar(@rows) . " Zeilen geschrieben";
+
+    record_version('loinc', $ver, $src, $n_codes);
+    finish($tx, 'loinc');
+}
+
+# =========================================================
+# ANLEITUNG
+# =========================================================
+sub print_help {
+    print <<'HELP';
+KATALOG-AKTUALISIERUNG FÜR ONTOTRIAL
+====================================
+Stand der Quellenangaben: 26.09.2026. Vor jedem Update auf den Seiten prüfen,
+ob neuere Fassungen erschienen sind.
+
+REIHENFOLGE
+  1. perl update_catalogs.pl inventory
+  2. Dateien besorgen (siehe unten)
+  3. Jeden Import zuerst mit --dry-run, dann ohne
+  4. LOINC direkt aus dem Download-ZIP (siehe LOINC)
+  5. hypnotoad + Minion-Worker neu starten
+  6. Vektorindex in Patchbay neu aufbauen (Prompts 51/52 HPO, 64 ICD, 65 OPS,
+     66 ATC, 69 LOINC) – erst NACH dem Tabellenimport
+  7. perl update_catalogs.pl check ontotrial.pl
+  8. Studienkriterien korrigieren, Kandidaten neu extrahieren, Matching neu
+
+HPO
+  Quelle : https://github.com/obophenotype/human-phenotype-ontology/releases
+           (Datei hp.obo, oder http://purl.obolibrary.org/obo/hp.obo)
+  Import : perl update_catalogs.pl hpo hp.obo --dry-run
+  Hinweis: Enthält synonyms deutsche Übersetzungen, bricht das Skript ab.
+           Dann --keep-synonyms verwenden. hpo_closure wird mit neu berechnet.
+
+ICD-10-GM
+  Quelle : https://www.bfarm.de/DE/Kodiersysteme/Services/Downloads/_node.html
+           Abschnitt ICD-10-GM, Downloadbedingungen bestätigen.
+  Aktuell: Version 2026 (ClaML Stand 12.09.2025). 2027 war am 26.09.2026 noch
+           nicht veröffentlicht; Endfassung laut BfArM etwa Ende September.
+  Dateien: - "Systematik ClaML/XML"          -> XML-Datei aus dem ZIP
+           - "Metadaten TXT (CSV)"           -> *syst_kodes.txt für --kodes
+           - "Überleitung Vorjahr -> Jahr"    -> für Codes, die check meldet
+           - Corrigenda (PDF)                 -> Korrekturen nach dem ClaML-Stand
+           - ClaML-Kurzdokumentation (PDF)    -> Verwendung der Modifikatoren
+  Import : perl update_catalogs.pl icd10 <claml.xml> --kodes <..._kodes.txt> --dry-run
+  Prüfung: Die Gegenprobe gegen --kodes sollte unter 2 % Differenz liegen.
+           Größere Abweichung: Modifikatoren prüfen (--no-modifiers vergleichen).
+
+OPS
+  Quelle : dieselbe BfArM-Seite, Abschnitt OPS.
+  Aktuell: Version 2026 (ClaML Stand 17.10.2025) importieren.
+           OPS 2027 gibt es seit 14.08.2026 nur als VORABFASSUNG ohne ClaML
+           (nur Metadaten, Überleitung, Aktualisierungsliste); Endfassung laut
+           BfArM etwa Ende Oktober. Das Skript warnt bei Vorabfassungen.
+  Import : perl update_catalogs.pl ops <claml.xml> --kodes <..._kodes.txt> --dry-run
+  Tipp   : Die Überleitung 2026 -> 2027 aus der Vorabfassung zeigt schon jetzt,
+           ob Augen-OPS (5-08 bis 5-16) betroffen sind.
+
+ATC
+  Quelle : BfArM -> Kodiersysteme -> Klassifikationen -> ATC -> ATC Downloads
+           (nicht auf der allgemeinen Download-Seite).
+  Format : CSV mit Spalten Code;Bezeichnung (Excel-Datei ggf. so exportieren).
+  Import : perl update_catalogs.pl atc <datei.csv> --version <Jahr> --dry-run
+
+LOINC
+  Quelle : https://loinc.org/downloads (Login erforderlich)
+  Aktuell: 2.83 vom 19.08.2026, Loinc_2.83.zip,
+           MD5 057ddf203164705d5a4c3604257060a4
+  Import : perl update_catalogs.pl loinc Loinc_2.83.zip --dry-run
+           Liest LoincTable/Loinc.csv direkt aus dem ZIP (unzip nötig) und
+           prüft die MD5. Für neuere Versionen: --md5 <Wert von loinc.org>.
+           Eine entpackte Loinc.csv geht auch (dann ohne Prüfsumme).
+           Lokale Erweiterungscodes (86290-4a usw.) bleiben erhalten.
+  Prüfen : perl update_catalogs.pl loinc-verify Loinc_2.83.zip  (nur MD5 + Inhalt)
+  Achtung: LOINC erscheint ab 2027 monatlich. Für die Automatisierung gibt es
+           eine Download-API (https://loinc.org/kb/api/download).
+
+NICHT IM SKRIPT, ABER NÜTZLICH
+  Alpha-ID-SE (BfArM-Downloadseite) verknüpft ICD-10-GM mit ORPHAcodes –
+  Ausgangspunkt für das TODO "support orphacodes" in ontotrial.pl.
+
+SICHERUNGEN
+  Jeder Import legt <tabelle>_bak_<zeitstempel> an. Übersicht:
+    SELECT tablename FROM pg_tables
+     WHERE schemaname = 'public' AND tablename ~ '_bak(up)?_';
+  Letzte Importe: perl update_catalogs.pl inventory
+HELP
 }

@@ -23,6 +23,7 @@ use DateTime;
 use Time::HiRes qw(gettimeofday tv_interval);
 use Text::CSV;
 use Digest::MD5 qw(md5_hex);   # ONTOTRIAL-PATCHSET-2026-09-23
+use List::Util ();
 
 no warnings 'uninitialized';
 no warnings 'experimental::vlb'; # Unterdrückt die Lookbehind-Warnung global
@@ -73,7 +74,7 @@ app->hook(before_dispatch => sub {
 # =========================================================
 # GLOBAL CONFIGURATION & LLM SETTINGS
 # =========================================================
-my $api_key      = $ENV{VLLM_API_KEY}   // 'ap-yf';
+my $api_key      = $ENV{VLLM_API_KEY}   // 'ap-';
 my $endpoint     = $ENV{VLLM_ENDPOINT}  // 'https://inference-api.aipier.kn.uniklinik-freiburg.de/v1/chat/completions';
 my $model        = $ENV{VLLM_MODEL}     // 'gpt-oss-120b';
 
@@ -557,6 +558,13 @@ sub extract_visus_and_refraction {
     # SCHRITT 2: Visuswerte scannen
     my $clean_for_visus = $input;
     1 while $clean_for_visus =~ s/\((?:[^()]+|(?R))*\)//g;
+
+    # Lochblendenvisus (LB) vorab isolieren, damit er den Hauptvisus nicht als Maximum verfälscht:
+    my $lb_visus = undef;
+    if ($clean_for_visus =~ /\b(?:mit\s+)?(?:LB|Lochblende)\s*[:=]?\s*(0[\.,]\d+|1[\.,]0|[1-6]\/\d{1,2})/i) {
+        $lb_visus = prune_visus_val($1);
+        $clean_for_visus =~ s/\b(?:mit\s+)?(?:LB|Lochblende)\s*[:=]?\s*(?:0[\.,]\d+|1[\.,]0|[1-6]\/\d{1,2})//gi;
+    }
 
     my @candidate_values;
 
@@ -1096,15 +1104,30 @@ helper format_hpo_id => sub {
 
 helper format_icd10_id => sub {
     my ($self, $raw_id) = @_;
-    return "ICD10:U99" unless $raw_id;
-    $raw_id =~ s/^\s+//; $raw_id =~ s/\s+$//;
-    $raw_id =~ s/^icd10:\s*//i;
+    return "ICD10:U99" unless defined $raw_id && length($raw_id);
 
-    # Trailing .- oder . entfernen (z. B. L82.- -> L82)
+    $raw_id =~ s/^\s+//;
+    $raw_id =~ s/\s+$//;
+    $raw_id =~ s/^icd(?:10)?[-:\s]*//i;
+
+    # 1. Trailing .- oder . oder Sonderzeichen entfernen (z. B. "H46.-" -> "H46", "H47.2!" -> "H47.2")
+    $raw_id =~ s/[\.\-\!\*\+\s]+$//;
+
+    # 2. Deutsche Zusatzkennzeichen am Ende entfernen (z. B. "H47.2G", "E74.4V", "H46.0A", "H46Z")
+    $raw_id =~ s/^([A-Z]\d{2}(?:\.\d{1,2})?)\s*[GVZARL]$/$1/i;
+
+    # 3. Freiburger Alpha-ID Suffixe mit Trennzeichen (z. B. "E74.4.H0" -> "E74.4", "H46.B0" -> "H46", "H46-B0" -> "H46")
+    # WICHTIG: Das Suffix MUSS mindestens einen Buchstaben enthalten ([A-Z]), damit reguläre
+    # Subcodes wie "H52.1" oder "H18.6" NICHT fälschlich abgeschnitten werden!
+    $raw_id =~ s/^([A-Z]\d{2}\.\d{1,2})[-_\.\s]+[A-Z][A-Z0-9]*$/$1/i;
+    $raw_id =~ s/^([A-Z]\d{2})[-_\.\s]+[A-Z][A-Z0-9]*$/$1/i;
+
+    # 4. Freiburger Alpha-ID Suffixe direkt angehängt (z. B. "E74.4H0" -> "E74.4", "H46B0" -> "H46")
+    $raw_id =~ s/^([A-Z]\d{2}\.\d{1,2})[A-Z][A-Z0-9]+$/$1/i;
+    $raw_id =~ s/^([A-Z]\d{2})[A-Z][A-Z0-9]+$/$1/i;
+
+    # 5. Abschließenden Punkt oder Bindestrich bereinigen
     $raw_id =~ s/[\.\-]+$//;
-
-    # Bereinigt freiburg-spezifische codes fuer seltene erkrankungen wie "D33.3A0" -> "D33.3"
-    $raw_id =~ s/^([A-Z]\d{2}(?:\.\d{1,2})?)[A-Z][A-Z0-9]*$/$1/i;
 
     return "ICD10:" . uc($raw_id);
 };
@@ -1544,9 +1567,8 @@ sub enrich_term_with_section_context {
     # ---------------------------------------------------------------------
     # OKULÄRE NARBENLÖSUNG / ADHÄSIOLYSE (SCHUTZ VOR NARBENHERNIE 5-536)
     # ---------------------------------------------------------------------
-    if ($term =~ /\b(?:narbenl[öo]sung\w*|l[öo]sung\s+von\s+narben|adh[äa]siolys\w*|strangl[öo]sung\w*)\b/i
-        || $combined =~ /\b(?:narbenl[öo]sung\w*|symblepharonl[öo]sung\w*)\b/i) {
-
+    if ($term =~ /\b(?:narbenl[öo]sung\w*|l[öo]sung\s+von\s+narben|adh[äa]siolys\w*|strangl[öo]sung\w*|symblepharo(?:lyse|l[öo]sung)\w*)\b/i
+            || $combined =~ /\b(?:narbenl[öo]sung\w*|symblepharonl[öo]sung\w*|symblepharolyse\w*)\b/i) {
         # 1. Bindehaut / Symblepharon (Fornix, Bindehaut, Bulbus)
         if ($combined =~ /\b(?:bindehaut|konjunktiv\w*|symblepharon|fornix|bulbus)\b/i) {
             return "Lösung von Adhäsionen der Konjunktiva Symblepharon"; # Zielt auf OPS:5-115.1
@@ -2153,7 +2175,7 @@ our $OCULAR_TERM_REGEX = qr{(?:
     hornhautendothel|endothelzell|endotheldystroph|limbus|limbal|
     bindehaut|konjunktiv|conjunctiv|pingue|pterygi|chemos[ie]|chemotisch|hyposphagm|
     (?:ober|unter|augen)lid|\blid(?:er|kante|rand|spalt|schwell|öd|hämat|schluss|haut|winkel|fehl|retrakt|tief|lamelle|ptos|rötung)|\blid\b|eyelid|palpebr|\btarsus|\btarsal|kanthus|canthus|
-    entropi|ektropi|ectropi|blepharo|chalazi|hordeol|symblephar|tarsorr|trichias|distichias|madaros|\bptos|dermatochalas|lagophth|
+    entropi|ektropi|ectropi|blephar|chalazi|hordeol|symblephar|tarsorr|trichias|distichias|madaros|\bptos|dermatochalas|lagophth|sursoadduk|deorsumadduk|
     \biris|irid|pupill|\bpupil|synechi|rubeos|
     linse\b|linsen(?:trüb|lux|sublux|disloz|kern|kapsel|implant|einnäh|berg|touch|pigment|affekt)|kontaktlinse|sklerallinse|verbandslinse|sulcuslinse|intraokularlinse|
     \blens\b|katarakt|cataract|\biol\b|hinterkammerlinse|kapselsack|hinterkapsel|vorderkapsel|kapsulotom|nachstar|phako|aphak|pseudophak|
@@ -2200,8 +2222,8 @@ helper is_ocular_code => sub {
     return undef unless defined $code && length $code;
     if ($domain eq 'icd10') {
         my $c = uc($code); $c =~ s/^ICD10://;
-        # PATCH 2026-09-25: B58.0, A18.5, E1x.3, B30, T15, Z44.2, C43.1, C44.1 ergänzt
-        return ($c =~ /^(?:H[0-5]\d|D31|C69|Q1[0-5]|Z96\.1|Z94\.7|T85\.2|T86\.83|B02\.3|B00\.5|S05|D09\.2|D22\.1|D23\.1|T26|T85\.3|B58\.0|A18\.5|E1[0-4]\.3|B30|T15|Z44\.2|C43\.1|C44\.1)/) ? 1 : 0;
+        # L12 (Vernarbendes Pemphigoid / OCP) und L11/L13 als okuläre Manifestationen zulassen:
+        return ($c =~ /^(?:H[0-5]\d|D31|C69|Q1[0-5]|Z96\.1|Z94\.7|T85\.2|T86\.83|B02\.3|B00\.5|S05|D09\.2|D22\.1|D23\.1|T26|T85\.3|B58\.0|A18\.5|E1[0-4]\.3|B30|T15|Z44\.2|C43\.1|C44\.1|L12)/) ? 1 : 0;
     }
     if ($domain eq 'hpo') {
         return ( $self->is_subclass_of($code, 'HP:0000478')  # Abnormality of the eye
@@ -3398,13 +3420,13 @@ sub split_into_clinical_section_chunks {
         (?:study\s+eye(?:\s+criteria)?|fellow\s+eye(?:\s+criteria)?|studienauge|partnerauge)|
         (?:general\s+criteria|allgemeine\s+kriterien|safety\s+criteria)|
         (?:diagnosen?|anamnese|ivom(?:[\s\-]anamnese)?|therapie|aktuelle\s+(?:ophthalmologische\s+)?therapie|lokaltherapie|medikation|dauermedikation|systemmedikation|blutverd[üu]nnung|vorgeschichte|allgemein(?:erkrankungen(?:\/medikation)?)?|allergien?)$lat_pattern?|
-        (?:visus|refraktion|skiaskopie|brille|fernvisus|nahvisus|orthoptik|binokularsehen|motilit[äa]t|stereosehen|tensio|druck|tonometrie|icare|goldmann|pachymetrie|cct|pentacam|topographie|gf|gesichtsfeld|perimetrie|hertel|iol[\s\-]?master|biometrie|endothel(?:zell\w*)?|ecd|ezd)$lat_pattern?|
+        (?:visus|refraktion|skiaskopie|brille|fernvisus|nahvisus|orthoptik|binokularsehen|motilit[äa]t|stereosehen|tensio|druck|tonometrie|icare|goldmann|pachymetrie|cct|pentacam|topographie|octopus(?:-gf)?|gf|gesichtsfeld|perimetrie|hertel|iol[\s\-]?master|biometrie|endothel(?:zell\w*)?|ecd|ezd)$lat_pattern?|
         (?:vaa|vorderabschnitt|spaltlampe|hornhaut|cornea|fundus|papille|makula|macula|nh[\s\-]oct|rnfl(?:[\s\-]oct)?|oct|bmo[\s\-]oct|gcl(?:[\s\-]oct)?|vaa[\s\-]oct|fag|fla|fl[\s\-]angio|angiograph\w*)$lat_pattern?|
         (?:lebensalter|geschlecht|alter|befund|prozeduren?|operationen?|orderheute|bemerkungen)
     )\s*[:=]}ix;
 
     # 3. SCHRITT: Zeilenumbrüche vor jedem erkannten Header sicherstellen
-    $text =~ s/($header_pattern)/\n$1/g;
+    $text =~ s/(?:^|(?<=[\n\r])|(?<=[.;]\s))($header_pattern)/\n$1/g;
 
     my @lines = split /\n/, $text;
     my @sections;
@@ -3693,6 +3715,17 @@ sub ground_canonical_term {
         $log->info("[UNGROUNDED ROW DROPPED] Kein kodierbares Konzept: '$ct'");
         return 0;
     }
+
+    return 1 if $core =~ /^(?:blepharitis|konjunktivitis|keratitis|uveitis|skleritis|episkleritis|retinitis|chorioiditis|neuritis\s+nervi\s+optici)$/i;
+
+    # Schutz vor isolierten Ätiologie-Fragmenten aus Differentialdiagnosen (z.B. "DD Nekrose", "DD entzündlich")
+    if ($domain eq 'icd10' && $core =~ /^(?:nekrose|entzündlich|postradiogen|strahlenschaden)$/i) {
+        my $site_chk = lc($item->{anatomical_site} // '');
+        if ($site_chk =~ /^(?:systemic|none)$/) {
+            $log->info("[ETIOLOGY FRAGMENT DROPPED] Isolierter Ätiologie-Begriff '$ct' ohne Organbezug verworfen.");
+            return 0;
+        }
+    }
     unless ($probe =~ $BARE_NOUN_REGEX) {
         # PATCH 2026-09-25: generische Verankerung. Okuläre Struktur, aber kein okuläres
         # Signal im Begriff ("Pannus", "Shieldulcus", "Hypotonie") -> Organ anhängen.
@@ -3939,13 +3972,21 @@ sub extract_event_date {
     my ($text, $ref_date_str) = @_;
     return undef unless defined $text && $text ne '';
 
-    # Vergleichs- und Vorbefundsfloskeln maskieren (z. B. "stabil zu 04/24", "Vergleich zu 04/2024")
+    # Vergleichs- und Vorbefundsfloskeln maskieren
     my $clean_date_text = $text;
     $clean_date_text =~ s/\b(?:stabil\s+(?:zu|ggü\.?|gegenüber)|progredient\s+(?:zu|ggü\.?|gegenüber)|(?:im\s+)?vergleich\s+zu|vgl\.?\s*zu|kontrolle\s+zu|vorbefund(?:\s+vom)?)\s*(?:(?:0?[1-9]|1[0-2])[\/\.](?:19|20)?\d{2}|(?:19|20)\d{2})\b/ /gi;
 
+    # PRIORITÄT: Deutsches Format DD.MM.YY (z. B. "05.09.26") ZUERST prüfen,
+    # um zu verhindern, dass LLMs "05.09.26" fälschlich zu "2005-09-26" machen!
+    if ($clean_date_text =~ /\b([0-3]?\d)\.([0-1]?\d)\.(\d{2})\b/) {
+        my ($d, $m, $y) = ($1, $2, $3 + 0);
+        my $full_year = ($y < 70) ? (2000 + $y) : (1900 + $y);
+        return sprintf("%04d-%02d-%02d", $full_year, $m, $d);
+    }
+
     # 0. Bereits ISO
     if ($clean_date_text =~ /\b((?:19|20)\d{2}-[0-1]\d-[0-3]\d)\b/) { return $1; }
-    if ($clean_date_text =~ /\b((?:19|20)\d{2}-[0-1]\d)\b/)          { return $1; }
+    if ($clean_date_text =~ /\b((?:19|20)\d{2}-[0-1]\d)\b/)         { return $1; }
 
     # 1. Vollständiges deutsches Datum: DD.MM.YYYY
     if ($clean_date_text =~ /\b([0-3]?\d)\.([0-1]?\d)\.((?:19|20)\d{2})\b/) {
@@ -4406,6 +4447,7 @@ sub strip_lab_values {
     $r =~ s/^\s+|\s+$//g;
     return length($r) > 1 ? $r : $orig;
 }
+
 sub prepare_loinc_search_term {
     my ($raw_text, $clean_term, $item_laterality) = @_;
     $raw_text   //= '';
@@ -4442,7 +4484,23 @@ sub prepare_loinc_search_term {
             : ($is_right ? "LOINC:28998-3 Right eye Exophthalmia Exophthalmometer.Hertel"
                          : "LOINC:28998-3 Right eye Exophthalmia Exophthalmometer.Hertel");
     }
+    # -------------------------------------------------------------
+    # 1b. GESICHTSFELD / PERIMETRIE MEAN DEFECT (MD)
+    # -------------------------------------------------------------
+    if ($combined_context =~ /\b(?:md|mean\s*defect|mean\s*deviation)\b/i
+        && $combined_context =~ /\b(?:gf\b|gesichtsfeld|perimetr\w*|octopus|humphrey|statisches)\b/i) {
+        return $is_left
+            ? "LOINC:79802-5 Left eye Visual field Mean deviation"
+            : ($is_right ? "LOINC:79803-3 Right eye Visual field Mean deviation"
+                         : "LOINC:86295-3 Visual field mean defect");
+    }
 
+    # -------------------------------------------------------------
+    # 1c. FIBRINOGEN (KOAGULATION)
+    # -------------------------------------------------------------
+    if ($combined_context =~ /\bfibrinogen\b/i) {
+        return "LOINC:3255-7 Fibrinogen in Platelet poor plasma by Coagulation assay";
+    }
     # -------------------------------------------------------------
     # 2. SEROLOGISCHE & SYSTEMISCHE LABORTESTS (KEIN EYE-PREFIX!)
     # -------------------------------------------------------------
@@ -4462,6 +4520,10 @@ sub prepare_loinc_search_term {
         # Nur der Analytname – ohne Messwert, Einheit, Ergebniswort und ohne
         # Verdopplung aus "$raw_text $clean_term".
         return strip_lab_values(length($clean_term) > 2 ? $clean_term : $raw_text);
+    }
+    # Liquordruck / Eröffnungsdruck (CSF / Intracranial pressure)
+    if ($combined_context =~ /\b(?:liquordruck|er[öo]ffnungsdruck|e[öo]d|csf\s*pressure)\b/i) {
+        return "LOINC:60956-0 Intracranial pressure (ICP)";
     }
 
     # -------------------------------------------------------------
@@ -5352,6 +5414,19 @@ helper generate_phenopacket_impl => sub {
 
         }
 
+        # Benannte Entzündungen (…itis) zusätzlich als Diagnose kodieren.
+        # Die HPO-Zeile bleibt erhalten, damit phänotypbasierte Kriterien weiter greifen.
+        my @dual_icd;
+        for my $it (@$atomic_items) {
+            next unless ($it->{domain} // '') eq 'hpo';
+            my $c = $it->{canonical_term} // '';
+            next unless $c =~ /itis\b/i;
+            next if $c =~ /\bvitritis\b/i;          # Glaskörperzellen: Befund, keine Diagnose
+            push @dual_icd, { %$it, domain => 'icd10' };
+            $self->app->log->info("[DUAL CODING] '$c' zusätzlich als icd10");
+        }
+        push @$atomic_items, @dual_icd;
+
         @$atomic_items = grep { ($_->{domain} // '') ne 'skip' } @$atomic_items;
 
         my @feature_promises;
@@ -5376,10 +5451,10 @@ helper generate_phenopacket_impl => sub {
             my $time_from_event = extract_event_date($event_date, $reference_date);
             my $item_timestamp  = $time_from_event // $time_from_verb;
 
-            # STUFE 1: Satz-Kontext durchsuchen, falls das LLM den Kriterientext verkürzt hat
-            # Sucht in einem 250-Zeichen-Fenster im selben Absatz (kein vorzeitiger Abbruch bei Punkten wie "Z.n." oder "+9,0 D")
+            # STUFE 1: Nur innerhalb derselben Klausel (begrenzt durch Komma, Semikolon oder Zeilenumbruch) nach Datum suchen:
             if (!$item_timestamp && length($v_text) > 3) {
-                if ($text_content =~ /([^\n\r]{0,250}\Q$v_text\E[^\n\r]{0,250})/i) {
+                # Verhindert, dass Datumsangaben von Nachbar-Medikamenten über Kommata hinweg überspringen:
+                if ($text_content =~ /(?:^|[\n\r,;])\s*([^,\n\r;]{0,100}\Q$v_text\E[^,\n\r;]{0,100})(?=[\n\r,;]|$)/i) {
                     my $surrounding_clause = $1;
                     $item_timestamp = extract_event_date($surrounding_clause, $reference_date);
                 }
@@ -5387,7 +5462,7 @@ helper generate_phenopacket_impl => sub {
             # STUFE 2: Pseudodatum-Fallback für alle historischen Einträge (is_history = true)
             # Verhindert, dass alte Diagnosen wie Endophthalmitis ohne Datum als "akut" fehlinterpretiert werden!
             if (!$item_timestamp && to_bool($item->{is_history})) {
-                $item_timestamp = "PAST-UK-Uk";
+                $item_timestamp = "PAST-UK-UK";
                 $self->app->log->info("[HISTORICAL PSEUDODATE] '$canon_term' (is_history=1) erhält Pseudodatum $item_timestamp");
             }
             
@@ -5445,7 +5520,8 @@ helper generate_phenopacket_impl => sub {
                 ) && ($v_text !~ /\b(?:osdi|vas|but|tbut|pachymetrie|k1|k2|kmax|astigmatismus|rr|blutdruck)\b/i);
 
                 my $time_obs = $item_timestamp;
-                if ($is_visus_candidate && $v_text =~ /^\s*visus\s*[rlb]?\s*:\s*[\d\.,]+/i) {
+                # Bei aktuellem Visusbefund (auch mit "sc:", "cc:", "AR:") immer das Referenzdatum der Konsultation nutzen:
+                if ($is_visus_candidate && $v_text =~ /^\s*visus\s*[rlb]?\s*:\s*(?:sc\s*[:=]?\s*|cc\s*[:=]?\s*|m\.?e\.?b\.?\s*[:=]?\s*)?[\d\.,]+/i) {
                     $time_obs = $reference_date;
                 } else {
                     $time_obs //= $reference_date;
@@ -8184,6 +8260,583 @@ get '/BBB/matches' => sub {
     $self->render(json => $self->pg->db->query(_fetch_all_matches_sql())->hashes->to_array);
 };
 
+our %PPD_DEFAULT_WEIGHTS = (
+    demographics => 0.15,
+    diseases     => 0.25,
+    phenotypes   => 0.20,
+    procedures   => 0.15,
+    medications  => 0.10,
+    measurements => 0.15,
+);
+
+# Ähnlichkeit an der tiefsten gemeinsamen Hierarchieebene
+our %PPD_LEVEL_SIM = (
+    icd10 => [0.10, 0.60, 0.85, 1.00],           # Buchstabe, Kategorie, 4-Steller, 5-Steller
+    ops   => [0.05, 0.30, 0.60, 0.85, 1.00],     # Kapitel, Bereich, Kode, 1. und 2. Unterstelle
+    atc   => [0.05, 0.30, 0.60, 0.85, 1.00],     # anatomisch, therapeutisch, pharmakologisch, chemisch, Wirkstoff
+);
+
+our $PPD_AGE_SCALE = 15;   # Altersdifferenz in Jahren, ab der die Distanz 1 ist
+
+# Augenspezifische LOINC-Paare: Gruppe => [rechts, links]
+our %PPD_LOINC_PAIRS = (
+    iop    => ['79892-6',  '79893-4'],
+    cct    => ['79888-4',  '79887-6'],
+    va_bc  => ['65893-0',  '65897-1'],
+    va_uc  => ['65892-2',  '65896-3'],
+    sphere => ['65890-6',  '65891-4'],
+    cyl    => ['65894-8',  '65895-5'],
+    axis   => ['65898-9',  '65899-7'],
+    se     => ['76587-5',  '76588-3'],
+    hertel => ['28998-3',  '28999-1'],
+    rnfl   => ['86300-1',  '86299-5'],
+    cdr    => ['71485-7',  '71484-0'],
+    lid    => ['79855-3',  '79856-1'],
+    ecd    => ['100076-9', '100077-7'],
+    bmo    => ['86301-9b', '86290-4b'],
+    gcl    => ['86301-9a', '86290-4a'],
+    vf_md  => ['79803-3',  '79802-5'],
+);
+our %PPD_LOINC_LOOKUP;
+for my $g (keys %PPD_LOINC_PAIRS) {
+    $PPD_LOINC_LOOKUP{ lc $PPD_LOINC_PAIRS{$g}[0] } = [$g, 'R'];
+    $PPD_LOINC_LOOKUP{ lc $PPD_LOINC_PAIRS{$g}[1] } = [$g, 'L'];
+}
+
+# Differenz, bei der die Messdistanz 1 erreicht (Visus in logMAR)
+our %PPD_MEAS_SCALE = (
+    iop => 10, cct => 50, va_bc => 0.5, va_uc => 0.5,
+    sphere => 3, cyl => 2, se => 3, hertel => 4, rnfl => 20, cdr => 0.3,
+    lid => 3, ecd => 500, bmo => 0.5, gcl => 0.3, vf_md => 5,
+    '4548-4' => 1.5,                              # HbA1c in %
+);
+our %PPD_SKIP_GROUPS = (axis => 1);               # Achse allein nicht sinnvoll vergleichbar
+our %PPD_HPO_TRIVIAL = map { $_ => 1 } (1, 118, 478);   # All, Phenotypic abnormality, Abnormality of the eye
+
+# ---------------------------------------------------------
+# Lateralität
+# ---------------------------------------------------------
+sub _ppd_side {
+    my ($obj) = @_;
+    my $id = uc((ref $obj eq 'HASH' ? $obj->{id} : $obj) // '');
+    return 'R' if $id =~ /^(?:HP:0012834|SNOMED:18944008|261185002)$/;
+    return 'L' if $id =~ /^(?:HP:0012835|SNOMED:8966001|261186004)$/;
+    return 'B' if $id =~ /^(?:HP:0012832|SNOMED:40638003|261184001)$/;
+    return '';
+}
+
+sub _ppd_side_of_mods {
+    for my $m (@{ $_[0] // [] }) {
+        my $s = _ppd_side($m);
+        return $s if $s;
+    }
+    return '';
+}
+
+sub _ppd_flip {
+    my $s = shift // '';
+    return $s eq 'R' ? 'L' : $s eq 'L' ? 'R' : $s;
+}
+
+sub _ppd_side_factor {
+    my ($x, $y) = @_;
+    return 1   if $x eq $y;
+    return 0.9 if $x eq '' || $y eq '';
+    return 0.8 if $x eq 'B' || $y eq 'B';
+    return 0.4;
+}
+
+# ---------------------------------------------------------
+# Codehierarchien (ICD-10, OPS, ATC)
+# ---------------------------------------------------------
+sub _ppd_code_chain {
+    my ($domain, $code) = @_;
+    my $c = $code // '';
+    $c =~ s/^(?:ICD10|OPS|ATC)://i;
+    $c =~ s/\s+//g;
+    return () unless length $c;
+
+    if ($domain eq 'icd10') {
+        $c = uc $c;
+        return ($c) unless $c =~ /^([A-Z])(\d{2})(?:\.?(\d)(\d)?)?/;
+        my @ch = ($1, "$1$2");
+        push @ch, "$1$2.$3"   if defined $3;
+        push @ch, "$1$2.$3$4" if defined $4;
+        return @ch;
+    }
+    if ($domain eq 'ops') {
+        $c = lc $c;
+        return ($c) unless $c =~ /^(\d)-(\w\w)(\w)?(?:\.(\w)(\w)?)?/;
+        my @ch = ($1, "$1-$2");
+        push @ch, "$1-$2$3"      if defined $3;
+        push @ch, "$1-$2$3.$4"   if defined $3 && defined $4;
+        push @ch, "$1-$2$3.$4$5" if defined $3 && defined $4 && defined $5;
+        return @ch;
+    }
+    if ($domain eq 'atc') {
+        $c = uc $c;
+        return map { substr($c, 0, $_) } grep { length($c) >= $_ } (1, 3, 4, 5, 7);
+    }
+    return ($c);
+}
+
+sub _ppd_chain_sim {
+    my ($domain, $x, $y) = @_;
+    return 1 if lc($x // '') eq lc($y // '');
+    my @a = _ppd_code_chain($domain, $x);
+    my @b = _ppd_code_chain($domain, $y);
+    my $n = @a < @b ? scalar(@a) : scalar(@b);
+    my $k = -1;
+    for my $i (0 .. $n - 1) {
+        last unless $a[$i] eq $b[$i];
+        $k = $i;
+    }
+    return 0 if $k < 0;
+    my $s = $PPD_LEVEL_SIM{$domain}[$k] // 0;
+    return $s < 1 ? $s : 0.95;    # verschiedene Codes nie ganz 1
+}
+
+sub _ppd_ts {
+    my $t = shift // '';
+    return $t =~ /^(\d{4}(?:-\d{2}(?:-\d{2})?)?)/ ? $1 : '0000';   # "PAST-UK-UK" ganz nach hinten
+}
+
+# ---------------------------------------------------------
+# Merkmalsextraktion aus einem Phenopacket
+# ---------------------------------------------------------
+sub extract_ppd_features {
+    my ($pp) = @_;
+    my %f = (_ppd => 1, age => undef, sex => undef,
+             diseases => [], phenotypes => [], procedures => [], medications => [], measurements => {});
+    return \%f unless ref $pp eq 'HASH';
+
+    my $subj = ref $pp->{subject} eq 'HASH' ? $pp->{subject} : {};
+    my $iso  = eval { $subj->{timeAtLastEncounter}{age}{iso8601duration} } // '';
+    $f{age}  = $1 + 0 if $iso =~ /^P(\d+)Y/;
+    my $sex  = uc($subj->{sex} // '');
+    $f{sex}  = $sex if $sex eq 'MALE' || $sex eq 'FEMALE';
+
+    my %seen;
+    my $add = sub {
+        my ($block, $id, $side) = @_;
+        return unless defined $id && length $id;
+        push @{ $f{$block} }, { id => $id, side => $side } unless $seen{"$block|$id|$side"}++;
+    };
+
+    for my $d (@{ $pp->{diseases} // [] }) {
+        next unless ref $d eq 'HASH' && !to_bool($d->{excluded});
+        $add->('diseases', $d->{term}{id}, _ppd_side($d->{primarySite}));
+    }
+    for my $p (@{ $pp->{phenotypicFeatures} // [] }) {
+        next unless ref $p eq 'HASH' && !to_bool($p->{excluded});
+        $add->('phenotypes', $p->{type}{id}, _ppd_side_of_mods($p->{modifiers}));
+    }
+    for my $p (@{ $pp->{procedures} // [] }) {
+        next unless ref $p eq 'HASH' && !to_bool($p->{excluded});
+        $add->('procedures', $p->{code}{id}, _ppd_side($p->{bodySite}));
+    }
+    for my $act (@{ $pp->{medicalActions} // [] }) {
+        next unless ref $act eq 'HASH';
+        if (ref $act->{procedure} eq 'HASH') {
+            $add->('procedures', $act->{procedure}{code}{id}, _ppd_side($act->{procedure}{bodySite}));
+        }
+        if (ref $act->{treatment} eq 'HASH' && !to_bool($act->{treatment}{excluded})) {
+            $add->('medications', $act->{treatment}{agent}{id}, _ppd_side($act->{treatment}{bodySite}));
+        }
+    }
+
+    # Messungen: jüngster Wert je Messgröße und Auge
+    for my $m (@{ $pp->{measurements} // [] }) {
+        next unless ref $m eq 'HASH' && !to_bool($m->{excluded});
+        my $val = eval { $m->{value}{quantity}{value} };
+        next unless defined $val && $val =~ /^-?\d+(?:\.\d+)?$/;
+        (my $aid = lc($m->{assay}{id} // '')) =~ s/^loinc://;
+        next unless length $aid;
+        my ($grp, $side) = $PPD_LOINC_LOOKUP{$aid}
+            ? @{ $PPD_LOINC_LOOKUP{$aid} }
+            : ($aid, _ppd_side_of_mods($m->{modifiers}));
+        next if $PPD_SKIP_GROUPS{$grp};
+        $val += 0;
+        $val = -log(($val > 0.001 ? $val : 0.001)) / log(10) if $grp =~ /^va_/;   # dezimal -> logMAR
+        my $ts  = _ppd_ts(eval { $m->{timeOfCollection}{timestamp} });
+        my $key = "$grp|$side";
+        my $cur = $f{measurements}{$key};
+        $f{measurements}{$key} = { group => $grp, side => $side, value => $val, ts => $ts }
+            if !$cur || $ts ge $cur->{ts};
+    }
+    return \%f;
+}
+
+sub _ppd_mirror_features {
+    my ($f) = @_;
+    my %m = %$f;
+    for my $b (qw(diseases phenotypes procedures medications)) {
+        $m{$b} = [ map { +{ %$_, side => _ppd_flip($_->{side}) } } @{ $f->{$b} } ];
+    }
+    my %meas;
+    for my $x (values %{ $f->{measurements} }) {
+        my $s = _ppd_flip($x->{side});
+        $meas{"$x->{group}|$s"} = { %$x, side => $s };
+    }
+    $m{measurements} = \%meas;
+    return \%m;
+}
+
+# ---------------------------------------------------------
+# Blockdistanzen
+# ---------------------------------------------------------
+# Symmetrischer Best-Match-Average: 1 - Mittel der besten Treffer in beide Richtungen
+sub _ppd_bma {
+    my ($A, $B, $sim, $explain) = @_;
+    return (undef, []) if !@$A && !@$B;
+    return (1, [])     if !@$A || !@$B;
+    my @pairs;
+    my $dir = sub {
+        my ($X, $Y, $rec) = @_;
+        my $tot = 0;
+        for my $x (@$X) {
+            my ($best, $by) = (0, undef);
+            for my $y (@$Y) {
+                my $s = $sim->($x, $y);
+                ($best, $by) = ($s, $y) if $s > $best;
+                last if $best >= 1;
+            }
+            $tot += $best;
+            push @pairs, { a => "$x->{id}$x->{side}", b => ($by ? "$by->{id}$by->{side}" : undef),
+                           sim => sprintf('%.3f', $best) + 0 } if $rec;
+        }
+        return $tot / @$X;
+    };
+    my $d = 1 - 0.5 * ($dir->($A, $B, $explain) + $dir->($B, $A, 0));
+    return ($d, \@pairs);
+}
+
+# Nur Messgrößen, die beide Patienten haben, gehen ein
+sub _ppd_meas_dist {
+    my ($MA, $MB) = @_;
+    my ($sum, $n, @det) = (0, 0);
+    for my $k (sort keys %$MA) {
+        my $y = $MB->{$k} or next;
+        my $x = $MA->{$k};
+        my $diff  = abs($x->{value} - $y->{value});
+        my $scale = $PPD_MEAS_SCALE{ $x->{group} };
+        my $d;
+        if ($scale) {
+            $d = $diff / $scale;
+        } else {
+            my $den = List::Util::max(abs($x->{value}), abs($y->{value}));
+            $d = $den > 0 ? $diff / $den : 0;
+        }
+        $d = 1 if $d > 1;
+        $sum += $d;
+        $n++;
+        push @det, { key => $k, a => $x->{value}, b => $y->{value}, d => sprintf('%.3f', $d) + 0 };
+    }
+    return ($n ? $sum / $n : undef, \@det);
+}
+
+sub _ppd_demo_dist {
+    my ($fa, $fb) = @_;
+    my @d;
+    push @d, List::Util::min(abs($fa->{age} - $fb->{age}) / $PPD_AGE_SCALE, 1)
+        if defined $fa->{age} && defined $fb->{age};
+    if (defined $fa->{sex} && defined $fb->{sex}) {
+        push @d, $fa->{sex} eq $fb->{sex} ? 0 : 1;
+    } elsif (defined $fa->{sex} || defined $fb->{sex}) {
+        push @d, 0.5;
+    }
+    return @d ? List::Util::sum(@d) / @d : undef;
+}
+
+# ---------------------------------------------------------
+# Kern: Distanz zweier Merkmalsvektoren
+# $opts: weights {}, mirror (1), exact ['sex'], explain (0), hpo_sim sub
+# ---------------------------------------------------------
+sub phenopacket_distance_features {
+    my ($fa, $fb, $opts) = @_;
+    $opts //= {};
+    my %w       = (%PPD_DEFAULT_WEIGHTS, %{ $opts->{weights} // {} });
+    my $hpo_sim = $opts->{hpo_sim} // sub { $_[0] eq $_[1] ? 1 : 0 };
+    my $explain = $opts->{explain} ? 1 : 0;
+
+    for my $e (@{ $opts->{exact} // [] }) {
+        if ($e eq 'sex' && defined $fa->{sex} && defined $fb->{sex} && $fa->{sex} ne $fb->{sex}) {
+            return { distance => undef, excluded_by => 'sex' };
+        }
+    }
+
+    my $best;
+    for my $mir ((($opts->{mirror} // 1) ? (0, 1) : (0))) {
+        my $gb = $mir ? _ppd_mirror_features($fb) : $fb;
+        my $sf = sub { _ppd_side_factor($_[0]{side}, $_[1]{side}) };
+        my (%blk, %det);
+
+        ($blk{diseases}, $det{diseases}) = _ppd_bma($fa->{diseases}, $gb->{diseases},
+            sub { _ppd_chain_sim('icd10', $_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
+        ($blk{procedures}, $det{procedures}) = _ppd_bma($fa->{procedures}, $gb->{procedures},
+            sub { _ppd_chain_sim('ops', $_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
+        ($blk{medications}, $det{medications}) = _ppd_bma($fa->{medications}, $gb->{medications},
+            sub { _ppd_chain_sim('atc', $_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
+        ($blk{phenotypes}, $det{phenotypes}) = _ppd_bma($fa->{phenotypes}, $gb->{phenotypes},
+            sub { $hpo_sim->($_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
+        ($blk{measurements}, $det{measurements}) = _ppd_meas_dist($fa->{measurements}, $gb->{measurements});
+        $blk{demographics} = _ppd_demo_dist($fa, $gb);
+
+        my ($num, $den, $wall) = (0, 0, 0);
+        for my $b (keys %blk) {
+            my $wb = $w{$b} // 0;
+            next unless $wb > 0;
+            $wall += $wb;
+            next unless defined $blk{$b};
+            $num += $wb * $blk{$b};
+            $den += $wb;
+        }
+        my $r = {
+            distance => $den ? $num / $den : undef,
+            mirrored => $mir ? \1 : \0,
+            coverage => $wall ? sprintf('%.3f', $den / $wall) + 0 : 0,
+            blocks   => { map { $_ => (defined $blk{$_} ? sprintf('%.4f', $blk{$_}) + 0 : undef) } keys %blk },
+        };
+        $r->{details} = \%det if $explain;
+        $best = $r if !$best
+            || (defined $r->{distance} && (!defined $best->{distance} || $r->{distance} < $best->{distance}));
+    }
+    $best->{distance} = sprintf('%.4f', $best->{distance}) + 0 if defined $best->{distance};
+    return $best;
+}
+
+sub _ppd_parse_json {
+    my ($v) = @_;
+    return $v if ref $v eq 'HASH';
+    return undef unless defined $v && length $v;
+    my $d = eval { from_json($v) } // eval { decode_json($v) } // eval { decode_json(encode('UTF-8', $v)) };
+    return ref $d eq 'HASH' ? $d : undef;
+}
+
+sub _ppd_opts {
+    my ($p) = @_;
+    return {
+        weights => (ref $p->{weights} eq 'HASH' ? $p->{weights} : {}),
+        mirror  => (exists $p->{mirror} ? to_bool($p->{mirror}) : 1),
+        exact   => (ref $p->{exact} eq 'ARRAY' ? $p->{exact} : []),
+        explain => to_bool($p->{explain}),
+    };
+}
+
+# ---------------------------------------------------------
+# HELPER: HPO-Ähnlichkeit über Vorfahrenmengen (isas, gecacht)
+# ---------------------------------------------------------
+helper hpo_ancestor_set => sub {
+    my ($self, $code) = @_;
+    state %cache;
+    my $id = _hpo_to_int($code);
+    return {} unless defined $id;
+    return $cache{$id} if $cache{$id};
+    my $rows = eval {
+        $self->pg->db->query(q{
+            WITH RECURSIVE up AS (
+                SELECT ?::int AS id
+                UNION
+                SELECT i.idparent FROM public.isas i JOIN up ON i.idchild = up.id
+            )
+            SELECT id FROM up
+        }, $id)->arrays->to_array;
+    } // [];
+    my %set = map { $_->[0] => 1 } grep { !$PPD_HPO_TRIVIAL{ $_->[0] } } @$rows;
+    $set{$id} = 1;
+    return $cache{$id} = \%set;
+};
+
+helper hpo_similarity => sub {
+    my ($self, $x, $y) = @_;
+    return 1 if $x eq $y;
+    state %cache;
+    my $key = $x lt $y ? "$x|$y" : "$y|$x";
+    return $cache{$key} if exists $cache{$key};
+    my $A = $self->hpo_ancestor_set($x);
+    my $B = $self->hpo_ancestor_set($y);
+    my $inter = grep { $B->{$_} } keys %$A;
+    my $union = keys(%$A) + keys(%$B) - $inter;
+    return $cache{$key} = ($union ? $inter / $union : 0);
+};
+
+# Phenopackets (oder bereits extrahierte Merkmale) vergleichen
+helper phenopacket_distance => sub {
+    my ($self, $pa, $pb, $opts) = @_;
+    my %o = %{ $opts // {} };
+    $o{hpo_sim} //= sub { $self->hpo_similarity(@_) };
+    my $fa = (ref $pa eq 'HASH' && $pa->{_ppd}) ? $pa : extract_ppd_features($pa);
+    my $fb = (ref $pb eq 'HASH' && $pb->{_ppd}) ? $pb : extract_ppd_features($pb);
+    return phenopacket_distance_features($fa, $fb, \%o);
+};
+
+# Kandidaten laden; standardmäßig nur der jüngste Brief je Pseudonym
+helper ppd_load_candidates => sub {
+    my ($self, %arg) = @_;
+    my @where = ("phenopacket_json IS NOT NULL");
+    my @bind;
+    if (ref $arg{ids} eq 'ARRAY' && @{ $arg{ids} }) {
+        push @where, "id = ANY(?)";
+        push @bind, [ map { int($_) } @{ $arg{ids} } ];
+    }
+    if (defined $arg{tag} && length $arg{tag}) {
+        push @where, "tags ILIKE ?";
+        push @bind, "%$arg{tag}%";
+    }
+    my $w   = join ' AND ', @where;
+    my $sql = ($arg{latest_per_patient} // 1)
+        ? "SELECT DISTINCT ON (COALESCE(pseudonym, id::text)) id, pseudonym, reference_date, phenopacket_json
+             FROM candidates WHERE $w
+            ORDER BY COALESCE(pseudonym, id::text), reference_date DESC NULLS LAST, id DESC"
+        : "SELECT id, pseudonym, reference_date, phenopacket_json FROM candidates WHERE $w ORDER BY id";
+    if ($arg{limit}) {
+        $sql = "SELECT * FROM ($sql) s LIMIT ?";
+        push @bind, int($arg{limit});
+    }
+    my $rows = $self->pg->db->query($sql, @bind)->hashes->to_array;
+    my @out;
+    for my $r (@$rows) {
+        my $pp = _ppd_parse_json($r->{phenopacket_json}) or next;
+        push @out, { id => $r->{id}, pseudonym => $r->{pseudonym},
+                     reference_date => $r->{reference_date}, f => extract_ppd_features($pp) };
+    }
+    return \@out;
+};
+
+# =========================================================
+# ENDPUNKT: Distanz zweier Phenopackets
+# Body: { a: <candidate_id | phenopacket>, b: <...>,
+#         weights: {...}, mirror: true, exact: ["sex"], explain: true }
+# =========================================================
+post '/BBB/phenopacket_distance' => sub {
+    my $c = shift;
+    my $p = $c->req->json // {};
+
+    my $resolve = sub {
+        my ($v) = @_;
+        return undef unless defined $v;
+        return _ppd_parse_json($v) if ref $v || $v !~ /^\d+$/;
+        my $row = $c->pg->db->select('candidates', ['phenopacket_json'], { id => $v })->hash;
+        return $row ? _ppd_parse_json($row->{phenopacket_json}) : undef;
+    };
+    my $pa = $resolve->($p->{a} // $p->{candidate_a});
+    my $pb = $resolve->($p->{b} // $p->{candidate_b});
+    return $c->render(json => { error => "Parameter 'a' und 'b' (candidate_id oder Phenopacket) erforderlich." }, status => 400)
+        unless $pa && $pb;
+
+    my $res = eval { $c->phenopacket_distance($pa, $pb, _ppd_opts($p)) };
+    return $c->render(json => { error => "$@" }, status => 500) if $@;
+    $c->render(json => $res);
+};
+
+# =========================================================
+# ENDPUNKT: k nächste Nachbarn eines Kandidaten
+# Body: { candidate_id, tag?, candidate_ids?, k: 10, caliper?, max_pool: 5000,
+#         exclude_same_pseudonym: true, weights, mirror, exact }
+# =========================================================
+post '/BBB/phenopacket_distance/nearest' => sub {
+    my $c = shift;
+    $c->inactivity_timeout(900);
+    my $p   = $c->req->json // {};
+    my $cid = $p->{candidate_id}
+        or return $c->render(json => { error => "Parameter 'candidate_id' erforderlich." }, status => 400);
+
+    my ($ref) = @{ $c->ppd_load_candidates(ids => [$cid], latest_per_patient => 0) };
+    return $c->render(json => { error => "Kandidat $cid ohne Phenopacket." }, status => 404) unless $ref;
+
+    my $pool = $c->ppd_load_candidates(
+        ids => $p->{candidate_ids}, tag => $p->{tag},
+        limit => $p->{max_pool} // 5000, latest_per_patient => $p->{latest_per_patient} // 1);
+
+    my $opts      = _ppd_opts($p);
+    my $k         = int($p->{k} // 10) || 10;
+    my $caliper   = $p->{caliper};
+    my $excl_same = exists $p->{exclude_same_pseudonym} ? to_bool($p->{exclude_same_pseudonym}) : 1;
+
+    my @res;
+    for my $cand (@$pool) {
+        next if $cand->{id} == $ref->{id};
+        next if $excl_same && defined $ref->{pseudonym} && defined $cand->{pseudonym}
+             && $cand->{pseudonym} eq $ref->{pseudonym};
+        my $r = $c->phenopacket_distance($ref->{f}, $cand->{f}, $opts);
+        next unless defined $r->{distance};
+        next if defined $caliper && $r->{distance} > $caliper;
+        push @res, { candidate_id => $cand->{id}, pseudonym => $cand->{pseudonym},
+                     reference_date => $cand->{reference_date}, %$r };
+    }
+    @res = sort { $a->{distance} <=> $b->{distance} } @res;
+    splice(@res, $k) if @res > $k;
+
+    $c->render(json => { candidate_id => $ref->{id}, pseudonym => $ref->{pseudonym},
+                         pool_size => scalar(@$pool), neighbours => \@res });
+};
+
+# =========================================================
+# ENDPUNKT: Greedy-Matching Fälle -> Kontrollen (1:ratio, Caliper)
+# Body: { treated_ids | treated_tag, control_ids | control_tag,
+#         ratio: 1, caliper: 0.35, replace: false, max_pool: 5000,
+#         weights, mirror, exact: ["sex"] }
+# Aufwand O(Fälle x Kontrollen); große Kohorten besser als Minion-Task.
+# =========================================================
+post '/BBB/propensity_match' => sub {
+    my $c = shift;
+    $c->inactivity_timeout(3000);
+    my $p = $c->req->json // {};
+
+    unless ((ref $p->{treated_ids} eq 'ARRAY' && @{ $p->{treated_ids} }) || $p->{treated_tag}) {
+        return $c->render(json => { error => "Parameter 'treated_ids' oder 'treated_tag' erforderlich." }, status => 400);
+    }
+
+    my $treated  = $c->ppd_load_candidates(ids => $p->{treated_ids}, tag => $p->{treated_tag});
+    my $controls = $c->ppd_load_candidates(ids => $p->{control_ids}, tag => $p->{control_tag},
+                                           limit => $p->{max_pool} // 5000);
+
+    my $ratio   = int($p->{ratio} // 1) || 1;
+    my $caliper = $p->{caliper};
+    my $replace = to_bool($p->{replace});
+    my $opts    = _ppd_opts($p);
+    $opts->{explain} = 0;
+
+    # Kontrollen dürfen nicht dieselben Patienten wie die Fälle sein
+    my %tp   = map { (($_->{pseudonym} // "id$_->{id}") => 1) } @$treated;
+    my @ctrl = grep { !$tp{ $_->{pseudonym} // "id$_->{id}" } } @$controls;
+
+    my @pairs;
+    for my $t (@$treated) {
+        for my $k (@ctrl) {
+            my $r = $c->phenopacket_distance($t->{f}, $k->{f}, $opts);
+            next unless defined $r->{distance};
+            next if defined $caliper && $r->{distance} > $caliper;
+            push @pairs, [ $r->{distance}, $t, $k, $r->{mirrored} ];
+        }
+    }
+    @pairs = sort { $a->[0] <=> $b->[0] } @pairs;
+
+    my (%n_t, %used_c, %matches);
+    for my $pr (@pairs) {
+        my ($d, $t, $k, $mir) = @$pr;
+        next if ($n_t{ $t->{id} } // 0) >= $ratio;
+        next if !$replace && $used_c{ $k->{id} };
+        $n_t{ $t->{id} }++;
+        $used_c{ $k->{id} }++;
+        push @{ $matches{ $t->{id} } }, { candidate_id => $k->{id}, pseudonym => $k->{pseudonym},
+                                          distance => $d, mirrored => $mir };
+    }
+
+    my @out = map { +{ treated_id => $_->{id}, treated_pseudonym => $_->{pseudonym},
+                       controls => $matches{ $_->{id} } // [] } } @$treated;
+    my @d_all = map { $_->{distance} } map { @{ $_->{controls} } } @out;
+
+    $c->render(json => {
+        n_treated        => scalar(@$treated),
+        n_controls_pool  => scalar(@ctrl),
+        n_fully_matched  => scalar(grep { @{ $_->{controls} } == $ratio } @out),
+        mean_distance    => @d_all ? sprintf('%.4f', List::Util::sum(@d_all) / @d_all) + 0 : undef,
+        unmatched        => [ map { $_->{treated_id} } grep { !@{ $_->{controls} } } @out ],
+        matches          => \@out,
+    });
+};
+
 
 # =========================================================
 # GENERIC DB REST CRUD ENDPOINTS (MIT 1/1-SICHERUNG)
@@ -8266,6 +8919,499 @@ post '/BBB/candidates/recompute_by_tag' => sub {
 
     $c->app->log->info("[RECOMPUTE BY TAG] $queued_count Kandidaten mit Tag '$tag' zur Neu-Extraktion in Minion eingereiht.");
     $c->render(json => { success => 1, tag => $tag, queued => $queued_count });
+};
+
+# =========================================================
+# ANONYMISIERTER PHENOPACKET-EXPORT
+# (DSFA OntoTrial V1.0 / Datenschutzkurzkonzept, Anlage V1.4)
+#
+#   Filter 1  Zero-Free-Text: nur validierte Codes mit kanonischem Label aus der
+#             Terminologietabelle. canonical_term, Verbatim-Texte, Messungs-
+#             Modifier und freie Einheiten werden nicht übernommen.
+#   Filter 2  Flüchtige Zufalls-IDs je Exportlauf (/dev/urandom). Die Zuordnung
+#             Pseudonym -> subject-ID existiert nur im Arbeitsspeicher dieses
+#             Requests und wird nirgends gespeichert oder geloggt.
+#   Filter 3  Monats-Trunkierung (JJJJ-MM) plus patientenkonstanter Versatz
+#             Δm ∈ {-3,-2,-1,+1,+2,+3}. Nicht parsbare Daten ("PAST-UK-UK") entfallen.
+#   Filter 4  Alter in vollen Jahren, Top-Coding ab 90 (P90Y = "90 oder älter"),
+#             Generalisierung seltener Codes entlang der Hierarchie, bis jeder
+#             ausgegebene Code von mindestens k Patienten stammt (k >= 5).
+#
+# Einfügen in backend.pl VOR dem Abschnitt
+#   "GENERIC DB REST CRUD ENDPOINTS (MIT 1/1-SICHERUNG)",
+# sonst fängt POST '/BBB/:table/:pk' die Anfrage ab.
+# Benötigt die bereits vorhandenen _ppd_code_chain, _ppd_parse_json,
+# _hpo_to_int, %PPD_HPO_TRIVIAL, to_bool und get_canonical_ontology_label.
+# =========================================================
+
+our $ANON_MIN_K  = 5;
+our @ANON_SHIFTS = (-3, -2, -1, 1, 2, 3);
+
+our %ANON_LATERALITY = (
+    'HP:0012834'      => 'Right',
+    'HP:0012835'      => 'Left',
+    'HP:0012832'      => 'Bilateral',
+    'SNOMED:18944008' => 'Right eye structure',
+    'SNOMED:8966001'  => 'Left eye structure',
+    'SNOMED:40638003' => 'Structure of both eyes',
+);
+
+# Lokale LOINC-Erweiterungscodes stehen nicht in loinc_terms
+our %ANON_STATIC_LABELS = (
+    'LOINC:86290-4a' => 'Left eye Retinal ganglion cell and inner plexiform layer volume by OCT',
+    'LOINC:86301-9a' => 'Right eye Retinal ganglion cell and inner plexiform layer volume by OCT',
+    'LOINC:86290-4b' => 'Left eye Bruch membrane opening area by OCT',
+    'LOINC:86301-9b' => 'Right eye Bruch membrane opening area by OCT',
+);
+
+our %ANON_QUALITATIVE = map { $_ => 1 } ('Positive / Detected', 'Examined');
+our %ANON_COMPARATORS = map { $_ => 1 } ('=', '<', '<=', '>', '>=');
+our $ANON_UNIT_RE     = qr{^(?:[A-Za-zµ°%{}/.\^0-9*]{1,20}|scale \([A-Za-z0-9-]{1,12}\))$};
+our %ANON_SEX         = (MALE => 'MALE', FEMALE => 'FEMALE', OTHER_SEX => 'OTHER_SEX');
+
+our @ANON_RESOURCES = (
+    { id => 'hp',     name => 'human phenotype ontology',                          namespacePrefix => 'HP' },
+    { id => 'loinc',  name => 'Logical Observation Identifiers Names and Codes',   namespacePrefix => 'LOINC' },
+    { id => 'icd10',  name => 'International Classification of Diseases 10 (GM)',  namespacePrefix => 'ICD10' },
+    { id => 'ops',    name => 'Operationen- und Prozedurenschlüssel',               namespacePrefix => 'OPS' },
+    { id => 'atc',    name => 'Anatomical Therapeutic Chemical Classification',     namespacePrefix => 'ATC' },
+    { id => 'snomed', name => 'SNOMED Clinical Terms',                              namespacePrefix => 'SNOMED' },
+);
+
+# ---------------------------------------------------------
+# Zufall aus /dev/urandom (Perls rand() ist nicht kryptographisch)
+# ---------------------------------------------------------
+sub _anon_random_bytes {
+    my ($n) = @_;
+    open my $fh, '<:raw', '/dev/urandom' or die "Kein /dev/urandom: $!\n";
+    my $got = read($fh, my $buf, $n);
+    close $fh;
+    die "Zu wenige Zufallsbytes\n" unless defined $got && $got == $n;
+    return $buf;
+}
+
+sub _anon_random_id { return unpack('H*', _anon_random_bytes($_[0] // 8)) }
+
+sub _anon_random_shift {
+    while (1) {                                   # Ablehnungsverfahren gegen Modulo-Verzerrung
+        my $b = ord(_anon_random_bytes(1));
+        return $ANON_SHIFTS[$b % 6] if $b < 252;
+    }
+}
+
+sub _anon_shuffle {
+    my @a = @_;
+    return @a if @a < 2;
+    my @r = unpack('N*', _anon_random_bytes(4 * $#a));
+    for (my $i = $#a; $i > 0; $i--) {
+        my $j = $r[$i - 1] % ($i + 1);
+        @a[$i, $j] = @a[$j, $i];
+    }
+    return @a;
+}
+
+# ---------------------------------------------------------
+# Datum, Alter, Listen, Domäne
+# ---------------------------------------------------------
+sub _anon_shift_ts {
+    my ($ts, $delta) = @_;
+    return undef unless defined $ts && !ref $ts;
+    if ($ts =~ /^(\d{4})-(\d{2})/ && $2 >= 1 && $2 <= 12) {
+        my $t = $1 * 12 + ($2 - 1) + $delta;
+        return sprintf('%04d-%02d', int($t / 12), $t % 12 + 1);
+    }
+    return $1 if $ts =~ /^(\d{4})$/;               # Jahr allein ist gröber als ein Monat
+    return undef;
+}
+
+sub _anon_age {
+    my ($iso) = @_;
+    return undef unless defined $iso && !ref $iso && $iso =~ /^P(\d{1,3})Y/;
+    my $y = $1 + 0;
+    $y = 90 if $y > 90;
+    return "P${y}Y";
+}
+
+sub _anon_list { return ref $_[0] eq 'ARRAY' ? @{ $_[0] } : () }
+
+sub _anon_domain {
+    my ($id) = @_;
+    return undef unless defined $id && !ref $id;
+    return 'hpo'   if $id =~ /^HP:\d{7}$/;
+    return 'icd10' if $id =~ /^ICD10:\S+$/;
+    return 'ops'   if $id =~ /^OPS:\S+$/;
+    return 'atc'   if $id =~ /^ATC:\S+$/;
+    return 'loinc' if $id =~ /^LOINC:\S+$/;
+    return undef;
+}
+
+sub _anon_collect_codes {
+    my ($pp) = @_;
+    my $id_of = sub {
+        my ($h, $k) = @_;
+        return (ref $h eq 'HASH' && ref $h->{$k} eq 'HASH' && defined $h->{$k}{id}) ? $h->{$k}{id} : ();
+    };
+    my @ids;
+    push @ids, map { $id_of->($_, 'type')  } _anon_list($pp->{phenotypicFeatures});
+    push @ids, map { $id_of->($_, 'term')  } _anon_list($pp->{diseases});
+    push @ids, map { $id_of->($_, 'code')  } _anon_list($pp->{procedures});
+    push @ids, map { $id_of->($_, 'assay') } _anon_list($pp->{measurements});
+    for my $act (_anon_list($pp->{medicalActions})) {
+        next unless ref $act eq 'HASH';
+        push @ids, $id_of->($act->{procedure}, 'code');
+        push @ids, $id_of->($act->{treatment}, 'agent');
+    }
+    return @ids;
+}
+
+# ---------------------------------------------------------
+# Hierarchiekette eines Codes, von allgemein nach spezifisch.
+# Untergrenzen: ICD-10 Dreisteller, OPS Viersteller, ATC Ebene 3.
+# LOINC wird nicht generalisiert (seltene Assays entfallen).
+# ---------------------------------------------------------
+helper anon_code_chain => sub {
+    my ($self, $id) = @_;
+    state %cache;
+    return @{ $cache{$id} } if $cache{$id};
+    my $dom = _anon_domain($id) or return ();
+
+    my @chain;
+    if ($dom =~ /^(?:icd10|ops|atc)$/) {
+        my %pfx  = (icd10 => 'ICD10:', ops => 'OPS:', atc => 'ATC:');
+        my %skip = (icd10 => 1, ops => 2, atc => 2);
+        my @c = _ppd_code_chain($dom, $id);
+        splice(@c, 0, $skip{$dom}) if @c > $skip{$dom};
+        @chain = map { $pfx{$dom} . $_ } @c;
+    } elsif ($dom eq 'hpo') {
+        @chain = ($id);
+        my $cur = _hpo_to_int($id);
+        for (1 .. 8) {
+            my $r = eval {
+                $self->pg->db->query(
+                    'SELECT idparent FROM public.isas WHERE idchild = ? ORDER BY idparent LIMIT 1', $cur
+                )->array;
+            };
+            last unless $r && defined $r->[0];
+            $cur = $r->[0];
+            last if $PPD_HPO_TRIVIAL{$cur};
+            unshift @chain, sprintf('HP:%07d', $cur);
+        }
+    } else {
+        @chain = ($id);
+    }
+    $cache{$id} = \@chain;
+    return @chain;
+};
+
+# Kanonisches Label; undef bei unbekannten oder veralteten Codes
+helper anon_label => sub {
+    my ($self, $id) = @_;
+    state %cache;
+    return $cache{$id} if exists $cache{$id};
+    my $label = $ANON_LATERALITY{$id} // $ANON_STATIC_LABELS{$id};
+    if (!defined $label && (my $dom = _anon_domain($id))) {
+        $label = eval { $self->get_canonical_ontology_label($dom, $id) };
+    }
+    $label = undef if defined $label && ($label !~ /\S/ || $label =~ /^\s*(?:obsolete|deprecated)\b/i);
+    return $cache{$id} = $label;
+};
+
+# ---------------------------------------------------------
+# Generalisierung: jedem Code den spezifischsten Knoten zuordnen,
+# den mindestens k Patienten teilen. Wiederholt, bis jeder AUSGEGEBENE
+# Code von >= k Patienten stammt. Negierte Befunde werden nie verallgemeinert
+# ("kein H40.1" bedeutet nicht "kein H40"), sondern bei Seltenheit verworfen.
+# ---------------------------------------------------------
+helper anon_build_generalizer => sub {
+    my ($self, $codes_by_patient, $k) = @_;
+    my (%chain, %level);
+    for my $codes (values %$codes_by_patient) {
+        for my $id (keys %$codes) {
+            next if exists $chain{$id};
+            $chain{$id} = [ $self->anon_code_chain($id) ];
+            $level{$id} = $#{ $chain{$id} };          # -1, wenn keine gültige Kette
+        }
+    }
+
+    my $count = sub {
+        my %cnt;
+        for my $codes (values %$codes_by_patient) {
+            my %seen;
+            $seen{ $chain{$_}[ $level{$_} ] } = 1 for grep { $level{$_} >= 0 } keys %$codes;
+            $cnt{$_}++ for keys %seen;
+        }
+        return \%cnt;
+    };
+
+    for (1 .. 50) {
+        my $cnt = $count->();
+        my $changed = 0;
+        for my $id (keys %level) {
+            next if $level{$id} < 0;
+            next if ($cnt->{ $chain{$id}[ $level{$id} ] } // 0) >= $k;
+            $level{$id}--;
+            $changed = 1;
+        }
+        last unless $changed;
+    }
+    my $final = $count->();                            # Sicherung, falls die Schleife abbricht
+    for my $id (keys %level) {
+        next if $level{$id} < 0;
+        $level{$id} = -1 if ($final->{ $chain{$id}[ $level{$id} ] } // 0) < $k;
+    }
+
+    return sub {
+        my ($id, $excluded) = @_;
+        return undef unless defined $id && exists $level{$id} && $level{$id} >= 0;
+        return undef if $excluded && $level{$id} != $#{ $chain{$id} };
+        return $chain{$id}[ $level{$id} ];
+    };
+};
+
+# ---------------------------------------------------------
+# Ein Phenopacket neu aufbauen (Whitelist statt Blacklist)
+# $ctx: subject_id, shift, gen, stats, created
+# ---------------------------------------------------------
+helper anon_phenopacket => sub {
+    my ($self, $pp, $ctx) = @_;
+    my $st = $ctx->{stats};
+
+    my $code = sub {
+        my ($id, $excluded) = @_;
+        my $g = $ctx->{gen}->($id, $excluded);
+        unless (defined $g) { $st->{codes_suppressed}++; return undef }
+        my $l = $self->anon_label($g);
+        unless (defined $l) { $st->{codes_unresolved}++; return undef }
+        my @ch = $self->anon_code_chain($id);
+        $st->{codes_generalized}++ if @ch && $g ne $ch[-1];
+        return { id => $g, label => $l };
+    };
+    my $lat = sub {
+        my ($o) = @_;
+        my $id = (ref $o eq 'HASH' && defined $o->{id}) ? $o->{id} : '';
+        return exists $ANON_LATERALITY{$id} ? { id => $id, label => $ANON_LATERALITY{$id} } : undef;
+    };
+    my $ts  = sub { _anon_shift_ts($_[0], $ctx->{shift}) };
+    my $get = sub { my ($h, @path) = @_; for (@path) { return undef unless ref $h eq 'HASH'; $h = $h->{$_} } return $h };
+
+    # --- Subject ---
+    my $subj = ref $pp->{subject} eq 'HASH' ? $pp->{subject} : {};
+    my %subject = (
+        id       => $ctx->{subject_id},
+        sex      => $ANON_SEX{ uc($subj->{sex} // '') } // 'UNKNOWN_SEX',
+        taxonomy => { id => 'NCBITaxon:9606', label => 'homo sapiens' },
+    );
+    if (my $age = _anon_age($get->($subj, qw(timeAtLastEncounter age iso8601duration)))) {
+        $subject{timeAtLastEncounter} = { age => { iso8601duration => $age } };
+    }
+
+    # --- Phänotypen ---
+    my (@features, %seen_f);
+    for my $f (_anon_list($pp->{phenotypicFeatures})) {
+        next unless ref $f eq 'HASH';
+        my $ex   = to_bool($f->{excluded}) ? 1 : 0;
+        my $t    = $code->($get->($f, qw(type id)), $ex) or next;
+        my @mods = grep { defined } map { $lat->($_) } _anon_list($f->{modifiers});
+        my $on   = $ts->($get->($f, qw(onset timestamp)));
+        next if $seen_f{ join '|', $t->{id}, (map { $_->{id} } @mods), $ex, $on // '' }++;
+        my $node = { type => $t };
+        $node->{modifiers} = \@mods                    if @mods;
+        $node->{excluded}  = Mojo::JSON->true          if $ex;
+        $node->{onset}     = { timestamp => $on }      if defined $on;
+        push @features, $node;
+    }
+
+    # --- Messungen ---
+    my (@measurements, %seen_m);
+    for my $m (_anon_list($pp->{measurements})) {
+        next unless ref $m eq 'HASH';
+        my $a = $code->($get->($m, qw(assay id)), 0) or next;
+        my ($value, $vsig);
+        my $q = $get->($m, qw(value quantity));
+        my $oc = $get->($m, qw(value ontologyClass));
+        if (ref $q eq 'HASH') {
+            my $v   = $q->{value};
+            my $u   = ref $q->{unit} eq 'HASH' ? $q->{unit}{label} : $q->{unit};
+            my $cmp = $q->{comparator} // '=';
+            unless (defined $v && !ref $v && $v =~ /^-?\d+(?:\.\d+)?$/
+                    && $ANON_COMPARATORS{$cmp} && defined $u && !ref $u && $u =~ $ANON_UNIT_RE) {
+                $st->{values_dropped}++;
+                next;
+            }
+            $value = { quantity => { comparator => $cmp, value => $v + 0, unit => { label => $u } } };
+            $vsig  = "$cmp$v$u";
+        } elsif (ref $oc eq 'HASH' && ($oc->{id} // '') eq 'NCIT:C25250' && $ANON_QUALITATIVE{ $oc->{label} // '' }) {
+            $value = { ontologyClass => { id => 'NCIT:C25250', label => $oc->{label} } };
+            $vsig  = $oc->{label};
+        } else {
+            $st->{values_dropped}++;
+            next;
+        }
+        my @mods = grep { defined } map { $lat->($_) } _anon_list($m->{modifiers});
+        my $tc   = $ts->($get->($m, qw(timeOfCollection timestamp)));
+        next if $seen_m{ join '|', $a->{id}, (map { $_->{id} } @mods), $vsig, $tc // '' }++;
+        my $node = { assay => $a, value => $value };
+        $node->{modifiers}        = \@mods                if @mods;
+        $node->{timeOfCollection} = { timestamp => $tc }  if defined $tc;
+        push @measurements, $node;
+    }
+
+    # --- Diagnosen ---
+    my (@diseases, %seen_d);
+    for my $d (_anon_list($pp->{diseases})) {
+        next unless ref $d eq 'HASH';
+        my $ex   = to_bool($d->{excluded}) ? 1 : 0;
+        my $t    = $code->($get->($d, qw(term id)), $ex) or next;
+        my $site = $lat->($d->{primarySite});
+        my $on   = $ts->($get->($d, qw(onset timestamp)));
+        next if $seen_d{ join '|', $t->{id}, ($site ? $site->{id} : ''), $ex, $on // '' }++;
+        my $node = { term => $t };
+        $node->{excluded}    = Mojo::JSON->true      if $ex;
+        $node->{primarySite} = $site                 if $site;
+        $node->{onset}       = { timestamp => $on }  if defined $on;
+        push @diseases, $node;
+    }
+
+    # --- Prozeduren (Top-Level wie im Konzept-Listing) ---
+    my (@procedures, %seen_p);
+    for my $p (_anon_list($pp->{procedures})) {
+        next unless ref $p eq 'HASH';
+        my $cd   = $code->($get->($p, qw(code id)), 0) or next;
+        my $site = $lat->($p->{bodySite});
+        my $pt   = $ts->($p->{performedTime});
+        next if $seen_p{ join '|', $cd->{id}, ($site ? $site->{id} : ''), $pt // '' }++;
+        my $node = { code => $cd };
+        $node->{bodySite}      = $site if $site;
+        $node->{performedTime} = $pt   if defined $pt;
+        push @procedures, $node;
+    }
+
+    # --- Medical Actions ---
+    my (@actions, %seen_a);
+    for my $act (_anon_list($pp->{medicalActions})) {
+        next unless ref $act eq 'HASH';
+        if (ref $act->{procedure} eq 'HASH') {
+            my $pr   = $act->{procedure};
+            my $cd   = $code->($get->($pr, qw(code id)), 0) or next;
+            my $site = $lat->($pr->{bodySite});
+            my $pt   = $ts->($get->($pr, qw(performed timestamp)));
+            next if $seen_a{ join '|', 'P', $cd->{id}, ($site ? $site->{id} : ''), $pt // '' }++;
+            my $node = { code => $cd };
+            $node->{bodySite}  = $site                 if $site;
+            $node->{performed} = { timestamp => $pt }  if defined $pt;
+            push @actions, { procedure => $node };
+        } elsif (ref $act->{treatment} eq 'HASH') {
+            my $tr   = $act->{treatment};
+            my $ag   = $code->($get->($tr, qw(agent id)), 0) or next;
+            my $site = $lat->($tr->{bodySite});
+            my $pt   = $ts->($tr->{performedTime});
+            next if $seen_a{ join '|', 'T', $ag->{id}, ($site ? $site->{id} : ''), $pt // '' }++;
+            my $node = { agent => $ag };
+            $node->{bodySite}      = $site if $site;
+            $node->{performedTime} = $pt   if defined $pt;
+            push @actions, { treatment => $node };
+        }
+    }
+
+    return {
+        id                 => 'phenopacket-' . _anon_random_id(8),
+        subject            => \%subject,
+        phenotypicFeatures => \@features,
+        measurements       => \@measurements,
+        diseases           => \@diseases,
+        procedures         => \@procedures,
+        medicalActions     => \@actions,
+        metaData           => {
+            created                  => $ctx->{created},
+            createdBy                => 'OntoTrial-DeidentificationEngine',
+            phenopacketSchemaVersion => '2.0.0',
+            resources                => [ map { +{ %$_ } } @ANON_RESOURCES ],
+        },
+    };
+};
+
+# =========================================================
+# ENDPUNKT: ANONYMISIERTER EXPORT
+# Body: { tag?: "...", candidate_ids?: [..], k?: 5 }
+# Ein Phenopacket pro Arztbrief, Verlaufskopplung über subject.id,
+# die nur innerhalb dieses Exportlaufs gilt.
+# =========================================================
+post '/BBB/export/anonymized_phenopackets' => sub {
+    my $c = shift;
+    $c->inactivity_timeout(1800);
+    my $p = $c->req->json // {};
+
+    my $k = int($p->{k} // $ANON_MIN_K);
+    $k = $ANON_MIN_K if $k < $ANON_MIN_K;              # DSFA: k >= 5, nur Verschärfung erlaubt
+
+    my @where = ('phenopacket_json IS NOT NULL');
+    my @bind;
+    if (ref $p->{candidate_ids} eq 'ARRAY' && @{ $p->{candidate_ids} }) {
+        push @where, 'id = ANY(?)';
+        push @bind, [ map { int($_) } @{ $p->{candidate_ids} } ];
+    }
+    if (defined $p->{tag} && !ref $p->{tag} && length $p->{tag}) {
+        push @where, 'tags ILIKE ?';
+        push @bind, '%' . $p->{tag} . '%';
+    }
+
+    my $rows = eval {
+        $c->pg->db->query('SELECT id, pseudonym, phenopacket_json FROM candidates WHERE ' . join(' AND ', @where), @bind)
+          ->hashes->to_array;
+    };
+    return $c->render(json => { error => 'Kandidaten konnten nicht geladen werden.' }, status => 500) unless $rows;
+
+    # Gruppierung je Patient nur im Arbeitsspeicher
+    my (%packets, %codes);
+    for my $r (@$rows) {
+        my $pp  = _ppd_parse_json($r->{phenopacket_json}) or next;
+        my $pid = (defined $r->{pseudonym} && length $r->{pseudonym}) ? "p:$r->{pseudonym}" : "c:$r->{id}";
+        push @{ $packets{$pid} }, $pp;
+        $codes{$pid}{$_} = 1 for _anon_collect_codes($pp);
+    }
+    undef $rows;
+
+    my $n_subjects = scalar keys %packets;
+    if ($n_subjects < $k) {
+        return $c->render(json => {
+            error => "Die Auswahl umfasst $n_subjects Patient(en); k-Anonymität mit k = $k ist nicht erreichbar."
+        }, status => 422);
+    }
+
+    my $gen   = $c->anon_build_generalizer(\%codes, $k);
+    my %stats = map { $_ => 0 } qw(codes_suppressed codes_generalized codes_unresolved values_dropped);
+    my ($mon, $year) = (gmtime)[4, 5];
+    my $created = sprintf('%04d-%02d-01T00:00:00Z', $year + 1900, $mon + 1);
+
+    my @out;
+    for my $pid (keys %packets) {
+        my $ctx = {
+            subject_id => 'subject-' . _anon_random_id(8),
+            shift      => _anon_random_shift(),
+            gen        => $gen,
+            stats      => \%stats,
+            created    => $created,
+        };
+        push @out, $c->anon_phenopacket($_, $ctx) for @{ $packets{$pid} };
+    }
+
+    # Zuordnung verwerfen (wird nicht persistiert; Perl überschreibt freigegebenen
+    # Speicher allerdings nicht zuverlässig)
+    %packets = ();
+    %codes   = ();
+
+    @out = _anon_shuffle(@out);                        # Reihenfolge verrät keine internen IDs
+
+    # Nur Zählwerte loggen, keine Inhalte
+    $c->app->log->info(sprintf('[ANON EXPORT] %d Patienten, %d Phenopackets, k=%d', $n_subjects, scalar(@out), $k));
+
+    $c->render(json => {
+        k              => $k,
+        n_subjects     => $n_subjects,
+        n_phenopackets => scalar(@out),
+        suppression    => \%stats,
+        phenopackets   => \@out,
+    });
 };
 
 # =========================================================
@@ -8367,130 +9513,6 @@ del '/BBB/:table/:pk/:key' => [key => qr/\d+/] => sub {
     my $err = $@ // $DBI::errstr;
     $self->notify_change($table_raw, $key, 'DELETE', {});
     $self->render(json => { err => $err });
-};
-
-# =========================================================
-# LOINC DATABASE IMPORT
-# =========================================================
-any '/_import_loinc' => sub {
-    my $c = shift;
-    $c->inactivity_timeout(1200); # 20 minutes for bulk insertion of ~100k records
-
-    my $filepath = '/Users/Shared/bin/OntoTrial2/_sources/Loinc2.csv';
-
-    unless (-e $filepath) {
-        $c->app->log->error("LOINC import file not found at: $filepath");
-        return $c->render(json => { error => "File not found at $filepath" }, status => 404);
-    }
-
-    my $db = $c->pg->db;
-    my $imported_count = 0;
-
-    eval {
-        my $tx = $db->begin;
-
-        # Truncate existing table
-        $db->query("TRUNCATE TABLE public.loinc_terms RESTART IDENTITY CASCADE");
-
-        my $sql_insert = q{
-            INSERT INTO public.loinc_terms (
-                id, label, component, property, time_aspect, system,
-                scale_type, method_type, class_name, parent_id,
-                code_formatted, status, example_ucum_units
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (id) DO UPDATE SET
-                label = EXCLUDED.label,
-                component = EXCLUDED.component,
-                property = EXCLUDED.property,
-                time_aspect = EXCLUDED.time_aspect,
-                system = EXCLUDED.system,
-                scale_type = EXCLUDED.scale_type,
-                method_type = EXCLUDED.method_type,
-                class_name = EXCLUDED.class_name,
-                parent_id = EXCLUDED.parent_id,
-                code_formatted = EXCLUDED.code_formatted,
-                status = EXCLUDED.status,
-                example_ucum_units = EXCLUDED.example_ucum_units
-        };
-
-        my $csv = Text::CSV->new({
-            binary           => 1,
-            auto_diag        => 1,
-            allow_loose_quotes => 1,
-        }) or die "Cannot use Text::CSV: " . Text::CSV->error_diag();
-
-        open my $fh, "<:encoding(UTF-8)", $filepath or die "Could not open $filepath: $!";
-
-        # Read header row and map column positions
-        my $headers = $csv->getline($fh);
-        unless ($headers) {
-            die "Failed to parse CSV header row.";
-        }
-
-        my %col;
-        for (my $i = 0; $i < @$headers; $i++) {
-            $col{$headers->[$i]} = $i;
-        }
-
-        my %created_classes;
-
-        while (my $row = $csv->getline($fh)) {
-            my $loinc_num = $row->[ $col{"LOINC_NUM"} ];
-            next unless defined $loinc_num && $loinc_num ne '';
-
-            my $component     = $row->[ $col{"COMPONENT"} ] // '';
-            my $property      = $row->[ $col{"PROPERTY"} ] // '';
-            my $time_aspect   = $row->[ $col{"TIME_ASPCT"} ] // '';
-            my $system        = $row->[ $col{"SYSTEM"} ] // '';
-            my $scale_type    = $row->[ $col{"SCALE_TYP"} ] // '';
-            my $method_type   = $row->[ $col{"METHOD_TYP"} ] // '';
-            my $class_name    = $row->[ $col{"CLASS"} ] // 'OTHER';
-            my $status        = $row->[ $col{"STATUS"} ] // 'ACTIVE';
-            my $ucum_units    = $row->[ $col{"EXAMPLE_UCUM_UNITS"} ] // '';
-
-            # Prefer LONG_COMMON_NAME, then DisplayName, then COMPONENT
-            my $label = $row->[ $col{"LONG_COMMON_NAME"} ]
-                     || $row->[ $col{"DisplayName"} ]
-                     || $component
-                     || "LOINC $loinc_num";
-
-            # Ensure parent CLASS category node exists
-            my $parent_class_id = "CLASS-" . uc($class_name);
-            unless ($created_classes{$parent_class_id}) {
-                $db->query(
-                    $sql_insert,
-                    $parent_class_id, "LOINC Class: $class_name",
-                    undef, undef, undef, undef,
-                    undef, undef, $class_name, undef,
-                    $parent_class_id, "ACTIVE", undef
-                );
-                $created_classes{$parent_class_id} = 1;
-                $imported_count++;
-            }
-
-            # Insert individual LOINC term under its CLASS parent
-            $db->query(
-                $sql_insert,
-                $loinc_num, $label, $component, $property, $time_aspect, $system,
-                $scale_type, $method_type, $class_name, $parent_class_id,
-                $loinc_num, $status, $ucum_units
-            );
-
-            $imported_count++;
-        }
-
-        close $fh;
-        $tx->commit;
-    };
-
-    if ($@) {
-        $c->app->log->error("Error during LOINC import: $@");
-        return $c->render(json => { error => "Import failed", details => "$@" }, status => 500);
-    }
-
-    $c->app->log->info("LOINC import completed. $imported_count records inserted/updated.");
-    $c->render(json => { success => 1, message => "Successfully imported $imported_count LOINC entries." });
 };
 
 # =========================================================
