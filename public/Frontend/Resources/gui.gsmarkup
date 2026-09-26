@@ -43,7 +43,10 @@
                                 <hbox height="26">
                                     <ButtonBar target="#CPOwner.candidatesController" minusButtonAction="remove:" plusButtonAction="insert:" actionsButton="YES">
                                         <popUpButtonItem title="Tagging..." target="#CPOwner" action="showTaggingWindowAction:"/>
+                                        <popUpButtonItem title="Recompute Candidates with Tag..." target="#CPOwner" action="recomputeCandidatesWithTagAction:"/>
                                         <popUpButtonItem title="Match tag against trials" target="#CPOwner" action="matchTagAgainstTrialsAction:"/>
+                                        <popUpButtonItem title="Propensity Matching..." target="#CPOwner" action="showPropensityMatchingAction:"/>
+                                        <popUpButtonItem title="Anonymized Export..." target="#CPOwner" action="showAnonymizedExportAction:"/>
                                     </ButtonBar>
                                     <hspace/>
                                 </hbox>

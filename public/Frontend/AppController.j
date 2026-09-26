@@ -7,6 +7,7 @@
 @import <Foundation/Foundation.j>
 @import <AppKit/AppKit.j>
 @import <Renaissance/Renaissance.j>
+@import "ToolsController.j"
 
 @implementation _CPStateMarker(_MonkeyPatch)
 - (integer)length{ return 0}
@@ -1926,6 +1927,19 @@ _CPTokenFieldToken = HPOTokenFieldToken;
     [self connectWebSocket];
 }
 
+- (void)showAnonymizedExportAction:(id)sender
+{
+    var tools = [ToolsController sharedController];
+    [tools setAppController:self];
+    [tools showAnonymizedExport:sender];
+}
+
+- (void)showPropensityMatchingAction:(id)sender
+{
+    var tools = [ToolsController sharedController];
+    [tools setAppController:self];
+    [tools showPropensityMatching:sender];
+}
 
 - (void)doubleClickChatPatient:(id)sender
 {
@@ -7583,6 +7597,70 @@ function formatHPOId(termId)
         [[_chatPseudonymsTextView window] makeFirstResponder:_chatPseudonymsTextView];
         [_chatPseudonymsTextView selectAll:self];
     }, 50);
+}
+
+- (void)recomputeCandidatesWithTagAction:(id)sender
+{
+    var tag = prompt("Geben Sie das Tag ein, dessen Kandidaten neu extrahiert werden sollen:", "");
+    if (!tag) return;
+
+    tag = tag.trim();
+    if (tag.length === 0) return;
+
+    if (!confirm("Möchten Sie wirklich alle Kandidaten mit dem Tag '" + tag + "' neu extrahieren lassen? Vorhandene Phenopackets werden dabei im Hintergrund neu generiert."))
+    {
+        return;
+    }
+
+    var taskId = @"recompute_tag_" + tag;
+    [self addTaskWithName:@"Neu-Extraktion Tag: " + tag identifier:taskId];
+    [self updateTaskWithIdentifier:taskId state:@"active" message:@"Reiht Kandidaten in Extraktions-Queue ein..." progress:20];
+
+    var request = [CPURLRequest requestWithURL:@"/BBB/candidates/recompute_by_tag"
+                                   cachePolicy:CPURLRequestUseProtocolCachePolicy
+                               timeoutInterval:120.0];
+    [request setHTTPMethod:@"POST"];
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+
+    var payload = {
+        "tag": tag,
+        "model": selectedModel,
+        "deep_mode": deepModeEnabled ? 1 : 0
+    };
+    [request setHTTPBody:JSON.stringify(payload)];
+
+    [CPURLConnection sendAsynchronousRequest:request
+                                       queue:[CPOperationQueue mainQueue]
+                           completionHandler:function(response, data, error)
+    {
+        if (!error && data)
+        {
+            try {
+                var res = JSON.parse(data);
+                if (res.success)
+                {
+                    var count = res.queued || 0;
+                    [self updateTaskWithIdentifier:taskId state:@"finished" message:[CPString stringWithFormat:@"%d Kandidat(en) eingereiht", count] progress:100];
+                    alert([CPString stringWithFormat:@"Erfolgreich: %d Kandidat(en) mit Tag '%@' wurden in die Hintergrund-Queue (Minion) eingereiht.", count, tag]);
+                }
+                else
+                {
+                    var errMsg = res.error || @"Unbekannter Fehler";
+                    [self updateTaskWithIdentifier:taskId state:@"failed" message:errMsg progress:0];
+                    alert(@"Fehler beim Einreihen: " + errMsg);
+                }
+            } catch(e) {
+                [self updateTaskWithIdentifier:taskId state:@"failed" message:@"Verarbeitungsfehler" progress:0];
+                alert(@"Fehler beim Parsen der Serverantwort: " + e.message);
+            }
+        }
+        else
+        {
+            var msg = error ? [error description] : @"Verbindungsfehler";
+            [self updateTaskWithIdentifier:taskId state:@"failed" message:@"Verbindungsfehler" progress:0];
+            alert(@"Netzwerkfehler: " + msg);
+        }
+    }];
 }
 
 @end
