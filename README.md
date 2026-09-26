@@ -4,7 +4,7 @@ An integrated, full-stack environment for structured clinical trial eligibility 
 
 Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology extraction, normalization and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC** and **LOINC**, with SNOMED CT laterality qualifiers.
 
-> **Research prototype.** OntoTrial is not a medical device and must not be used for diagnostic or therapeutic decisions. Process patient data only in pseudonymized form and in accordance with your local data-protection and ethics requirements.
+> **Research prototype.** OntoTrial is not a medical device and must not be used for diagnostic or therapeutic decisions. Process patient data only in pseudonymized form and in accordance with your local data-protection and ethics requirements. Data leaving the institution should only be produced via the [anonymized export](#anonymized-export).
 
 <img width="2033" height="1022" alt="OntoTrial Candidates view" src="https://github.com/user-attachments/assets/421e4515-8eb7-4c70-9790-1d21a1f340d0" />
 <img width="1860" height="1028" alt="OntoTrial Phenotype Tree Browser" src="https://github.com/user-attachments/assets/f7c86a01-2ce4-4fbc-83fa-633d0b4c1e6d" />
@@ -21,6 +21,7 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 - [Ophthalmology engine](#ophthalmology-engine)
 - [Matching, time-to-eligibility and patient similarity](#matching-time-to-eligibility-and-patient-similarity)
 - [Feasibility chat assistant](#feasibility-chat-assistant)
+- [Anonymized export](#anonymized-export)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Keeping terminologies up to date](#keeping-terminologies-up-to-date)
@@ -47,6 +48,7 @@ Highlights added in recent versions:
 - **Multi-stage mapping quality control** – curated regex intercepts, LLM translation with cache, dense vector retrieval, LLM reranking of the top-k candidates in a "gray zone", lexical label gate and anatomy/scope guards (details [below](#extraction-and-mapping-pipeline)).
 - **Database-driven configuration** – LLM prompts, intercept rules and filter rules live in PostgreSQL and are reloaded every 30 seconds without a restart.
 - **Deep mode** – optional two-stage extraction with an unconstrained reasoning trace (pre-extraction table) followed by schema-constrained JSON sampling.
+- **Anonymized export** – de-identified phenopackets for data sharing: no free text, ephemeral subject IDs, month truncation with patient-constant date shift, age top-coding and hierarchical generalization of rare codes (k ≥ 5).
 - **Patient similarity** – eye-mirroring distance between phenopackets, nearest-neighbour search and greedy 1:n case-control matching with caliper.
 - **Catalog maintenance** – `update_catalogs.pl` for inventory, versioned imports with backups and post-import checks.
 - **Real-time progress** – every extraction step reports progress over the WebSocket channel.
@@ -169,6 +171,28 @@ A weighted, interpretable distance between two phenopackets in the range 0–1:
 Laterality mismatches are penalized, and the comparison is repeated with the second patient mirrored so that "right eye of A" can match "left eye of B". Missing blocks are ignored and reported as `coverage`. Weights, mirroring and exact matching on sex are configurable per request; `explain: true` returns the matched pairs.
 
 On top of this, OntoTrial offers k-nearest-neighbour search and greedy 1:ratio case-control matching with optional caliper, with or without replacement.
+
+---
+
+## Anonymized export
+
+`POST /BBB/export/anonymized_phenopackets` produces de-identified phenopackets for a cohort (selected by `tag` or `candidate_ids`), one per letter, following the project's data-protection impact assessment (DSFA) and technical anonymization concept. Nothing about the mapping between pseudonyms and export IDs is stored or logged.
+
+| Filter | Implementation |
+| :--- | :--- |
+| **1 – No free text** | Each phenopacket is rebuilt from a whitelist. Only validated codes with their canonical label from the terminology tables are exported; LLM `canonical_term` labels, verbatim modifiers, free-text units and unresolvable or obsolete codes are dropped. Laterality is limited to a fixed set of HPO/SNOMED codes. |
+| **2 – ID decoupling** | Random `subject-…` and `phenopacket-…` IDs from `/dev/urandom`, generated per export run. All letters of one patient share the subject ID within that run only; repeated exports cannot be linked. Output order is shuffled. |
+| **3 – Date shift** | Dates are truncated to `YYYY-MM` and shifted by a patient-constant Δm ∈ {−3, −2, −1, +1, +2, +3} months, so intervals are preserved. Year-only dates stay as they are; unparsable dates (e.g. `PAST-UK-UK`) are removed. |
+| **4 – Demographics & rare codes** | Age in full years, top-coded at 90 (`P90Y` = 90 or older). Rare codes are generalized along the hierarchy until every exported code is shared by at least k patients (ICD-10 down to 3 characters, OPS to 4, ATC to level 3, HPO via `isas`); rare LOINC assays are dropped. Negated findings are never generalized, only removed. |
+
+Request body: `{ "tag": "...", "candidate_ids": [...], "k": 5 }`. `k` can only be raised above 5. If the selection contains fewer than k patients, the request is rejected with HTTP 422. The response contains the phenopackets plus counts of suppressed, generalized and dropped elements.
+
+Limitations to keep in mind:
+
+- k-anonymity is enforced per individual code, not for the combination of all codes and measurements in a phenopacket. Rich phenotypes can remain unique.
+- The internal `candidates` table keeps pseudonyms, narrative reports and the raw phenopackets. For anyone with access to it, exported packets can be matched back via their content. Whether the export is anonymous for a recipient has to be assessed by data protection.
+- Exported timestamps (`YYYY-MM`) and the top-level `procedures` array follow the anonymization concept, not the strict Phenopacket v2 schema.
+- The endpoint, like the rest of the API, has no built-in authentication. Restrict access at the network or reverse-proxy level.
 
 ---
 
@@ -322,6 +346,7 @@ Recommended order:
 | GET | `/BBB/trials/:id/time_to_eligibility.csv` | Same as CSV; optional `?piz=a,b,c` |
 | POST | `/BBB/phenopacket_distance` | Distance between two candidates or phenopackets (`a`, `b`, `weights`, `mirror`, `exact`, `explain`) |
 | POST | `/BBB/phenopacket_distance/nearest` | k nearest neighbours of a candidate (`candidate_id`, `k`, `caliper`, `tag`) |
+| POST | `/BBB/export/anonymized_phenopackets` | De-identified phenopackets for a cohort (`tag` or `candidate_ids`, `k` ≥ 5) |
 | POST | `/BBB/propensity_match` | Greedy case-control matching (`treated_ids`/`treated_tag`, `control_ids`/`control_tag`, `ratio`, `caliper`, `replace`) |
 
 ### Cohort chat and candidates
@@ -344,6 +369,8 @@ Recommended order:
 | LOINC | `GET /BBB/loinc/roots` | `GET /BBB/loinc/children/:id` | `GET /BBB/loinc/search/:query` |
 
 Additionally: `GET /BBB/hpo/synonyms/:id`, `GET /BBB/hpo/xrefs/:id`.
+
+> **Security:** the API has no authentication and sends `Access-Control-Allow-Origin: *`. Generic table routes (`/BBB/:table`) and `/BBB/chat/execute_sql` can read narrative reports. Run the backend only in a protected network segment behind an authenticating reverse proxy.
 
 ### Live updates
 
