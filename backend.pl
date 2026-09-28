@@ -5,9 +5,7 @@
 
 # + FHIR Eye Normalization (Study Eye -> Right Eye, Fellow Eye -> Left Eye)
 # TODO: use a BERT model to validate idems after union ensemble (idea)
-# TODO: backport of event date (or use observed date) for PhenoViewer to work properly
 # TODO: support orphacodes
-# todo: intercepts->vectorstore zusätzlich
 
 use utf8;
 use Mojolicious::Lite;
@@ -3771,12 +3769,14 @@ helper extract_atomic_criteria_async => sub {
     $text =~ s/&nbsp;/ /g;
     $text =~ s/&amp;/&/g;
     $text =~ s/<\/?[a-zA-Z][^>]*>/ /g;
+    $text =~ s/([^\.\s])\s*\n(?=\s*\p{Lu})/$1. \n/g; # newline mit neuem absatz, ohne punkt->LLM fuegt das sonst zusammen.
 
     $text =~ s/\bRZA\b/Riesenzellarteriitis (RZA)/g;
     $text =~ s/\bAAION\b/Arteriitische anteriore ischämische Optikusneuropathie (AAION)/g;
     $text =~ s/\bNAION\b/Nicht-arteriitische anteriore ischämische Optikusneuropathie (NAION)/g;
     $text =~ s/\bPDR\b/Proliferative diabetische Retinopathie (PDR)/g;
     $text =~ s/\bNPDR\b/Nicht-proliferative diabetische Retinopathie (NPDR)/g;
+    $text =~ s/\b[CZ]PK\b/Zyklophotokoagulation (ZPK)/g;
 
     if ($mode eq 'phenopacket') {
         $mode_context = qq|
@@ -6257,85 +6257,250 @@ post '/BBB/extract_phenopacket_from_letter' => sub {
     });
 };
 
-# =========================================================
-# ENDPUNKT: ARZTBRIEF IMPORTIEREN & ASYNCHRON EXTRAHIEREN
-# =========================================================
+
+# =========================================================================
+# A) ENDPUNKT: ARZTBRIEF IMPORTIEREN & ASYNCHRON EXTRAHIEREN
+#
+# Payload (zusätzlich zu den bisherigen Feldern):
+#   source              'argos' (Default) | 'dwh' | ...  – Herkunft, Namensraum für doc_id
+#   mode                'hard' | 'soft'                  – Default: hard für argos, soft sonst
+#   date_tolerance_days 0..99 (Default ENV ONTOTRIAL_IMPORT_DATE_TOLERANCE_DAYS // 0)
+#   force               true: Text immer übernehmen und neu extrahieren
+#   dry_run             true: nur prüfen, nichts schreiben, nichts einreihen
+#   tags                optionaler Tag-String für neu angelegte Kandidaten
+#
+# hard: gleicher Brief (source + doc_id) -> aktualisieren, nur neu extrahieren,
+#       wenn sich der Text geändert hat. Liegt für PIZ + Tag bereits ein Brief
+#       einer ANDEREN Quelle vor (z. B. DWH-Kopie), wird diese Zeile übernommen
+#       ("adopted") statt einen zweiten Kandidaten anzulegen.
+# soft: ablehnen ("skipped"), wenn für PIZ + Tag (± Toleranz) schon irgendein
+#       Brief registriert ist, derselbe Brief schon da ist oder derselbe Text
+#       beim Patienten schon existiert. Überschreibt nie etwas.
+#
+# Antwort immer HTTP 200 mit status:
+#   queued | would_queue | skipped | unchanged | already_queued
+# Fehler: HTTP 4xx/5xx mit status 'rejected' bzw. 'error'.
+# =========================================================================
+my $import_date_tolerance = $ENV{ONTOTRIAL_IMPORT_DATE_TOLERANCE_DAYS} // 0;
+
+sub normalize_reference_day {
+    my ($d) = @_;
+    return undef unless defined $d && !ref $d && length $d;
+    return $1 if $d =~ /^\s*(\d{4}-\d{2}-\d{2})/;
+    return sprintf('%04d-%02d-%02d', $3, $2, $1) if $d =~ /^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\b/;
+    return undef;
+}
+
+helper extraction_pending => sub {
+    my ($c, $job_id) = @_;
+    return 0 unless $job_id;
+    my $job = eval { $c->minion->job($job_id) } or return 0;
+    return (($job->info->{state} // '') =~ /^(?:inactive|active)$/) ? 1 : 0;
+};
+
+helper enqueue_letter_extraction => sub {
+    my ($c, $cand, $model, $deep_mode) = @_;
+    # Live-Briefe aus argos vor dem Altbestand abarbeiten
+    my $priority = ($cand->{source} // '') eq 'argos' ? 0 : -5;
+    my $job_id = $c->minion->enqueue(import_and_extract_letter_task => [{
+        candidate_id   => $cand->{id},
+        pseudonym      => $cand->{pseudonym},
+        doc_id         => $cand->{doc_id},
+        text_content   => $cand->{text},
+        reference_date => $cand->{reference_date},
+        model          => $model,
+        deep_mode      => $deep_mode,
+    }] => { priority => $priority });
+    $c->pg->db->update('candidates', { extract_job_id => $job_id }, { id => $cand->{id} });
+    return $job_id;
+};
+
 post '/BBB/import_and_extract_letter' => sub {
     my $c = shift;
-    my $payload = $c->req->json // {};
+    my $p = $c->req->json // {};
 
-    my $pseudonym      = $payload->{pseudonym} // $payload->{piz};
-    my $doc_id         = $payload->{doc_id}    // $payload->{idbrief};
-    my $text_content   = $payload->{medical_report} // $payload->{medical_letter} // $payload->{text} // '';
-    my $reference_date = $payload->{reference_date} // POSIX::strftime("%Y-%m-%d", localtime);
-    my $selected_model = $payload->{model};
-    my $deep_mode      = $payload->{deep_mode} // 0;
+    my $pseudonym = $p->{pseudonym} // $p->{piz};
+    my $doc_id    = $p->{doc_id}    // $p->{idbrief};
+    my $text      = $p->{medical_report} // $p->{medical_letter} // $p->{text} // '';
+    my $source    = lc($p->{source} // 'argos');
+    my $mode      = lc($p->{mode}   // ($source eq 'argos' ? 'hard' : 'soft'));
+    my $ref_day   = normalize_reference_day($p->{reference_date});
+    my $tol       = $p->{date_tolerance_days} // $import_date_tolerance;
+    my $force     = to_bool($p->{force});
+    my $dry_run   = to_bool($p->{dry_run});
+    my $tags      = (defined $p->{tags} && !ref $p->{tags} && length $p->{tags}) ? $p->{tags} : undef;
+    my $model     = $p->{model};
+    my $deep_mode = $p->{deep_mode} // 0;
 
-    unless ($pseudonym && $text_content) {
-        return $c->render(json => {
-            error => "Pflichtfelder 'pseudonym' (oder 'piz') und 'medical_report' (oder 'text') fehlen."
-        }, status => 400);
-    }
+    return $c->render(json => { status => 'rejected',
+        error => "Pflichtfelder 'pseudonym' (oder 'piz') und 'medical_report' (oder 'text') fehlen." }, status => 400)
+    unless defined $pseudonym && length $pseudonym && length $text;
+    return $c->render(json => { status => 'rejected', error => "Ungültige Quelle '$source'." }, status => 400)
+    unless $source =~ /^[a-z0-9_]{1,20}$/;
+    return $c->render(json => { status => 'rejected', error => "Ungültiger Modus '$mode'." }, status => 400)
+    unless $mode =~ /^(?:hard|soft)$/;
+    return $c->render(json => { status => 'rejected',
+        error => "Soft-Push braucht ein gültiges 'reference_date' (JJJJ-MM-TT oder TT.MM.JJJJ)." }, status => 422)
+    if $mode eq 'soft' && !$ref_day;
+
+    $tol       = 0 unless defined $tol && $tol =~ /^\d{1,2}$/;
+    $ref_day //= POSIX::strftime('%Y-%m-%d', localtime);
+    $pseudonym = "$pseudonym";
+    $doc_id    = (defined $doc_id && length $doc_id) ? "$doc_id" : undef;
+    my $hash   = md5_hex(encode('UTF-8', $text));
 
     my $db = $c->pg->db;
+    my (%r, $enqueue_id);
 
-    # 1. Prüfung: Existiert GENAU DIESER Arztbrief (über doc_id) bereits?
-    my $existing = $doc_id
-        ? $db->select('candidates', ['id'], { doc_id => $doc_id })->hash
-        : undef;
+    eval {
+        my $tx = $db->begin;
 
-    my $candidate_id;
+        # argos- und DWH-Push laufen parallel: Importe desselben Patienten serialisieren
+        $db->query('SELECT pg_advisory_xact_lock(hashtext(?))', "ontotrial-import|$pseudonym");
 
-    if ($existing) {
-        $candidate_id = $existing->{id};
-        # Bestehenden Brief-Eintrag aktualisieren
-        $db->update('candidates', {
-            pseudonym        => $pseudonym,
-            narrative_report => $text_content,
-            phenopacket_json => undef,
-            reference_date   => $reference_date
-        }, { id => $candidate_id });
+        # 1. Derselbe Brief aus derselben Quelle
+        my $same = $doc_id ? $db->query(q{
+            SELECT id, doc_hash, (phenopacket_json IS NOT NULL) AS has_pp, extract_job_id,
+            to_char(public.ontotrial_ref_day(reference_date::text), 'YYYY-MM-DD') AS day
+            FROM candidates
+            WHERE doc_source = ? AND doc_id::text = ?
+            ORDER BY id LIMIT 1
+        }, $source, $doc_id)->hash : undef;
+        my $self_id = $same ? $same->{id} : 0;
 
-        $c->app->log->info("Brief Doc-ID '$doc_id' (PIZ $pseudonym, ID: $candidate_id) existierte bereits - Inhalt wird neu extrahiert.");
-    } else {
-        # Neuen Arztbrief-Datensatz anlegen
-        $candidate_id = $db->insert('candidates', {
-            pseudonym        => $pseudonym,
-            doc_id           => $doc_id,
-            narrative_report => $text_content,
-            reference_date   => $reference_date,
-            phenopacket_json => undef
-        }, { returning => 'id' })->hash->{id};
+        # 2. Irgendein anderer Brief desselben Patienten am selben Tag (± Toleranz)
+        my $same_day = $db->query(q{
+            SELECT id, doc_source, doc_id::text AS doc_id,
+            to_char(public.ontotrial_ref_day(reference_date::text), 'YYYY-MM-DD') AS day
+            FROM candidates
+            WHERE pseudonym = ?
+            AND id <> ?
+            AND public.ontotrial_ref_day(reference_date::text) BETWEEN ?::date - ?::int AND ?::date + ?::int
+            ORDER BY (doc_source = 'argos') DESC,
+            abs(public.ontotrial_ref_day(reference_date::text) - ?::date), id
+            LIMIT 1
+        }, $pseudonym, $self_id, $ref_day, $tol, $ref_day, $tol, $ref_day)->hash;
 
-        $c->app->log->info("Neuer Brief für PIZ '$pseudonym' angelegt (Doc-ID: $doc_id, ID: $candidate_id).");
+        # 3. Identischer Text beim selben Patienten (anderes Datum, andere ID)
+        my $same_text = $db->query(q{
+            SELECT id, doc_source, doc_id::text AS doc_id
+            FROM candidates
+            WHERE pseudonym = ? AND doc_hash = ? AND id <> ?
+            ORDER BY id LIMIT 1
+        }, $pseudonym, $hash, $self_id)->hash;
+
+        my $conflict = sub {
+            my $x = shift;
+            return { candidate_id => $x->{id}, source => $x->{doc_source}, doc_id => $x->{doc_id},
+                (defined $x->{day} ? (reference_date => $x->{day}) : ()) };
+        };
+        my %row = (narrative_report => $text, doc_hash => $hash,
+        reference_date => $ref_day, phenopacket_json => undef);
+
+        if ($same) {
+            # Gleicher Text UND gleiches Datum: nichts zu tun. Ein geändertes Datum
+            # verschiebt relative Zeitangaben und reference_date im Phenopacket -> neu extrahieren.
+            if (!$force && ($same->{doc_hash} // '') eq $hash && ($same->{day} // '') eq $ref_day) {
+                if ($same->{has_pp}) {
+                    %r = (status => 'unchanged', candidate_id => $same->{id});
+                } elsif ($c->extraction_pending($same->{extract_job_id})) {
+                    %r = (status => 'already_queued', candidate_id => $same->{id});
+                } else {
+                    # Text gleich, aber (noch) kein Phenopacket und kein laufender Job
+                    %r = (status => 'queued', action => 'requeued', candidate_id => $same->{id});
+                    $enqueue_id = $same->{id};
+                }
+            } elsif ($mode eq 'soft' && !$force) {
+                %r = (status => 'skipped', reason => 'same_doc', candidate_id => $same->{id});
+            } else {
+                $db->update('candidates', { %row, pseudonym => $pseudonym }, { id => $same->{id} });
+                %r = (status => 'queued', action => 'updated', candidate_id => $same->{id});
+                $enqueue_id = $same->{id};
+            }
+        }
+        elsif ($mode eq 'soft' && $same_day) {
+            %r = (status => 'skipped', reason => 'same_day', conflict => $conflict->($same_day));
+        }
+        elsif ($mode eq 'soft' && $same_text) {
+            %r = (status => 'skipped', reason => 'same_text', conflict => $conflict->($same_text));
+        }
+        else {
+            # hard: eine Kopie aus einer anderen (nicht manuellen) Quelle am selben Tag übernehmen
+            my $adopt = $mode eq 'hard' ? $db->query(q{
+                SELECT id, doc_source, doc_id::text AS doc_id
+                FROM candidates
+                WHERE pseudonym = ?
+                AND doc_source NOT IN (?, 'manual')
+                AND public.ontotrial_ref_day(reference_date::text) BETWEEN ?::date - ?::int AND ?::date + ?::int
+                ORDER BY abs(public.ontotrial_ref_day(reference_date::text) - ?::date), id
+                LIMIT 1
+            }, $pseudonym, $source, $ref_day, $tol, $ref_day, $tol, $ref_day)->hash : undef;
+
+            if ($adopt) {
+                $db->update('candidates',
+                { %row, doc_source => $source, doc_id => $doc_id, pseudonym => $pseudonym },
+                { id => $adopt->{id} });
+                %r = (status => 'queued', action => 'adopted', candidate_id => $adopt->{id},
+                replaced => { source => $adopt->{doc_source}, doc_id => $adopt->{doc_id} });
+                $enqueue_id = $adopt->{id};
+            } else {
+                my $id = $db->insert('candidates', {
+                    %row,
+                    pseudonym  => $pseudonym,
+                    doc_id     => $doc_id,
+                    doc_source => $source,
+                    ($tags ? (tags => $tags) : ()),
+                }, { returning => 'id' })->hash->{id};
+                %r = (status => 'queued', action => 'created', candidate_id => $id);
+                $enqueue_id = $id;
+            }
+        }
+
+        if ($dry_run) {
+            undef $tx;    # Rollback
+            $r{dry_run} = Mojo::JSON->true;
+            $r{status}  = 'would_queue' if $r{status} eq 'queued';
+            delete $r{candidate_id} if ($r{action} // '') eq 'created';
+            $enqueue_id = undef;
+        } else {
+            $tx->commit;
+        }
+        1;
+    } or do {
+        my $err = $@ || 'unbekannter Fehler';
+        $c->app->log->error("[IMPORT ERROR] $source:" . ($doc_id // '-') . " (PIZ $pseudonym): $err");
+        return $c->render(json => { status => 'error', error => "$err" }, status => 500);
+    };
+
+    if ($enqueue_id) {
+        $r{job_id} = $c->enqueue_letter_extraction({
+            id => $enqueue_id, pseudonym => $pseudonym, doc_id => $doc_id, source => $source,
+            text => $text, reference_date => $ref_day,
+        }, $model, $deep_mode);
     }
 
-    # 2. Minion-Task für Hintergrund-Extraktion einreihen
-    my $job_id = $c->minion->enqueue(import_and_extract_letter_task => [{
-        candidate_id   => $candidate_id,
+    my $log_msg = sprintf("[IMPORT %s] %s:%s PIZ %s %s -> %s%s%s",
+    uc($mode), $source, $doc_id // '-', $pseudonym, $ref_day, $r{status},
+    ($r{action} ? " ($r{action})" : ''), ($r{reason} ? " ($r{reason})" : ''));
+    $r{status} eq 'skipped' ? $c->app->log->debug($log_msg) : $c->app->log->info($log_msg);
+
+    $c->render(json => {
+        %r,
         pseudonym      => $pseudonym,
         doc_id         => $doc_id,
-        text_content   => $text_content,
-        reference_date => $reference_date,
-        model          => $selected_model,
-        deep_mode      => $deep_mode
-    }]);
-
-    # Sofortige Rückmeldung mit Job-ID
-    $c->render(json => {
-        status       => 'queued',
-        job_id       => $job_id,
-        candidate_id => $candidate_id,
-        pseudonym    => $pseudonym,
-        doc_id       => $doc_id,
-        action       => $existing ? 'updated' : 'created',
-        message      => sprintf("Arztbrief %s (PIZ %s) zur Extraktion im Hintergrund eingereiht.", $doc_id // $candidate_id, $pseudonym)
+        source         => $source,
+        reference_date => $ref_day,
+        message        => sprintf("Arztbrief %s:%s (PIZ %s, %s): %s", $source, $doc_id // '-', $pseudonym, $ref_day, $r{status}),
     });
 };
 
-# =========================================================
-# MINION TASK: ASYNCHRONE ARZTBRIEF-EXTRAKTION (PHENOPACKET)
-# =========================================================
+# =========================================================================
+# B) MINION TASK: ASYNCHRONE ARZTBRIEF-EXTRAKTION (PHENOPACKET)
+#    Neu: Job wird übersprungen bzw. sein Ergebnis verworfen, wenn der
+#    Brieftext des Kandidaten inzwischen ersetzt wurde (z. B. DWH-Kopie
+#    durch argos-Original übernommen). Verhindert, dass ein älterer Job
+#    das Phenopacket des neueren überschreibt.
+# =========================================================================
 app->minion->add_task(import_and_extract_letter_task => sub {
     my ($job, $payload) = @_;
     my $app = $job->app;
@@ -6343,23 +6508,37 @@ app->minion->add_task(import_and_extract_letter_task => sub {
 
     my $candidate_id   = $payload->{candidate_id};
     my $pseudonym      = $payload->{pseudonym};
-    my $text_content   = $payload->{text_content};
+    my $text_content   = $payload->{text_content} // '';
     my $selected_model = $payload->{model};
     my $reference_date = $payload->{reference_date};
     my $deep_mode      = $payload->{deep_mode} // 0;
     my $task_id        = "minion_$candidate_id";
 
+    my $my_hash    = md5_hex(encode('UTF-8', $text_content));
+    my $is_current = sub {
+        my $row = $db->query('SELECT md5(narrative_report) AS h FROM candidates WHERE id = ?', $candidate_id)->hash;
+        return ($row && defined $row->{h} && $row->{h} eq $my_hash) ? 1 : 0;
+    };
+
+    unless ($is_current->()) {
+        $app->log->info("[MINION TASK] Candidate $candidate_id: Brieftext wurde ersetzt oder gelöscht – Job übersprungen.");
+        return $job->finish('superseded');
+    }
+
     $job->note(status => 'processing', message => "Starte Extraktion für Pseudonym $pseudonym...", progress => 10);
 
-    # Führe Phenopacket-Extraktionspipeline aus
     $app->generate_phenopacket_impl($text_content, $selected_model, $candidate_id, $reference_date, $deep_mode, $task_id)->then(sub {
         my $phenopacket = shift;
 
-        # Extrahiertes Phenopacket in der Datenbank speichern
+        unless ($is_current->()) {
+            $app->log->info("[MINION TASK] Candidate $candidate_id: Brieftext wurde während der Extraktion ersetzt – Ergebnis verworfen.");
+            return $job->finish('superseded');
+        }
+
         $db->update('candidates', {
-            phenopacket_json => to_json($phenopacket),
-                    narrative_report   => $text_content
-        }, { id => $candidate_id });
+                                        phenopacket_json => to_json($phenopacket),
+                                        narrative_report => $text_content
+                                  }, { id => $candidate_id });
 
         $app->log->info("[MINION TASK] Extraktion für Candidate ID $candidate_id ($pseudonym) erfolgreich abgeschlossen.");
         $job->note(status => 'finished', message => "Extraktion für $pseudonym abgeschlossen.", progress => 100);
@@ -6368,7 +6547,7 @@ app->minion->add_task(import_and_extract_letter_task => sub {
         my $err = shift;
         $app->log->error("[MINION TASK FEHLER] Extraktion für Candidate ID $candidate_id fehlgeschlagen: $err");
         $job->fail("Extraktionsfehler: $err");
-    })->wait; # ->wait stellt sicher, dass das Promise innerhalb des Minion-Workers abgewartet wird
+    })->wait;
 });
 
 # =========================================================================
@@ -8837,6 +9016,24 @@ post '/BBB/propensity_match' => sub {
     });
 };
 
+get '/BBB/candidates/count_by_tag' => sub {
+    my $c   = shift;
+    my $tag = $c->param('tag') // '';
+    $tag =~ s/^\s+|\s+$//g;
+    return $c->render(json => { success => 0, error => "Parameter 'tag' ist erforderlich." }, status => 400)
+        unless length $tag;
+
+    my $row = eval {
+        $c->pg->db->query(q{
+            SELECT count(*) AS n FROM candidates
+             WHERE (tags ILIKE ? OR tags ILIKE ? OR tags ILIKE ? OR tags = ?)
+               AND narrative_report IS NOT NULL
+               AND TRIM(narrative_report) <> ''
+        }, "%$tag,%", "%, $tag%", "%$tag", $tag)->hash;
+    };
+    return $c->render(json => { success => 0, error => 'Datenbankfehler' }, status => 500) unless $row;
+    $c->render(json => { success => 1, tag => $tag, count => $row->{n} + 0 });
+};
 
 # =========================================================
 # GENERIC DB REST CRUD ENDPOINTS (MIT 1/1-SICHERUNG)
