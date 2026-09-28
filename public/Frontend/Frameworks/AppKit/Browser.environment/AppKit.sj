@@ -42242,7 +42242,7 @@ var meta_class = the_class.isa;class_addMethods(the_class, [new objj_method(sel_
 
 ,["void","CPCoder"])]);
 }
-p;13;CPTextField.jt;132988;@STATIC;1.0;i;11;CPControl.ji;17;CPStringDrawing.ji;17;CPCompatibility.ji;8;CPText.ji;20;CPWindow_Constants.ji;21;_CPImageAndTextView.jt;132844;objj_executeFile("CPControl.j", YES);objj_executeFile("CPStringDrawing.j", YES);objj_executeFile("CPCompatibility.j", YES);objj_executeFile("CPText.j", YES);objj_executeFile("CPWindow_Constants.j", YES);objj_executeFile("_CPImageAndTextView.j", YES);{var the_protocol = objj_allocateProtocol("CPTextFieldDelegate");
+p;13;CPTextField.jt;134622;@STATIC;1.0;i;11;CPControl.ji;17;CPStringDrawing.ji;17;CPCompatibility.ji;8;CPText.ji;20;CPWindow_Constants.ji;21;_CPImageAndTextView.jt;134478;objj_executeFile("CPControl.j", YES);objj_executeFile("CPStringDrawing.j", YES);objj_executeFile("CPCompatibility.j", YES);objj_executeFile("CPText.j", YES);objj_executeFile("CPWindow_Constants.j", YES);objj_executeFile("_CPImageAndTextView.j", YES);{var the_protocol = objj_allocateProtocol("CPTextFieldDelegate");
 var aProtocol = objj_getProtocol("CPControlTextEditingDelegate");
 if (!aProtocol) throw new SyntaxError("*** Could not find definition for protocol \"CPTextFieldDelegate\"");
 protocol_addProtocol(the_protocol, aProtocol);
@@ -42296,6 +42296,20 @@ CPTextFieldHandleBlur = function(anEvent, ownerRef)
     (ownerRef)(nil);
     ((___r1 = (CPRunLoop.isa.method_msgSend["currentRunLoop"] || _objj_forward)(CPRunLoop, "currentRunLoop")), ___r1 == null ? ___r1 : (___r1.isa.method_msgSend["limitDateForMode:"] || _objj_forward)(___r1, "limitDateForMode:", CPDefaultRunLoopMode));
     var ___r1;
+}
+_CPTextFieldDetachInputElement = function(anElement)
+{
+    if (!anElement || !anElement.parentNode)
+        return;
+    var wasResigning = CPTextFieldInputResigning;
+    CPTextFieldInputResigning = YES;
+    try {
+        anElement.parentNode.removeChild(anElement);
+    }
+    catch(e) {
+    }
+    CPTextFieldInputResigning = wasResigning;
+    CPTextFieldInputDidBlur = NO;
 }
 {
 var the_class = objj_getClass("CPString")
@@ -42578,7 +42592,31 @@ class_addMethods(the_class, [new objj_method(sel_getUid("setControlSize:"), func
     (self.isa.method_msgSend["_setCSSStyleForInputElement"] || _objj_forward)(self, "_setCSSStyleForInputElement");
     var element = (self.isa.method_msgSend["_inputElement"] || _objj_forward)(self, "_inputElement");
     element.value = self._stringValue;
-    self._DOMElement.appendChild(element);
+    if (element.parentNode !== self._DOMElement)
+    {
+        var previousOwner = CPTextFieldInputOwner;
+        _CPTextFieldDetachInputElement(element);
+        try {
+            self._DOMElement.appendChild(element);
+        }
+        catch(e) {
+            _CPTextFieldDetachInputElement(element);
+            try {
+                self._DOMElement.appendChild(element);
+            }
+            catch(e2) {
+                (self.isa.method_msgSend["unsetThemeState:"] || _objj_forward)(self, "unsetThemeState:", CPThemeStateEditing);
+                (self.isa.method_msgSend["_updatePlaceholderState"] || _objj_forward)(self, "_updatePlaceholderState");
+                (self.isa.method_msgSend["setNeedsLayout"] || _objj_forward)(self, "setNeedsLayout");
+                return NO;
+            }
+        }
+        if (previousOwner && previousOwner !== self)
+        {
+            (previousOwner == null ? previousOwner : (previousOwner.isa.method_msgSend["unsetThemeState:"] || _objj_forward)(previousOwner, "unsetThemeState:", CPThemeStateEditing));
+            (previousOwner == null ? previousOwner : (previousOwner.isa.method_msgSend["setNeedsLayout"] || _objj_forward)(previousOwner, "setNeedsLayout"));
+        }
+    }
     CPTextFieldInputIsActive = YES;
     if (document.attachEvent)
     {
@@ -42742,7 +42780,13 @@ default:
     if (!CPTextFieldInputDidBlur)
         CPTextFieldBlurHandler();
     if (element.parentNode == self._DOMElement)
-        element.parentNode.removeChild(element);
+    {
+        try {
+            element.parentNode.removeChild(element);
+        }
+        catch(e) {
+        }
+    }
     CPTextFieldInputDidBlur = NO;
     CPTextFieldInputResigning = NO;
     CPTextFieldInputIsActive = NO;
@@ -85051,7 +85095,7 @@ CPMenuWindowShadowStyle = 1;
 CPPanelWindowShadowStyle = 2;
 CPCustomWindowShadowStyle = 3;
 CPWindowConstrainToScreen = YES;
-p;12;CPPlatform.jt;8521;@STATIC;1.0;I;21;Foundation/CPObject.jt;8476;objj_executeFile("Foundation/CPObject.j", NO);
+p;12;CPPlatform.jt;8847;@STATIC;1.0;I;21;Foundation/CPObject.jt;8802;objj_executeFile("Foundation/CPObject.j", NO);
 {var the_class = objj_allocateClassPair(CPObject, "CPBasePlatform"),
 meta_class = the_class.isa;objj_registerClassPair(the_class);
 class_addMethods(meta_class, [new objj_method(sel_getUid("bootstrap"), function $CPBasePlatform__bootstrap(self, _cmd)
@@ -85122,11 +85166,21 @@ class_addMethods(meta_class, [new objj_method(sel_getUid("initialize"), function
             if ((CPApp == null ? CPApp : (CPApp.isa.method_msgSend["_sendDelegateApplicationShouldTerminate"] || _objj_forward)(CPApp, "_sendDelegateApplicationShouldTerminate")) != CPTerminateNow)
                 return (CPApp == null ? CPApp : (CPApp.isa.method_msgSend["_sendDelegateApplicationShouldTerminateMessage"] || _objj_forward)(CPApp, "_sendDelegateApplicationShouldTerminateMessage"));
         };
-        window.onunload =         function()
+        var terminateApplication =         function()
         {
             (self.isa.method_msgSend["closeAllPlatformWindows"] || _objj_forward)(self, "closeAllPlatformWindows");
             (CPApp == null ? CPApp : (CPApp.isa.method_msgSend["terminate:"] || _objj_forward)(CPApp, "terminate:", nil));
         };
+        if ("onpagehide" in window)
+        {
+            window.addEventListener("pagehide",             function(anEvent)
+            {
+                if (!anEvent.persisted)
+                    terminateApplication();
+            }, NO);
+        }
+        else
+            window.onunload = terminateApplication;
     }
 }
 
@@ -85690,7 +85744,7 @@ class_addMethods(the_class, [new objj_method(sel_getUid("initWithLevel:"), funct
 
 ,["void","CPWindow"])]);
 }
-p;22;CPPlatformPasteboard.jt;24508;@STATIC;1.0;I;21;Foundation/CPObject.jI;22;Foundation/CPRunLoop.ji;17;CPCompatibility.ji;9;CPEvent.ji;14;CPPasteboard.ji;12;CPPlatform.ji;26;CPPlatformWindow+DOMKeys.jt;24333;objj_executeFile("Foundation/CPObject.j", NO);objj_executeFile("Foundation/CPRunLoop.j", NO);objj_executeFile("CPCompatibility.j", YES);objj_executeFile("CPEvent.j", YES);objj_executeFile("CPPasteboard.j", YES);objj_executeFile("CPPlatform.j", YES);objj_executeFile("CPPlatformWindow+DOMKeys.j", YES);var hasEditableTarget = function(aDOMEvent)
+p;22;CPPlatformPasteboard.jt;24275;@STATIC;1.0;I;21;Foundation/CPObject.jI;22;Foundation/CPRunLoop.ji;17;CPCompatibility.ji;9;CPEvent.ji;14;CPPasteboard.ji;12;CPPlatform.ji;26;CPPlatformWindow+DOMKeys.jt;24100;objj_executeFile("Foundation/CPObject.j", NO);objj_executeFile("Foundation/CPRunLoop.j", NO);objj_executeFile("CPCompatibility.j", YES);objj_executeFile("CPEvent.j", YES);objj_executeFile("CPPasteboard.j", YES);objj_executeFile("CPPlatform.j", YES);objj_executeFile("CPPlatformWindow+DOMKeys.j", YES);var hasEditableTarget = function(aDOMEvent)
 {
     var target = aDOMEvent.target || aDOMEvent.srcElement;
     if (!target)
@@ -85702,7 +85756,7 @@ p;22;CPPlatformPasteboard.jt;24508;@STATIC;1.0;I;21;Foundation/CPObject.jI;22;Fo
 };
 
 {var the_class = objj_allocateClassPair(CPObject, "CPPlatformPasteboard"),
-meta_class = the_class.isa;class_addIvars(the_class, [new objj_ivar("_DOMWindow", "DOMWindow"), new objj_ivar("_DOMPasteboardElement", "DOMElement"), new objj_ivar("supportsNativeCopyAndPaste", "BOOL"), new objj_ivar("hasBugWhichPreventsNonEditablePaste", "BOOL"), new objj_ivar("hasBugWhichPreventsNonEditablePasteRedirect", "BOOL"), new objj_ivar("currentEventIsNativePasteEvent", "BOOL"), new objj_ivar("currentEventIsNativeCopyOrCutEvent", "BOOL"), new objj_ivar("currentEventShouldBeSuppressed", "BOOL"), new objj_ivar("currentEventShouldDefinitelyBubble", "BOOL"), new objj_ivar("currentEventShouldDefinitelyNotBubble", "BOOL"), new objj_ivar("_ignoreNativeCopyOrCutEvent", "BOOL"), new objj_ivar("_ignoreNativePastePreparation", "BOOL")]);objj_registerClassPair(the_class);
+meta_class = the_class.isa;class_addIvars(the_class, [new objj_ivar("_DOMWindow", "DOMWindow"), new objj_ivar("_DOMPasteboardElement", "DOMElement"), new objj_ivar("supportsNativeCopyAndPaste", "BOOL"), new objj_ivar("hasBugWhichPreventsNonEditablePaste", "BOOL"), new objj_ivar("hasBugWhichPreventsNonEditablePasteRedirect", "BOOL"), new objj_ivar("currentEventIsNativePasteEvent", "BOOL"), new objj_ivar("currentEventIsNativeCopyOrCutEvent", "BOOL"), new objj_ivar("currentEventShouldBeSuppressed", "BOOL"), new objj_ivar("currentEventShouldDefinitelyBubble", "BOOL"), new objj_ivar("currentEventShouldDefinitelyNotBubble", "BOOL"), new objj_ivar("_ignoreNativeCopyOrCutEvent", "BOOL"), new objj_ivar("_ignoreNativePastePreparation", "BOOL"), new objj_ivar("_clipboardListeners", "JSObject")]);objj_registerClassPair(the_class);
 class_addMethods(the_class, [new objj_method(sel_getUid("init"), function $CPPlatformPasteboard__init(self, _cmd)
 {
     if (self = (objj_getClass("CPPlatformPasteboard").super_class.method_dtable["init"] || _objj_forward)(self, "init"))
@@ -85760,36 +85814,18 @@ class_addMethods(the_class, [new objj_method(sel_getUid("init"), function $CPPla
     {
         if (self.supportsNativeCopyAndPaste)
         {
-            self._DOMWindow.addEventListener("beforecopy", nativeBeforeClipboardEventCallback, NO);
-            self._DOMWindow.addEventListener("beforecut", nativeBeforeClipboardEventCallback, NO);
-            self._DOMWindow.addEventListener("beforepaste", nativeBeforeClipboardEventCallback, NO);
-            self._DOMWindow.addEventListener("copy", nativeCopyOrCutEventCallback, NO);
-            self._DOMWindow.addEventListener("cut", nativeCopyOrCutEventCallback, NO);
-            self._DOMWindow.addEventListener("paste", nativePasteEventCallback, NO);
+            self._clipboardListeners = [[self._DOMWindow, "beforecopy", nativeBeforeClipboardEventCallback], [self._DOMWindow, "beforecut", nativeBeforeClipboardEventCallback], [self._DOMWindow, "beforepaste", nativeBeforeClipboardEventCallback], [self._DOMWindow, "copy", nativeCopyOrCutEventCallback], [self._DOMWindow, "cut", nativeCopyOrCutEventCallback], [self._DOMWindow, "paste", nativePasteEventCallback]];
         }
         else
         {
-            theDocument.addEventListener("beforepaste", pasteEventCallback, NO);
-            theDocument.addEventListener("beforecopy", copyEventCallback, NO);
-            theDocument.addEventListener("beforecut", copyEventCallback, NO);
+            self._clipboardListeners = [[theDocument, "beforepaste", pasteEventCallback], [theDocument, "beforecopy", copyEventCallback], [theDocument, "beforecut", copyEventCallback]];
         }
-        self._DOMWindow.addEventListener("unload",         function()
+        for (var i = 0; i < self._clipboardListeners.length; i++)
+            self._clipboardListeners[i][0].addEventListener(self._clipboardListeners[i][1], self._clipboardListeners[i][2], NO);
+        self._DOMWindow.addEventListener("pagehide",         function(anEvent)
         {
-            if (self.supportsNativeCopyAndPaste)
-            {
-                self._DOMWindow.removeEventListener("beforecopy", nativeBeforeClipboardEventCallback, NO);
-                self._DOMWindow.removeEventListener("beforecut", nativeBeforeClipboardEventCallback, NO);
-                self._DOMWindow.removeEventListener("beforepaste", nativeBeforeClipboardEventCallback, NO);
-                self._DOMWindow.removeEventListener("copy", nativeCopyOrCutEventCallback, NO);
-                self._DOMWindow.removeEventListener("cut", nativeCopyOrCutEventCallback, NO);
-                self._DOMWindow.removeEventListener("paste", nativePasteEventCallback, NO);
-            }
-            else
-            {
-                theDocument.removeEventListener("beforepaste", pasteEventCallback, NO);
-                theDocument.removeEventListener("beforecopy", copyEventCallback, NO);
-                theDocument.removeEventListener("beforecut", copyEventCallback, NO);
-            }
+            if (!anEvent.persisted)
+                (self.isa.method_msgSend["_removeClipboardListeners"] || _objj_forward)(self, "_removeClipboardListeners");
         }, NO);
     }
     else
@@ -85799,10 +85835,20 @@ class_addMethods(the_class, [new objj_method(sel_getUid("init"), function $CPPla
 
 ,["void"]), new objj_method(sel_getUid("destroyDOMElements"), function $CPPlatformPasteboard__destroyDOMElements(self, _cmd)
 {
+    (self.isa.method_msgSend["_removeClipboardListeners"] || _objj_forward)(self, "_removeClipboardListeners");
     var theDocument = self._DOMWindow.document,
         _DOMBodyElement = theDocument.getElementById("cappuccino-body") || theDocument.body;
     _DOMBodyElement.removeChild(self._DOMPasteboardElement);
     self._DOMPasteboardElement = nil;
+}
+
+,["void"]), new objj_method(sel_getUid("_removeClipboardListeners"), function $CPPlatformPasteboard___removeClipboardListeners(self, _cmd)
+{
+    if (!self._clipboardListeners)
+        return;
+    for (var i = 0; i < self._clipboardListeners.length; i++)
+        self._clipboardListeners[i][0].removeEventListener(self._clipboardListeners[i][1], self._clipboardListeners[i][2], NO);
+    self._clipboardListeners = nil;
 }
 
 ,["void"]), new objj_method(sel_getUid("windowMaySendKeyEvent:"), function $CPPlatformPasteboard__windowMaySendKeyEvent_(self, _cmd, anEvent)
