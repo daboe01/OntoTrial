@@ -3,6 +3,8 @@
  * Werkzeuge im Aktionsmenü der Candidates-ButtonBar:
  *   - Anonymisierter Export      -> POST /BBB/export/anonymized_phenopackets
  *   - Propensity Matching        -> POST /BBB/propensity_match
+ *   - Kandidaten neu extrahieren -> GET  /BBB/candidates/count_by_tag
+ *                                   POST /BBB/candidates/recompute_by_tag
  *
  * Aufruf aus AppController.j über showAnonymizedExportAction: und
  * showPropensityMatchingAction: (siehe dort).
@@ -65,6 +67,25 @@ function OTPostJSON(url, payload, timeout, callback)
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [request setHTTPBody:JSON.stringify(payload)];
 
+    [CPURLConnection sendAsynchronousRequest:request
+                                       queue:[CPOperationQueue mainQueue]
+                           completionHandler:function(response, data, error)
+    {
+        var res = null;
+        if (!error && data)
+        {
+            try { res = (typeof data === "string") ? JSON.parse(data) : data; }
+            catch (e) { res = null; }
+        }
+        callback(res, error);
+    }];
+}
+
+function OTGetJSON(url, timeout, callback)
+{
+    var request = [CPURLRequest requestWithURL:url
+                                   cachePolicy:CPURLRequestUseProtocolCachePolicy
+                               timeoutInterval:timeout];
     [CPURLConnection sendAsynchronousRequest:request
                                        queue:[CPOperationQueue mainQueue]
                            completionHandler:function(response, data, error)
@@ -154,6 +175,17 @@ function OTCheckBox(frame, title, isOn)
     id              _psmRows;
     id              _psmResult;
     CPTextField     _psmTagOutField;
+
+    // Neu-Extraktion nach Tag
+    CPWindow        _recWindow;
+    CPComboBox      _recTagCombo;
+    CPPopUpButton   _recModelPopUp;
+    CPCheckBox      _recDeepModeBox;
+    CPTextField     _recCountLabel;
+    CPTextField     _recStatusLabel;
+    CPButton        _recRunButton;
+    int             _recCount;
+    CPString        _recCountTag;
 }
 
 + (ToolsController)sharedController
@@ -580,6 +612,210 @@ function OTCheckBox(frame, title, isOn)
     }
     OTDownload("psm_" + OTSafeName([_psmTreatedTagField stringValue]) + "_" + OTYearMonth() + ".csv",
                "\uFEFF" + lines.join("\n") + "\n", "text/csv;charset=utf-8");
+}
+
+// ================================================================================
+// KANDIDATEN NACH TAG NEU EXTRAHIEREN
+// ================================================================================
+
+- (void)showRecomputeByTag:(id)sender
+{
+    if (!_recWindow)
+        [self _buildRecomputeWindow];
+
+    [_recTagCombo removeAllItems];
+    [_recTagCombo addItemsWithObjectValues:[self _knownTags]];
+
+    var model = [_app selectedModel] || "gpt-oss-120b";
+    if ([_recModelPopUp indexOfItemWithTitle:model] === -1)
+        [_recModelPopUp addItemWithTitle:model];
+    [_recModelPopUp selectItemWithTitle:model];
+    [_recDeepModeBox setState:([_app deepModeEnabled] ? CPOnState : CPOffState)];
+
+    [_recStatusLabel setStringValue:@""];
+    [self _recomputeTagDidChange];
+
+    [_recWindow center];
+    [_recWindow makeKeyAndOrderFront:self];
+    [_recWindow makeFirstResponder:_recTagCombo];
+}
+
+- (void)_buildRecomputeWindow
+{
+    _recWindow = [[CPWindow alloc] initWithContentRect:CGRectMake(0, 0, 460, 300)
+                                             styleMask:CPTitledWindowMask | CPClosableWindowMask];
+    [_recWindow setTitle:@"Kandidaten neu extrahieren"];
+    var cv = [_recWindow contentView];
+
+    [cv addSubview:OTLabel(CGRectMake(20, 15, 420, 18), "Tag der Kandidaten:", YES)];
+    _recTagCombo = [[CPComboBox alloc] initWithFrame:CGRectMake(20, 36, 420, 29)];
+    [_recTagCombo setEditable:YES];
+    [_recTagCombo setCompletes:YES];
+    [_recTagCombo setPlaceholderString:@"Tag wählen oder eingeben…"];
+    [_recTagCombo setDelegate:self];
+    [_recTagCombo setTarget:self];
+    [_recTagCombo setAction:@selector(_recomputeTagDidChange)];
+    [cv addSubview:_recTagCombo];
+
+    [cv addSubview:OTLabel(CGRectMake(20, 80, 60, 18), "Modell:", NO)];
+    _recModelPopUp = [[CPPopUpButton alloc] initWithFrame:CGRectMake(80, 75, 220, 26) pullsDown:NO];
+    [_recModelPopUp addItemsWithTitles:["gpt-oss-120b", "gemma4:26b-mlx", "gemma4:31b-mlx", "qwen3.6:35b-mlx",
+                                        "muse-glimmer:30b-mlx", "qwen3.8:27b-mlx", "nemotron-3.5-lightning:30b-mlx"]];
+    [cv addSubview:_recModelPopUp];
+
+    _recDeepModeBox = OTCheckBox(CGRectMake(320, 79, 120, 20), "Deep Mode", NO);
+    [cv addSubview:_recDeepModeBox];
+
+    _recCountLabel = OTLabel(CGRectMake(20, 116, 420, 18), "Betroffene Kandidaten: –", YES);
+    [cv addSubview:_recCountLabel];
+
+    var note = "Alle Kandidaten mit diesem Tag und vorhandenem Arztbrief werden in die Minion-Queue eingereiht. "
+             + "Ihre bisherigen Phenopackets werden überschrieben; Matches danach neu berechnen.";
+    [cv addSubview:OTLabel(CGRectMake(20, 140, 420, 48), note, NO)];
+
+    _recStatusLabel = OTLabel(CGRectMake(20, 194, 420, 40), "", NO);
+    [_recStatusLabel setTextColor:[CPColor colorWithCalibratedRed:0.0 green:0.4 blue:0.8 alpha:1.0]];
+    [cv addSubview:_recStatusLabel];
+
+    [cv addSubview:OTButton(CGRectMake(150, 252, 100, 26), "Schließen", self, @selector(closeRecomputeWindow:))];
+
+    _recRunButton = OTButton(CGRectMake(260, 252, 180, 26), "Neu extrahieren", self, @selector(runRecomputeByTag:));
+    [cv addSubview:_recRunButton];
+    [self _setRecomputeRunButtonEnabled:NO];
+}
+
+// Der Default-Button (blau, weiße Schrift) hat im Theme keinen eigenen Disabled-Stil:
+// deaktiviert erscheint er als weiße Schrift auf hellgrauem Grund. Deshalb nur dann
+// Default-Button (und Return-Taste), wenn er auch aktiv ist.
+- (void)_setRecomputeRunButtonEnabled:(BOOL)shouldEnable
+{
+    [_recRunButton setEnabled:shouldEnable];
+    [_recWindow setDefaultButton:(shouldEnable ? _recRunButton : nil)];
+}
+
+// Tags der bereits geladenen Kandidaten als Vorschläge
+- (CPArray)_knownTags
+{
+    var cc = [_app candidatesController],
+        content = cc ? [cc content] : nil,
+        n = content ? [content count] : 0,
+        seen = {},
+        tags = [];
+
+    for (var i = 0; i < n; i++)
+    {
+        var raw = [[content objectAtIndex:i] valueForKey:@"tags"];
+        if (!raw)
+            continue;
+        var parts = String(raw).split(/\s*,\s*/);
+        for (var j = 0; j < parts.length; j++)
+        {
+            var t = OTTrim(parts[j]);
+            if (t.length && !seen[t])
+            {
+                seen[t] = true;
+                tags.push(t);
+            }
+        }
+    }
+    tags.sort(function(a, b) { return a.localeCompare(b); });
+    return tags;
+}
+
+- (void)controlTextDidChange:(CPNotification)aNotification
+{
+    if ([aNotification object] === _recTagCombo)
+        [self _scheduleRecomputeCount];
+}
+
+- (void)comboBoxSelectionDidChange:(CPNotification)aNotification
+{
+    if ([aNotification object] === _recTagCombo)
+        [self _scheduleRecomputeCount];
+}
+
+- (void)_scheduleRecomputeCount
+{
+    _recCount = -1;
+    [self _setRecomputeRunButtonEnabled:NO];
+    [_recCountLabel setStringValue:@"Betroffene Kandidaten: wird ermittelt…"];
+    [CPObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(_recomputeTagDidChange) object:nil];
+    [self performSelector:@selector(_recomputeTagDidChange) withObject:nil afterDelay:0.4];
+}
+
+- (void)_recomputeTagDidChange
+{
+    var tag = OTTrim([_recTagCombo stringValue]);
+    _recCount = -1;
+    _recCountTag = tag;
+    [_recRunButton setTitle:@"Neu extrahieren"];
+    [self _setRecomputeRunButtonEnabled:NO];
+
+    if (!tag.length)
+    {
+        [_recCountLabel setStringValue:@"Betroffene Kandidaten: bitte Tag wählen"];
+        return;
+    }
+    [_recCountLabel setStringValue:@"Betroffene Kandidaten: wird ermittelt…"];
+
+    OTGetJSON("/BBB/candidates/count_by_tag?tag=" + encodeURIComponent(tag), 60.0, function(res, error)
+    {
+        if (tag !== OTTrim([_recTagCombo stringValue]))
+            return;   // Eingabe hat sich inzwischen geändert
+
+        if (res && res.success)
+        {
+            _recCount = res.count || 0;
+            [_recCountLabel setStringValue:@"Betroffene Kandidaten: " + _recCount];
+            [_recRunButton setTitle:(_recCount === 1 ? "1 Kandidat neu extrahieren" : _recCount + " Kandidaten neu extrahieren")];
+            [self _setRecomputeRunButtonEnabled:(_recCount > 0)];
+        }
+        else
+        {
+            var msg = (res && res.error) ? res.error : (error ? [error description] : "Zählroute nicht erreichbar");
+            [_recCountLabel setStringValue:@"Betroffene Kandidaten: unbekannt (" + msg + ")"];
+        }
+    });
+}
+
+- (void)runRecomputeByTag:(id)sender
+{
+    var tag = OTTrim([_recTagCombo stringValue]);
+    if (!tag.length || _recCount <= 0 || tag !== _recCountTag)
+        return;
+
+    var model = [_recModelPopUp titleOfSelectedItem];
+    var deep  = ([_recDeepModeBox state] === CPOnState);
+
+    [self _setRecomputeRunButtonEnabled:NO];
+    [_recStatusLabel setStringValue:@"Reihe Kandidaten ein…"];
+
+    var taskId = "recompute_tag_" + tag;
+    [_app addTaskWithName:@"Neu-Extraktion Tag: " + tag identifier:taskId];
+    [_app updateTaskWithIdentifier:taskId state:@"active" message:@"Reihe Kandidaten ein…" progress:20];
+
+    OTPostJSON("/BBB/candidates/recompute_by_tag", { "tag": tag, "model": model, "deep_mode": deep ? 1 : 0 }, 120.0, function(res, error)
+    {
+        if (res && res.success)
+        {
+            var n = res.queued || 0;
+            [_recStatusLabel setStringValue:n + " Kandidat(en) eingereiht. Die Extraktion läuft im Minion-Worker."];
+            [_recRunButton setTitle:@"Eingereiht"];
+            [_app updateTaskWithIdentifier:taskId state:@"finished" message:n + " Kandidat(en) eingereiht" progress:100];
+        }
+        else
+        {
+            var msg = (res && res.error) ? res.error : (error ? [error description] : "Unbekannter Fehler");
+            [_recStatusLabel setStringValue:@"Fehler: " + msg];
+            [self _setRecomputeRunButtonEnabled:YES];
+            [_app updateTaskWithIdentifier:taskId state:@"failed" message:@"Einreihen fehlgeschlagen" progress:0];
+        }
+    });
+}
+
+- (void)closeRecomputeWindow:(id)sender
+{
+    [_recWindow orderOut:self];
 }
 
 // --------------------------------------------------------------------------------
