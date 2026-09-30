@@ -12,7 +12,6 @@ use Mojolicious::Lite;
 use Mojo::Pg;
 use Data::Dumper;
 use Mojo::UserAgent;
-use Apache::Session::File;
 use Encode qw(decode_utf8 is_utf8 encode decode);
 use Mojo::JSON qw(decode_json encode_json from_json to_json);
 use Mojo::Loader qw(data_section);
