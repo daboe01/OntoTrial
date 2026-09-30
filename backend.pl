@@ -14,11 +14,9 @@ use Data::Dumper;
 use Mojo::UserAgent;
 use Encode qw(decode_utf8 is_utf8 encode decode);
 use Mojo::JSON qw(decode_json encode_json from_json to_json);
-use Mojo::Loader qw(data_section);
 use POSIX qw(strftime);
 use DateTime;
 use Time::HiRes qw(gettimeofday tv_interval);
-use Text::CSV;
 use Digest::MD5 qw(md5_hex);   # ONTOTRIAL-PATCHSET-2026-09-23
 use List::Util ();
 
