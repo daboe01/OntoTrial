@@ -220,7 +220,7 @@ A natural-language assistant for cohort queries such as *"Patients with Sjögren
 ### Perl dependencies
 
 ```bash
-cpanm Mojolicious Mojo::Pg Minion DateTime Text::CSV Apache::Session::File
+cpanm Mojolicious Mojo::Pg Minion DateTime
 ```
 
 ### Database
