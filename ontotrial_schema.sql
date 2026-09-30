@@ -18,11 +18,13 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
--- Name: public; Type: SCHEMA; Schema: -; Owner: -
+-- Name: public; Type: SCHEMA; Schema: -; Owner: postgres
 --
 
 -- *not* creating schema, since initdb creates it
 
+
+ALTER SCHEMA public OWNER TO postgres;
 
 --
 -- Name: fuzzystrmatch; Type: EXTENSION; Schema: -; Owner: -
@@ -32,7 +34,7 @@ CREATE EXTENSION IF NOT EXISTS fuzzystrmatch WITH SCHEMA public;
 
 
 --
--- Name: EXTENSION fuzzystrmatch; Type: COMMENT; Schema: -; Owner: -
+-- Name: EXTENSION fuzzystrmatch; Type: COMMENT; Schema: -; Owner: 
 --
 
 COMMENT ON EXTENSION fuzzystrmatch IS 'determine similarities and distance between strings';
@@ -46,14 +48,14 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
 
 
 --
--- Name: EXTENSION pg_trgm; Type: COMMENT; Schema: -; Owner: -
+-- Name: EXTENSION pg_trgm; Type: COMMENT; Schema: -; Owner: 
 --
 
 COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
 
 
 --
--- Name: minion_state; Type: TYPE; Schema: public; Owner: -
+-- Name: minion_state; Type: TYPE; Schema: public; Owner: postgres
 --
 
 CREATE TYPE public.minion_state AS ENUM (
@@ -64,8 +66,10 @@ CREATE TYPE public.minion_state AS ENUM (
 );
 
 
+ALTER TYPE public.minion_state OWNER TO postgres;
+
 --
--- Name: all_childen_of(integer); Type: FUNCTION; Schema: public; Owner: -
+-- Name: all_childen_of(integer); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.all_childen_of(integer) RETURNS TABLE(identity integer)
@@ -84,8 +88,10 @@ FROM included_entities
 $_$;
 
 
+ALTER FUNCTION public.all_childen_of(integer) OWNER TO postgres;
+
 --
--- Name: commacat(text, text); Type: FUNCTION; Schema: public; Owner: -
+-- Name: commacat(text, text); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.commacat(acc text, instr text) RETURNS text
@@ -103,8 +109,10 @@ CREATE FUNCTION public.commacat(acc text, instr text) RETURNS text
 $$;
 
 
+ALTER FUNCTION public.commacat(acc text, instr text) OWNER TO postgres;
+
 --
--- Name: is_atc_subclass(text, text); Type: FUNCTION; Schema: public; Owner: -
+-- Name: is_atc_subclass(text, text); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.is_atc_subclass(child_text text, parent_text text) RETURNS boolean
@@ -131,8 +139,10 @@ END;
 $$;
 
 
+ALTER FUNCTION public.is_atc_subclass(child_text text, parent_text text) OWNER TO postgres;
+
 --
--- Name: is_hpo_subclass(text, text); Type: FUNCTION; Schema: public; Owner: -
+-- Name: is_hpo_subclass(text, text); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.is_hpo_subclass(child_text text, parent_text text) RETURNS boolean
@@ -165,8 +175,10 @@ END;
 $$;
 
 
+ALTER FUNCTION public.is_hpo_subclass(child_text text, parent_text text) OWNER TO postgres;
+
 --
--- Name: is_icd10_subclass(text, text); Type: FUNCTION; Schema: public; Owner: -
+-- Name: is_icd10_subclass(text, text); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.is_icd10_subclass(child_text text, parent_text text) RETURNS boolean
@@ -194,8 +206,10 @@ END;
 $$;
 
 
+ALTER FUNCTION public.is_icd10_subclass(child_text text, parent_text text) OWNER TO postgres;
+
 --
--- Name: is_ops_subclass(text, text); Type: FUNCTION; Schema: public; Owner: -
+-- Name: is_ops_subclass(text, text); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.is_ops_subclass(child_text text, parent_text text) RETURNS boolean
@@ -223,8 +237,10 @@ END;
 $$;
 
 
+ALTER FUNCTION public.is_ops_subclass(child_text text, parent_text text) OWNER TO postgres;
+
 --
--- Name: is_subclass_of(text, text); Type: FUNCTION; Schema: public; Owner: -
+-- Name: is_subclass_of(text, text); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.is_subclass_of(child_code text, parent_code text) RETURNS boolean
@@ -263,8 +279,10 @@ END;
 $$;
 
 
+ALTER FUNCTION public.is_subclass_of(child_code text, parent_code text) OWNER TO postgres;
+
 --
--- Name: minion_jobs_notify_workers(); Type: FUNCTION; Schema: public; Owner: -
+-- Name: minion_jobs_notify_workers(); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.minion_jobs_notify_workers() RETURNS trigger
@@ -279,8 +297,10 @@ CREATE FUNCTION public.minion_jobs_notify_workers() RETURNS trigger
 $$;
 
 
+ALTER FUNCTION public.minion_jobs_notify_workers() OWNER TO postgres;
+
 --
--- Name: minion_lock(text, integer, integer); Type: FUNCTION; Schema: public; Owner: -
+-- Name: minion_lock(text, integer, integer); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.minion_lock(text, integer, integer) RETURNS boolean
@@ -302,165 +322,10 @@ END;
 $_$;
 
 
---
--- Name: stemmed_hpo_code(text); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.stemmed_hpo_code(input_string text) RETURNS text
-    LANGUAGE plpgsql IMMUTABLE
-    AS $$
-DECLARE
-    modified_string TEXT;
-BEGIN
-    modified_string := input_string;  -- Start with the original string
-
-    IF modified_string ~ '0011505|0007989|0007989|0040049|0007822|0030496' THEN -- retiales ödem
-        modified_string := '0031527';
-    END IF;
-    IF modified_string ~ '0011532|0030628' THEN -- subretinal fluid
-        modified_string := '0031526';
-    END IF;
-
-    IF modified_string ~ '0000518|0100018|0100019|0011141|0010924' THEN -- cat
-        modified_string := '0011142';
-    END IF;
-
-    IF modified_string ~ '0001123' THEN -- scotoma
-        modified_string := '0000575';
-    END IF;
-
-    IF modified_string ~ '0025562' THEN -- ac cells
-        modified_string := '0025561';
-    END IF;
-
-    IF modified_string ~ '0025242' THEN -- hemorrhage
-        modified_string := '0000573';
-    END IF;
-
-    IF modified_string ~ '0031609|0007722' THEN -- macular atrophy
-        modified_string := '0007401';
-    END IF;
-
-    IF modified_string ~ '0010733|0010732' THEN -- nevus
-        modified_string := '0003764';
-    END IF;
-	
-	    IF modified_string ~ '0007401|0030329' THEN -- retinal atrophy
-        modified_string := '0001105';
-    END IF;
-
-	    IF modified_string ~ '0025609' THEN -- blepharitis
-        modified_string := '0000498';
-    END IF;
-	
-	    IF modified_string ~ '0007677' THEN -- retinal degeneration
-        modified_string := '0000546';
-    END IF;
-
-	    IF modified_string ~ '0007686' THEN -- pupillary function
-        modified_string := '0001089';
-    END IF;
-
-	    IF modified_string ~ '0000509' THEN -- bindehautrötung
-        modified_string := '0030953';
-    END IF;
-	
-	    IF modified_string ~ '0025574|0025241' THEN -- retinal hemorrhage
-        modified_string := '0025242';
-    END IF;
-
-	    IF modified_string ~ '0033705' THEN -- tear drainage
-        modified_string := '0031881';
-    END IF;
-	
-		    IF modified_string ~ '0007765|0011499|0030663|0000616' THEN -- ignore deep anterior chamber mydriasis
-        modified_string := '';
-	end if;
-		    IF modified_string ~ '0003676|0003680|0031915' THEN -- ignore progressive et al
-        modified_string := '';
-    END IF;
-	
-		    IF modified_string ~ '0000587' THEN -- optic nerver / optic disc
-        modified_string := '0012795';
-    END IF;
-
-		    IF modified_string ~ '0000648' THEN -- optic atrophy
-        modified_string := '0012512';
-    END IF;
-
-		    IF modified_string ~ '0000315' THEN -- exophthalmus
-        modified_string := '0000520';
-    END IF;
-
-	IF modified_string ~ '0009918' THEN -- korektopie
-        modified_string := '0025309';
-    END IF;
-	IF modified_string ~ '0012805' THEN -- iridektomie
-        modified_string := '0000525';
-    END IF;
-	IF modified_string ~ '0200071' THEN -- periphere degeneration
-        modified_string := '0007769';
-    END IF;
-	
-	IF modified_string ~ '0500046' THEN -- but vs. meibomdrüsensstau
-        modified_string := '6000069';
-    END IF;
-
-	IF modified_string ~ '0031977' THEN -- CDR
-        modified_string := '0031976';
-    END IF;
-	IF modified_string ~ '0030652' THEN -- floaters
-        modified_string := '0100832';
-    END IF;
-
-	IF modified_string ~ '0001489' THEN -- vitreous detachment
-        modified_string := '0004327';
-    END IF;
-
-	IF modified_string ~ '0001059' THEN -- pterygium
-        modified_string := '0034363';
-    END IF;
-
-	IF modified_string ~ '0025582' THEN -- subretinal hemorrhage
-        modified_string := '0025243';
-    END IF;
-
-	IF modified_string ~ '0040031' THEN -- hyperpigmentation
-        modified_string := '0011509';
-    END IF;
-
-	IF modified_string ~ '0000315' THEN -- lid erythema
-        modified_string := '0040323';
-    END IF;
-	IF modified_string ~ '0007677' THEN -- yellow lesion
-        modified_string := '0030500';
-    END IF;
-
-	IF modified_string ~ '0001103' THEN -- mottling
-        modified_string := '0007814';
-    END IF;
-
-	IF modified_string ~ '0040167' THEN -- papillom
-        modified_string := '0000492';
-    END IF;
-	IF modified_string ~ '0011531' THEN -- vitritis 
-        modified_string := '0004327';
-    END IF;
-	IF modified_string ~ '0100832' THEN -- floaters 
-        modified_string := '0004327';
-    END IF;
-	
-	IF modified_string ~ '0200065|0000546' THEN -- pflastersteine / retinal degeneration
-        modified_string := '0007769';
-    END IF;
-
-    RETURN modified_string;  -- Return the (potentially) modified string
-END;
-$$;
-
+ALTER FUNCTION public.minion_lock(text, integer, integer) OWNER TO postgres;
 
 --
--- Name: to_date_safe(text); Type: FUNCTION; Schema: public; Owner: -
+-- Name: to_date_safe(text); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.to_date_safe(val text) RETURNS date
@@ -524,8 +389,10 @@ END;
 $_$;
 
 
+ALTER FUNCTION public.to_date_safe(val text) OWNER TO postgres;
+
 --
--- Name: textcat_all(text); Type: AGGREGATE; Schema: public; Owner: -
+-- Name: textcat_all(text); Type: AGGREGATE; Schema: public; Owner: postgres
 --
 
 CREATE AGGREGATE public.textcat_all(text) (
@@ -535,12 +402,14 @@ CREATE AGGREGATE public.textcat_all(text) (
 );
 
 
+ALTER AGGREGATE public.textcat_all(text) OWNER TO postgres;
+
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
 
 --
--- Name: atc_terms; Type: TABLE; Schema: public; Owner: -
+-- Name: atc_terms; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.atc_terms (
@@ -551,8 +420,10 @@ CREATE TABLE public.atc_terms (
 );
 
 
+ALTER TABLE public.atc_terms OWNER TO postgres;
+
 --
--- Name: candidates; Type: TABLE; Schema: public; Owner: -
+-- Name: candidates; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.candidates (
@@ -562,12 +433,17 @@ CREATE TABLE public.candidates (
     phenopacket_json jsonb,
     reference_date date DEFAULT now(),
     doc_id character varying(64),
-    tags text
+    tags text,
+    doc_source text DEFAULT 'manual'::text,
+    doc_hash text,
+    extract_job_id bigint
 );
 
 
+ALTER TABLE public.candidates OWNER TO postgres;
+
 --
--- Name: candidates_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: candidates_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.candidates_id_seq
@@ -579,15 +455,17 @@ CREATE SEQUENCE public.candidates_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.candidates_id_seq OWNER TO postgres;
+
 --
--- Name: candidates_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: candidates_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.candidates_id_seq OWNED BY public.candidates.id;
 
 
 --
--- Name: filter_rules; Type: TABLE; Schema: public; Owner: -
+-- Name: filter_rules; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.filter_rules (
@@ -603,8 +481,10 @@ CREATE TABLE public.filter_rules (
 );
 
 
+ALTER TABLE public.filter_rules OWNER TO postgres;
+
 --
--- Name: filter_rules_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: filter_rules_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.filter_rules_id_seq
@@ -616,15 +496,17 @@ CREATE SEQUENCE public.filter_rules_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.filter_rules_id_seq OWNER TO postgres;
+
 --
--- Name: filter_rules_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: filter_rules_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.filter_rules_id_seq OWNED BY public.filter_rules.id;
 
 
 --
--- Name: hpo_closure; Type: TABLE; Schema: public; Owner: -
+-- Name: hpo_closure; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.hpo_closure (
@@ -633,8 +515,10 @@ CREATE TABLE public.hpo_closure (
 );
 
 
+ALTER TABLE public.hpo_closure OWNER TO postgres;
+
 --
--- Name: icd10_terms; Type: TABLE; Schema: public; Owner: -
+-- Name: icd10_terms; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.icd10_terms (
@@ -647,8 +531,10 @@ CREATE TABLE public.icd10_terms (
 );
 
 
+ALTER TABLE public.icd10_terms OWNER TO postgres;
+
 --
--- Name: isas; Type: TABLE; Schema: public; Owner: -
+-- Name: isas; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.isas (
@@ -658,8 +544,10 @@ CREATE TABLE public.isas (
 );
 
 
+ALTER TABLE public.isas OWNER TO postgres;
+
 --
--- Name: isas_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: isas_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.isas_id_seq
@@ -670,15 +558,17 @@ CREATE SEQUENCE public.isas_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.isas_id_seq OWNER TO postgres;
+
 --
--- Name: isas_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: isas_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.isas_id_seq OWNED BY public.isas.id;
 
 
 --
--- Name: llm_prompts; Type: TABLE; Schema: public; Owner: -
+-- Name: llm_prompts; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.llm_prompts (
@@ -693,8 +583,10 @@ CREATE TABLE public.llm_prompts (
 );
 
 
+ALTER TABLE public.llm_prompts OWNER TO postgres;
+
 --
--- Name: llm_prompts_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: llm_prompts_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.llm_prompts_id_seq
@@ -706,15 +598,17 @@ CREATE SEQUENCE public.llm_prompts_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.llm_prompts_id_seq OWNER TO postgres;
+
 --
--- Name: llm_prompts_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: llm_prompts_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.llm_prompts_id_seq OWNED BY public.llm_prompts.id;
 
 
 --
--- Name: loinc_terms; Type: TABLE; Schema: public; Owner: -
+-- Name: loinc_terms; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.loinc_terms (
@@ -735,8 +629,10 @@ CREATE TABLE public.loinc_terms (
 );
 
 
+ALTER TABLE public.loinc_terms OWNER TO postgres;
+
 --
--- Name: mapping_rerank_cache; Type: TABLE; Schema: public; Owner: -
+-- Name: mapping_rerank_cache; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.mapping_rerank_cache (
@@ -751,8 +647,10 @@ CREATE TABLE public.mapping_rerank_cache (
 );
 
 
+ALTER TABLE public.mapping_rerank_cache OWNER TO postgres;
+
 --
--- Name: matches; Type: TABLE; Schema: public; Owner: -
+-- Name: matches; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.matches (
@@ -767,8 +665,10 @@ CREATE TABLE public.matches (
 );
 
 
+ALTER TABLE public.matches OWNER TO postgres;
+
 --
--- Name: matches_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: matches_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.matches_id_seq
@@ -780,15 +680,17 @@ CREATE SEQUENCE public.matches_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.matches_id_seq OWNER TO postgres;
+
 --
--- Name: matches_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: matches_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.matches_id_seq OWNED BY public.matches.id;
 
 
 --
--- Name: minion_jobs; Type: TABLE; Schema: public; Owner: -
+-- Name: minion_jobs; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.minion_jobs (
@@ -816,8 +718,10 @@ CREATE TABLE public.minion_jobs (
 );
 
 
+ALTER TABLE public.minion_jobs OWNER TO postgres;
+
 --
--- Name: minion_jobs_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: minion_jobs_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.minion_jobs_id_seq
@@ -828,15 +732,17 @@ CREATE SEQUENCE public.minion_jobs_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.minion_jobs_id_seq OWNER TO postgres;
+
 --
--- Name: minion_jobs_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: minion_jobs_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.minion_jobs_id_seq OWNED BY public.minion_jobs.id;
 
 
 --
--- Name: minion_locks; Type: TABLE; Schema: public; Owner: -
+-- Name: minion_locks; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE UNLOGGED TABLE public.minion_locks (
@@ -846,8 +752,10 @@ CREATE UNLOGGED TABLE public.minion_locks (
 );
 
 
+ALTER TABLE public.minion_locks OWNER TO postgres;
+
 --
--- Name: minion_locks_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: minion_locks_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE UNLOGGED SEQUENCE public.minion_locks_id_seq
@@ -858,15 +766,17 @@ CREATE UNLOGGED SEQUENCE public.minion_locks_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.minion_locks_id_seq OWNER TO postgres;
+
 --
--- Name: minion_locks_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: minion_locks_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.minion_locks_id_seq OWNED BY public.minion_locks.id;
 
 
 --
--- Name: minion_workers; Type: TABLE; Schema: public; Owner: -
+-- Name: minion_workers; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE UNLOGGED TABLE public.minion_workers (
@@ -882,8 +792,10 @@ CREATE UNLOGGED TABLE public.minion_workers (
 );
 
 
+ALTER TABLE public.minion_workers OWNER TO postgres;
+
 --
--- Name: minion_workers_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: minion_workers_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE UNLOGGED SEQUENCE public.minion_workers_id_seq
@@ -894,15 +806,17 @@ CREATE UNLOGGED SEQUENCE public.minion_workers_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.minion_workers_id_seq OWNER TO postgres;
+
 --
--- Name: minion_workers_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: minion_workers_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.minion_workers_id_seq OWNED BY public.minion_workers.id;
 
 
 --
--- Name: mojo_migrations; Type: TABLE; Schema: public; Owner: -
+-- Name: mojo_migrations; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.mojo_migrations (
@@ -912,8 +826,10 @@ CREATE TABLE public.mojo_migrations (
 );
 
 
+ALTER TABLE public.mojo_migrations OWNER TO postgres;
+
 --
--- Name: ontology_intercepts; Type: TABLE; Schema: public; Owner: -
+-- Name: ontology_intercepts; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.ontology_intercepts (
@@ -930,8 +846,10 @@ CREATE TABLE public.ontology_intercepts (
 );
 
 
+ALTER TABLE public.ontology_intercepts OWNER TO postgres;
+
 --
--- Name: ontology_intercepts_backup_20260923b; Type: TABLE; Schema: public; Owner: -
+-- Name: ontology_intercepts_backup_20260923b; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.ontology_intercepts_backup_20260923b (
@@ -948,8 +866,10 @@ CREATE TABLE public.ontology_intercepts_backup_20260923b (
 );
 
 
+ALTER TABLE public.ontology_intercepts_backup_20260923b OWNER TO postgres;
+
 --
--- Name: ontology_intercepts_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: ontology_intercepts_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.ontology_intercepts_id_seq
@@ -961,15 +881,17 @@ CREATE SEQUENCE public.ontology_intercepts_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.ontology_intercepts_id_seq OWNER TO postgres;
+
 --
--- Name: ontology_intercepts_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: ontology_intercepts_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.ontology_intercepts_id_seq OWNED BY public.ontology_intercepts.id;
 
 
 --
--- Name: ontology_intercepts_patchlog; Type: TABLE; Schema: public; Owner: -
+-- Name: ontology_intercepts_patchlog; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.ontology_intercepts_patchlog (
@@ -985,8 +907,10 @@ CREATE TABLE public.ontology_intercepts_patchlog (
 );
 
 
+ALTER TABLE public.ontology_intercepts_patchlog OWNER TO postgres;
+
 --
--- Name: ops_terms; Type: TABLE; Schema: public; Owner: -
+-- Name: ops_terms; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.ops_terms (
@@ -997,8 +921,10 @@ CREATE TABLE public.ops_terms (
 );
 
 
+ALTER TABLE public.ops_terms OWNER TO postgres;
+
 --
--- Name: patients; Type: VIEW; Schema: public; Owner: -
+-- Name: patients; Type: VIEW; Schema: public; Owner: postgres
 --
 
 CREATE VIEW public.patients AS
@@ -1013,8 +939,10 @@ CREATE VIEW public.patients AS
   ORDER BY pseudonym;
 
 
+ALTER VIEW public.patients OWNER TO postgres;
+
 --
--- Name: synonyms; Type: TABLE; Schema: public; Owner: -
+-- Name: synonyms; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.synonyms (
@@ -1024,8 +952,10 @@ CREATE TABLE public.synonyms (
 );
 
 
+ALTER TABLE public.synonyms OWNER TO postgres;
+
 --
--- Name: synonyms_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: synonyms_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.synonyms_id_seq
@@ -1036,15 +966,17 @@ CREATE SEQUENCE public.synonyms_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.synonyms_id_seq OWNER TO postgres;
+
 --
--- Name: synonyms_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: synonyms_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.synonyms_id_seq OWNED BY public.synonyms.id;
 
 
 --
--- Name: terms; Type: TABLE; Schema: public; Owner: -
+-- Name: terms; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.terms (
@@ -1056,8 +988,10 @@ CREATE TABLE public.terms (
 );
 
 
+ALTER TABLE public.terms OWNER TO postgres;
+
 --
--- Name: translation_cache; Type: TABLE; Schema: public; Owner: -
+-- Name: translation_cache; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.translation_cache (
@@ -1072,8 +1006,10 @@ CREATE TABLE public.translation_cache (
 );
 
 
+ALTER TABLE public.translation_cache OWNER TO postgres;
+
 --
--- Name: trials; Type: TABLE; Schema: public; Owner: -
+-- Name: trials; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.trials (
@@ -1084,8 +1020,10 @@ CREATE TABLE public.trials (
 );
 
 
+ALTER TABLE public.trials OWNER TO postgres;
+
 --
--- Name: trials_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: trials_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.trials_id_seq
@@ -1097,15 +1035,17 @@ CREATE SEQUENCE public.trials_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.trials_id_seq OWNER TO postgres;
+
 --
--- Name: trials_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: trials_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.trials_id_seq OWNED BY public.trials.id;
 
 
 --
--- Name: xrefs; Type: TABLE; Schema: public; Owner: -
+-- Name: xrefs; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.xrefs (
@@ -1115,8 +1055,10 @@ CREATE TABLE public.xrefs (
 );
 
 
+ALTER TABLE public.xrefs OWNER TO postgres;
+
 --
--- Name: xrefs_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: xrefs_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.xrefs_id_seq
@@ -1127,99 +1069,101 @@ CREATE SEQUENCE public.xrefs_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.xrefs_id_seq OWNER TO postgres;
+
 --
--- Name: xrefs_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: xrefs_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.xrefs_id_seq OWNED BY public.xrefs.id;
 
 
 --
--- Name: candidates id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: candidates id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.candidates ALTER COLUMN id SET DEFAULT nextval('public.candidates_id_seq'::regclass);
 
 
 --
--- Name: filter_rules id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: filter_rules id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.filter_rules ALTER COLUMN id SET DEFAULT nextval('public.filter_rules_id_seq'::regclass);
 
 
 --
--- Name: isas id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: isas id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.isas ALTER COLUMN id SET DEFAULT nextval('public.isas_id_seq'::regclass);
 
 
 --
--- Name: llm_prompts id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: llm_prompts id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.llm_prompts ALTER COLUMN id SET DEFAULT nextval('public.llm_prompts_id_seq'::regclass);
 
 
 --
--- Name: matches id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: matches id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.matches ALTER COLUMN id SET DEFAULT nextval('public.matches_id_seq'::regclass);
 
 
 --
--- Name: minion_jobs id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: minion_jobs id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.minion_jobs ALTER COLUMN id SET DEFAULT nextval('public.minion_jobs_id_seq'::regclass);
 
 
 --
--- Name: minion_locks id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: minion_locks id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.minion_locks ALTER COLUMN id SET DEFAULT nextval('public.minion_locks_id_seq'::regclass);
 
 
 --
--- Name: minion_workers id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: minion_workers id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.minion_workers ALTER COLUMN id SET DEFAULT nextval('public.minion_workers_id_seq'::regclass);
 
 
 --
--- Name: ontology_intercepts id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: ontology_intercepts id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.ontology_intercepts ALTER COLUMN id SET DEFAULT nextval('public.ontology_intercepts_id_seq'::regclass);
 
 
 --
--- Name: synonyms id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: synonyms id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.synonyms ALTER COLUMN id SET DEFAULT nextval('public.synonyms_id_seq'::regclass);
 
 
 --
--- Name: trials id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: trials id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.trials ALTER COLUMN id SET DEFAULT nextval('public.trials_id_seq'::regclass);
 
 
 --
--- Name: xrefs id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: xrefs id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.xrefs ALTER COLUMN id SET DEFAULT nextval('public.xrefs_id_seq'::regclass);
 
 
 --
--- Name: atc_terms atc_terms_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: atc_terms atc_terms_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.atc_terms
@@ -1227,7 +1171,7 @@ ALTER TABLE ONLY public.atc_terms
 
 
 --
--- Name: candidates candidates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: candidates candidates_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.candidates
@@ -1235,7 +1179,7 @@ ALTER TABLE ONLY public.candidates
 
 
 --
--- Name: filter_rules filter_rules_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: filter_rules filter_rules_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.filter_rules
@@ -1243,7 +1187,7 @@ ALTER TABLE ONLY public.filter_rules
 
 
 --
--- Name: icd10_terms icd10_terms_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: icd10_terms icd10_terms_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.icd10_terms
@@ -1251,7 +1195,7 @@ ALTER TABLE ONLY public.icd10_terms
 
 
 --
--- Name: isas isas_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: isas isas_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.isas
@@ -1259,7 +1203,7 @@ ALTER TABLE ONLY public.isas
 
 
 --
--- Name: llm_prompts llm_prompts_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: llm_prompts llm_prompts_name_key; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.llm_prompts
@@ -1267,7 +1211,7 @@ ALTER TABLE ONLY public.llm_prompts
 
 
 --
--- Name: llm_prompts llm_prompts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: llm_prompts llm_prompts_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.llm_prompts
@@ -1275,7 +1219,7 @@ ALTER TABLE ONLY public.llm_prompts
 
 
 --
--- Name: loinc_terms loinc_terms_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: loinc_terms loinc_terms_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.loinc_terms
@@ -1283,7 +1227,7 @@ ALTER TABLE ONLY public.loinc_terms
 
 
 --
--- Name: matches matches_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: matches matches_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.matches
@@ -1291,7 +1235,7 @@ ALTER TABLE ONLY public.matches
 
 
 --
--- Name: minion_jobs minion_jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: minion_jobs minion_jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.minion_jobs
@@ -1299,7 +1243,7 @@ ALTER TABLE ONLY public.minion_jobs
 
 
 --
--- Name: minion_locks minion_locks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: minion_locks minion_locks_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.minion_locks
@@ -1307,7 +1251,7 @@ ALTER TABLE ONLY public.minion_locks
 
 
 --
--- Name: minion_workers minion_workers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: minion_workers minion_workers_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.minion_workers
@@ -1315,7 +1259,7 @@ ALTER TABLE ONLY public.minion_workers
 
 
 --
--- Name: mojo_migrations mojo_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: mojo_migrations mojo_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.mojo_migrations
@@ -1323,7 +1267,7 @@ ALTER TABLE ONLY public.mojo_migrations
 
 
 --
--- Name: ontology_intercepts ontology_intercepts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: ontology_intercepts ontology_intercepts_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.ontology_intercepts
@@ -1331,7 +1275,7 @@ ALTER TABLE ONLY public.ontology_intercepts
 
 
 --
--- Name: ops_terms ops_terms_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: ops_terms ops_terms_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.ops_terms
@@ -1339,7 +1283,7 @@ ALTER TABLE ONLY public.ops_terms
 
 
 --
--- Name: synonyms synonyms_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: synonyms synonyms_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.synonyms
@@ -1347,7 +1291,7 @@ ALTER TABLE ONLY public.synonyms
 
 
 --
--- Name: terms terms_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: terms terms_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.terms
@@ -1355,7 +1299,7 @@ ALTER TABLE ONLY public.terms
 
 
 --
--- Name: translation_cache translation_cache_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: translation_cache translation_cache_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.translation_cache
@@ -1363,7 +1307,7 @@ ALTER TABLE ONLY public.translation_cache
 
 
 --
--- Name: trials trials_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: trials trials_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.trials
@@ -1371,7 +1315,7 @@ ALTER TABLE ONLY public.trials
 
 
 --
--- Name: xrefs xrefs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: xrefs xrefs_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.xrefs
@@ -1379,273 +1323,287 @@ ALTER TABLE ONLY public.xrefs
 
 
 --
--- Name: atc_terms_lower_id_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: atc_terms_lower_id_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX atc_terms_lower_id_idx ON public.atc_terms USING btree (lower((id)::text));
 
 
 --
--- Name: icd_label_trgm; Type: INDEX; Schema: public; Owner: -
+-- Name: candidates_piz_day_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX candidates_piz_day_idx ON public.candidates USING btree (pseudonym, reference_date);
+
+
+--
+-- Name: candidates_piz_hash_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX candidates_piz_hash_idx ON public.candidates USING btree (pseudonym, doc_hash);
+
+
+--
+-- Name: icd_label_trgm; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX icd_label_trgm ON public.icd10_terms USING gin (label public.gin_trgm_ops);
 
 
 --
--- Name: idx_atc_terms_parent; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_atc_terms_parent; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_atc_terms_parent ON public.atc_terms USING btree (parent_id);
 
 
 --
--- Name: idx_candidates_doc_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX idx_candidates_doc_id ON public.candidates USING btree (doc_id);
-
-
---
--- Name: idx_candidates_phenopacket; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_candidates_phenopacket; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_candidates_phenopacket ON public.candidates USING gin (phenopacket_json);
 
 
 --
--- Name: idx_candidates_pseudonym; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_candidates_pseudonym; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_candidates_pseudonym ON public.candidates USING btree (pseudonym);
 
 
 --
--- Name: idx_candidates_tags; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_candidates_src_doc_id; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE UNIQUE INDEX idx_candidates_src_doc_id ON public.candidates USING btree (doc_source, doc_id) WHERE (doc_id IS NOT NULL);
+
+
+--
+-- Name: idx_candidates_tags; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_candidates_tags ON public.candidates USING btree (tags);
 
 
 --
--- Name: idx_candidates_tags_trgm; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_candidates_tags_trgm; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_candidates_tags_trgm ON public.candidates USING gin (tags public.gin_trgm_ops);
 
 
 --
--- Name: idx_filter_rules_cat_act; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_filter_rules_cat_act; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_filter_rules_cat_act ON public.filter_rules USING btree (category, active, priority);
 
 
 --
--- Name: idx_hpo_closure; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_hpo_closure; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE UNIQUE INDEX idx_hpo_closure ON public.hpo_closure USING btree (idchild, idparent);
 
 
 --
--- Name: idx_icd10_terms_parent_id; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_icd10_terms_parent_id; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_icd10_terms_parent_id ON public.icd10_terms USING btree (parent_id);
 
 
 --
--- Name: idx_isas_child; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_isas_child; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_isas_child ON public.isas USING btree (idchild);
 
 
 --
--- Name: idx_isas_parent; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_isas_parent; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_isas_parent ON public.isas USING btree (idparent);
 
 
 --
--- Name: idx_llm_prompts_name; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_llm_prompts_name; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_llm_prompts_name ON public.llm_prompts USING btree (name);
 
 
 --
--- Name: idx_loinc_class; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_loinc_class; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_loinc_class ON public.loinc_terms USING btree (class_name);
 
 
 --
--- Name: idx_loinc_label_trgm; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_loinc_label_trgm; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_loinc_label_trgm ON public.loinc_terms USING gin (label public.gin_trgm_ops);
 
 
 --
--- Name: idx_loinc_parent; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_loinc_parent; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_loinc_parent ON public.loinc_terms USING btree (parent_id);
 
 
 --
--- Name: idx_loinc_status; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_loinc_status; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_loinc_status ON public.loinc_terms USING btree (status);
 
 
 --
--- Name: idx_matches_candidate_id; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_matches_candidate_id; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_matches_candidate_id ON public.matches USING btree (candidate_id);
 
 
 --
--- Name: idx_matches_trial_id; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_matches_trial_id; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_matches_trial_id ON public.matches USING btree (trial_id);
 
 
 --
--- Name: idx_ontology_intercepts_lookup; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_ontology_intercepts_lookup; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_ontology_intercepts_lookup ON public.ontology_intercepts USING btree (domain, active, priority);
 
 
 --
--- Name: idx_ops_terms_parent; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_ops_terms_parent; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_ops_terms_parent ON public.ops_terms USING btree (parent_id);
 
 
 --
--- Name: idx_trial_candidate_uniqueness; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_trial_candidate_uniqueness; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE UNIQUE INDEX idx_trial_candidate_uniqueness ON public.matches USING btree (trial_id, candidate_id);
 
 
 --
--- Name: idx_trials_fhir_group; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_trials_fhir_group; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_trials_fhir_group ON public.trials USING gin (fhir_group_json);
 
 
 --
--- Name: loinc_label_trgm; Type: INDEX; Schema: public; Owner: -
+-- Name: loinc_label_trgm; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX loinc_label_trgm ON public.loinc_terms USING gin (label public.gin_trgm_ops);
 
 
 --
--- Name: mapping_rerank_cache_key_v2; Type: INDEX; Schema: public; Owner: -
+-- Name: mapping_rerank_cache_key_v2; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE UNIQUE INDEX mapping_rerank_cache_key_v2 ON public.mapping_rerank_cache USING btree (domain, query, candidate_ids, prompt_hash);
 
 
 --
--- Name: minion_jobs_expires_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: minion_jobs_expires_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX minion_jobs_expires_idx ON public.minion_jobs USING btree (expires);
 
 
 --
--- Name: minion_jobs_finished_state_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: minion_jobs_finished_state_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX minion_jobs_finished_state_idx ON public.minion_jobs USING btree (finished, state);
 
 
 --
--- Name: minion_jobs_notes_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: minion_jobs_notes_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX minion_jobs_notes_idx ON public.minion_jobs USING gin (notes);
 
 
 --
--- Name: minion_jobs_parents_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: minion_jobs_parents_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX minion_jobs_parents_idx ON public.minion_jobs USING gin (parents);
 
 
 --
--- Name: minion_jobs_state_priority_id_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: minion_jobs_state_priority_id_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX minion_jobs_state_priority_id_idx ON public.minion_jobs USING btree (state, priority DESC, id);
 
 
 --
--- Name: minion_locks_name_expires_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: minion_locks_name_expires_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX minion_locks_name_expires_idx ON public.minion_locks USING btree (name, expires);
 
 
 --
--- Name: ops_label_trgm; Type: INDEX; Schema: public; Owner: -
+-- Name: ops_label_trgm; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX ops_label_trgm ON public.ops_terms USING gin (label public.gin_trgm_ops);
 
 
 --
--- Name: ops_terms_lower_id_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: ops_terms_lower_id_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX ops_terms_lower_id_idx ON public.ops_terms USING btree (lower((id)::text));
 
 
 --
--- Name: syn_label_trgm; Type: INDEX; Schema: public; Owner: -
+-- Name: syn_label_trgm; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX syn_label_trgm ON public.synonyms USING gin (label public.gin_trgm_ops);
 
 
 --
--- Name: terms_label_trgm; Type: INDEX; Schema: public; Owner: -
+-- Name: terms_label_trgm; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX terms_label_trgm ON public.terms USING gin (label public.gin_trgm_ops);
 
 
 --
--- Name: translation_cache_curated_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: translation_cache_curated_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX translation_cache_curated_idx ON public.translation_cache USING btree (domain, target_language, source_text) WHERE curated;
 
 
 --
--- Name: minion_jobs minion_jobs_notify_workers_trigger; Type: TRIGGER; Schema: public; Owner: -
+-- Name: minion_jobs minion_jobs_notify_workers_trigger; Type: TRIGGER; Schema: public; Owner: postgres
 --
 
 CREATE TRIGGER minion_jobs_notify_workers_trigger AFTER INSERT OR UPDATE OF retries ON public.minion_jobs FOR EACH ROW EXECUTE FUNCTION public.minion_jobs_notify_workers();
 
 
 --
--- Name: atc_terms atc_terms_parent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: atc_terms atc_terms_parent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.atc_terms
@@ -1653,7 +1611,7 @@ ALTER TABLE ONLY public.atc_terms
 
 
 --
--- Name: icd10_terms icd10_terms_parent_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: icd10_terms icd10_terms_parent_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.icd10_terms
@@ -1661,7 +1619,7 @@ ALTER TABLE ONLY public.icd10_terms
 
 
 --
--- Name: matches matches_candidate_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: matches matches_candidate_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.matches
@@ -1669,7 +1627,7 @@ ALTER TABLE ONLY public.matches
 
 
 --
--- Name: matches matches_trial_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: matches matches_trial_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.matches
@@ -1677,7 +1635,7 @@ ALTER TABLE ONLY public.matches
 
 
 --
--- Name: ops_terms ops_terms_parent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: ops_terms ops_terms_parent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.ops_terms
@@ -1685,7 +1643,7 @@ ALTER TABLE ONLY public.ops_terms
 
 
 --
--- Name: synonyms synonyms_idterm_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: synonyms synonyms_idterm_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.synonyms
@@ -1693,7 +1651,7 @@ ALTER TABLE ONLY public.synonyms
 
 
 --
--- Name: xrefs xrefs_idterm_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: xrefs xrefs_idterm_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.xrefs
@@ -1701,6 +1659,9 @@ ALTER TABLE ONLY public.xrefs
 
 
 --
--- PostgreSQL database dump complete
+-- Name: SCHEMA public; Type: ACL; Schema: -; Owner: postgres
 --
+
+REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+GRANT ALL ON SCHEMA public TO PUBLIC;
 
