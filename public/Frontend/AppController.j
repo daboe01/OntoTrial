@@ -1820,6 +1820,11 @@ _CPTokenFieldToken = HPOTokenFieldToken;
 
     CPPopover           _chatPseudonymsPopover;
     CPTextView          _chatPseudonymsTextView;
+
+    // Datensätze, die gerade in den Editoren angezeigt werden.
+    // Editoren schreiben nur hierhin, nie in die aktuelle Selektion.
+    id                  _editorTrial;
+    id                  _editorCandidate;
 }
 
 - (void)applicationDidFinishLaunching:(CPNotification)aNotification
@@ -1866,6 +1871,8 @@ _CPTokenFieldToken = HPOTokenFieldToken;
 
     [trialsController addObserver:self forKeyPath:@"selection" options:CPKeyValueObservingOptionNew context:nil];
     [candidatesController addObserver:self forKeyPath:@"selection" options:CPKeyValueObservingOptionNew context:nil];
+    // Live-Updates (Fireside/WebSocket) des angezeigten Phenopackets
+    [candidatesController addObserver:self forKeyPath:@"selection.phenopacket_json" options:CPKeyValueObservingOptionNew context:nil];
 
     [outlineView bind:@"content" toObject:treeController withKeyPath:@"arrangedObjects" options:nil];
     [outlineView bind:@"selectionIndexPaths" toObject:treeController withKeyPath:@"selectionIndexPaths" options:nil];
@@ -1939,6 +1946,78 @@ _CPTokenFieldToken = HPOTokenFieldToken;
     var tools = [ToolsController sharedController];
     [tools setAppController:self];
     [tools showPropensityMatching:sender];
+}
+
+// --------------------------------------------------------------------------------
+// Selektions-Helfer: konkrete Objekte statt CPControllerSelectionProxy
+// ([controller selection] leitet setValue:forKey: an die Objekte weiter, die
+// zum Zeitpunkt des Aufrufs selektiert sind - in async Handlern also falsch)
+// --------------------------------------------------------------------------------
+
+- (id)_concreteSelectionOf:(CPArrayController)aController
+{
+    var objs = [aController selectedObjects];
+    return ([objs count] === 1) ? [objs objectAtIndex:0] : nil;
+}
+
+- (BOOL)_record:(id)anObject hasId:(id)anId
+{
+    if (!anObject || anId === nil || anId === undefined)
+        return NO;
+    return String([anObject valueForKey:@"id"]) === String(anId);
+}
+
+- (id)_objectWithId:(id)anId inController:(CPArrayController)aController
+{
+    var all = [aController content];
+    var n = all ? [all count] : 0;
+    for (var i = 0; i < n; i++)
+    {
+        var o = [all objectAtIndex:i];
+        if ([self _record:o hasId:anId])
+            return o;
+    }
+    return nil;
+}
+
+// In den Datensatz mit dieser ID schreiben, unabhängig von der Selektion
+- (void)_persistValue:(id)aValue forKey:(CPString)aKey recordId:(id)anId table:(CPString)aTable controller:(CPArrayController)aController
+{
+    var obj = [self _objectWithId:anId inController:aController];
+    if (obj)
+    {
+        [obj setValue:aValue forKey:aKey];   // Fireside persistiert per PATCH
+        return;
+    }
+
+    // Nicht im Browser geladen: direkt per REST (Backend sendet notify_change)
+    var req = [CPURLRequest requestWithURL:@"/BBB/" + aTable + @"/id/" + encodeURIComponent(anId)];
+    [req setHTTPMethod:@"PATCH"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    var body = {};
+    body[aKey] = aValue;
+    [req setHTTPBody:JSON.stringify(body)];
+    [CPURLConnection sendAsynchronousRequest:req
+                                       queue:[CPOperationQueue mainQueue]
+                           completionHandler:function(response, data, error)
+    {
+        if (error)
+            console.error("Persistieren fehlgeschlagen (" + aTable + "/" + anId + "): ", error);
+    }];
+}
+
+- (void)_showPhenopacket:(CPString)aJson
+{
+    var text = aJson || @"";
+    if (typeof text !== "string")
+        text = JSON.stringify(text);
+    try {
+        if (text.length > 0)
+            text = JSON.stringify(JSON.parse(text), null, 4);
+    } catch (e) {
+    }
+    [_phenopacketOutputTextView setString:text];
+    [self parseActivePhenopacketToVisualItems];
 }
 
 - (void)doubleClickChatPatient:(id)sender
@@ -2377,58 +2456,47 @@ _CPTokenFieldToken = HPOTokenFieldToken;
     {
         [self updateMatchesFilter];
 
-        var selectedTrial = [trialsController selection];
+        var trial = [self _concreteSelectionOf:trialsController];
 
-        if (selectedTrial && ![selectedTrial isMemberOfClass:[CPNull class]])
+        // Während des Umladens nirgends hinschreiben (früher landeten hier die
+        // Kriterien der vorherigen Studie per resetEditor: in der neuen)
+        _editorTrial = nil;
+        _isImportingJSON = YES;
+        [[self mutableArrayValueForKey:@"rootNodes"] removeAllObjects];
+        _fhirJsonString = @"";
+
+        var fhirJsonStr = trial ? ([trial valueForKey:@"fhir_group_json"] || @"") : @"";
+        if ([fhirJsonStr length] > 0)
         {
-            var fhirJsonStr = [selectedTrial valueForKey:@"fhir_group_json"] || @"";
-            
-            _fhirJsonString = fhirJsonStr;
-
-            if (fhirJsonStr && [fhirJsonStr length] > 0)
-            {
-                try {
-                    var parsed = JSON.parse(fhirJsonStr);
-                    _isImportingJSON = YES;
-                    [self importFHIRGroup:parsed];
-                    _isImportingJSON = NO;
-                } catch(e) {
-                    [self resetEditor:self];
-                }
-            }
-            else
-            {
-                [self resetEditor:self];
+            try {
+                [self importFHIRGroup:JSON.parse(fhirJsonStr)];
+                _fhirJsonString = fhirJsonStr;
+            } catch(e) {
+                console.warn("Ungültiges fhir_group_json in Studie " + [trial valueForKey:@"id"], e);
             }
         }
-        else
-        {
-            [self resetEditor:self];
-        }
+
+        _editorTrial = trial;
+        _isImportingJSON = NO;
     }
     else if (object === candidatesController && [keyPath isEqualToString:@"selection"])
     {
         [self updatePatientMatchesFilter];
 
-        var selectedCandidate = [candidatesController selection];
-        if (selectedCandidate && ![selectedCandidate isMemberOfClass:[CPNull class]])
+        _editorCandidate = [self _concreteSelectionOf:candidatesController];
+        [self _showPhenopacket:(_editorCandidate ? [_editorCandidate valueForKey:@"phenopacket_json"] : @"")];
+    }
+    else if (object === candidatesController && [keyPath isEqualToString:@"selection.phenopacket_json"])
+    {
+        // Live-Update für den angezeigten Kandidaten (Backend -> notify_change -> Fireside).
+        // Selektionswechsel erledigt der Zweig oben.
+        var cand = [self _concreteSelectionOf:candidatesController];
+        if (cand && cand === _editorCandidate)
         {
-            var phenoJsonStr = [selectedCandidate valueForKey:@"phenopacket_json"];
-            if (phenoJsonStr && [phenoJsonStr length] > 0)
-            {
-                [_phenopacketOutputTextView setString:phenoJsonStr];
-                [self parseActivePhenopacketToVisualItems];
-            }
-            else
-            {
-                [_phenopacketOutputTextView setString:@""];
-                [self parseActivePhenopacketToVisualItems];
-            }
-        }
-        else
-        {
-            [_phenopacketOutputTextView setString:@""];
-            [self parseActivePhenopacketToVisualItems];
+            var fresh = [cand valueForKey:@"phenopacket_json"] || @"";
+            // Echos der eigenen Bearbeitung nicht neu rendern (jsonb ordnet Keys um)
+            if (canonicalJSON(fresh) !== canonicalJSON([_phenopacketOutputTextView string]))
+                [self _showPhenopacket:fresh];
         }
     }
     else if (object === matchesController && [keyPath isEqualToString:@"content"])
@@ -3122,8 +3190,8 @@ _CPTokenFieldToken = HPOTokenFieldToken;
 
 - (void)_generateNarrativeSummaryForController:(id)controller targetView:(CPTextView)targetTextView sender:(id)sender
 {
-    var selectedMatch = [controller selection];
-    if (!selectedMatch || [selectedMatch isMemberOfClass:[CPNull class]]) {
+    var selectedMatch = [self _concreteSelectionOf:controller];
+    if (!selectedMatch) {
         alert("Please select a match row first.");
         return;
     }
@@ -3163,10 +3231,11 @@ _CPTokenFieldToken = HPOTokenFieldToken;
             try {
                 var parsedData = JSON.parse(data);
                 var summary = parsedData.summary || "No narrative generated by the model.";
-                var parsedAttrStr = [CPMarkdownParser attributedStringFromMarkdown:summary];
-                [targetTextView setString:parsedAttrStr];
-                
                 [selectedMatch setValue:summary forKey:@"summary"];
+
+                // Nur anzeigen, wenn dieser Match noch selektiert ist
+                if ([self _concreteSelectionOf:controller] === selectedMatch)
+                    [targetTextView setString:[CPMarkdownParser attributedStringFromMarkdown:summary]];
                 [self updateTaskWithIdentifier:@"narrative_summary" state:@"finished" message:@"Abgeschlossen" progress:100];
             } catch (e) {
                 [targetTextView setString:@"Error parsing narrative response: " + e.message];
@@ -3730,6 +3799,10 @@ _CPTokenFieldToken = HPOTokenFieldToken;
     [self addTaskWithName:@"FHIR Eligibility Extraction" identifier:@"fhir_extraction"];
     [self updateTaskWithIdentifier:@"fhir_extraction" state:@"active" message:@"Extrahiere Kriterien..." progress:25];
 
+    // Zielstudie JETZT festhalten, nicht erst im Completion-Handler
+    var targetTrial   = [self _concreteSelectionOf:trialsController];
+    var targetTrialId = targetTrial ? [targetTrial valueForKey:@"id"] : nil;
+
     var request = [CPURLRequest requestWithURL:"/BBB/extract_fhir_inex_criteria"
                                    cachePolicy:CPURLRequestUseProtocolCachePolicy
                                timeoutInterval:1800.0];
@@ -3764,20 +3837,29 @@ _CPTokenFieldToken = HPOTokenFieldToken;
                     parsedData = [self convertCustomJSONToFHIRGroup:parsedData];
                 }
 
+                var targetShown = (targetTrialId === nil || [self _record:_editorTrial hasId:targetTrialId]);
+
                 if (parsedData && parsedData.resourceType === "Group")
                 {
-                    [self importFHIRGroup:parsedData];
-
-                    var selectedTrial = [trialsController selection];
-
-                    if (selectedTrial && ![selectedTrial isMemberOfClass:[CPNull class]])
+                    if (targetShown)
                     {
-                        var prettyJson = JSON.stringify([[self compileGroupFromFlatNodes:_rootNodes] JSObject], null, 2);
-                        [selectedTrial setValue:prettyJson forKey:@"fhir_group_json"];
+                        // Studie ist noch im Editor: laden und normalisiert speichern
+                        [self importFHIRGroup:parsedData];
+                        if (_editorTrial)
+                        {
+                            var prettyJson = JSON.stringify([[self compileGroupFromFlatNodes:_rootNodes] JSObject], null, 2);
+                            [_editorTrial setValue:prettyJson forKey:@"fhir_group_json"];
+                            _fhirJsonString = prettyJson;
+                        }
                     }
-
+                    else
+                    {
+                        // Nutzer ist woanders: nur in die Ursprungsstudie, Editor nicht anfassen
+                        [self _persistValue:JSON.stringify(parsedData, null, 2) forKey:@"fhir_group_json"
+                                   recordId:targetTrialId table:@"trials" controller:trialsController];
+                    }
                 }
-                else
+                else if (targetShown)
                 {
                     [self importPhenopacketToEditor:parsedData];
                 }
@@ -3827,10 +3909,11 @@ _CPTokenFieldToken = HPOTokenFieldToken;
         }
     }
 
-    // Extract selected candidate details (ID and reference date)
-    var selectedCandidate = [candidatesController selection];
-    var candidateId = (selectedCandidate && ![selectedCandidate isMemberOfClass:[CPNull class]]) ? [selectedCandidate valueForKey:@"id"] : nil;
-    var refDate = (selectedCandidate && ![selectedCandidate isMemberOfClass:[CPNull class]]) ? ([selectedCandidate valueForKey:@"reference_date"]) : nil;
+    // Kandidaten JETZT festhalten. Das Backend speichert per candidate_id,
+    // die GUI aktualisiert sich über Fireside (WebSocket).
+    var targetCandidate = [self _concreteSelectionOf:candidatesController];
+    var candidateId = targetCandidate ? [targetCandidate valueForKey:@"id"] : nil;
+    var refDate     = targetCandidate ? [targetCandidate valueForKey:@"reference_date"] : nil;
 
     [sender setEnabled:NO];
     [sender setTitle:@"Extracting..."];
@@ -3863,30 +3946,36 @@ _CPTokenFieldToken = HPOTokenFieldToken;
         [sender setEnabled:YES];
         [sender setTitle:@"Extract phenopacket"];
 
+        // Gespeichert hat das Backend. Hier nur anzeigen, und nur, wenn
+        // dieser Kandidat noch offen ist (sonst kommt das Update per Fireside).
+        var stillShown = (candidateId === nil || candidateId === undefined) || [self _record:_editorCandidate hasId:candidateId];
+        var status = (response && [response respondsToSelector:@selector(statusCode)]) ? [response statusCode] : 200;
+        var parsedData = nil;
         if (!error && data) {
-            try {
-                var parsedData = JSON.parse(data);
-                var prettyJSON = JSON.stringify(parsedData, null, 4);
-                [_phenopacketOutputTextView setString:prettyJSON];
-                [self parseActivePhenopacketToVisualItems];
-                
-                if (selectedCandidate && ![selectedCandidate isMemberOfClass:[CPNull class]])
-                {
-                    [selectedCandidate setValue:prettyJSON forKey:@"phenopacket_json"];
-                }
-                
-                [self updateTaskWithIdentifier:@"phenopacket_extraction" state:@"finished" message:@"Erfolgreich abgeschlossen" progress:100];
-            } catch (e) {
-                [_phenopacketOutputTextView setString:data];
-                [self parseActivePhenopacketToVisualItems];
-                [self updateTaskWithIdentifier:@"phenopacket_extraction" state:@"failed" message:@"Verarbeitungsfehler" progress:0];
-            }
-        } else {
-            var errorMsg = (error) ? [error description] : @"Unknown error occurred.";
-            [_phenopacketOutputTextView setString:@"Failed to extract phenopacket:\n\n" + errorMsg];
-            [self parseActivePhenopacketToVisualItems];
-            console.log("Extraction Error: ", error);
-            [self updateTaskWithIdentifier:@"phenopacket_extraction" state:@"failed" message:@"Verbindungsfehler" progress:0];
+            try { parsedData = JSON.parse(data); } catch (e) { parsedData = nil; }
+        }
+
+        if (!error && status < 400 && parsedData && !parsedData.error)
+        {
+            // Direkt anzeigen: Bleibt das Ergebnis gleich, feuert kein KVO und
+            // der Platzhalter "Extracting..." bliebe sonst stehen.
+            if (stillShown)
+                [self _showPhenopacket:JSON.stringify(parsedData)];
+            [self updateTaskWithIdentifier:@"phenopacket_extraction" state:@"finished" message:@"Erfolgreich abgeschlossen" progress:100];
+        }
+        else
+        {
+            var errorMsg = error ? [error description]
+                         : (parsedData && parsedData.error) ? (parsedData.error + (parsedData.details ? ": " + parsedData.details : ""))
+                         : (data || @"Unbekannter Fehler");
+            console.log("Extraction Error: ", errorMsg);
+
+            // Gespeicherten Stand wiederherstellen statt Fehlertext im Editor
+            // (sonst würde eine Bearbeitung in der Tabelle den Fehlertext speichern)
+            if (stillShown)
+                [self _showPhenopacket:(_editorCandidate ? [_editorCandidate valueForKey:@"phenopacket_json"] : @"")];
+            [self updateTaskWithIdentifier:@"phenopacket_extraction" state:@"failed" message:@"Fehler" progress:0];
+            alert("Phenopacket-Extraktion fehlgeschlagen:\n" + errorMsg);
         }
      }];
 }
@@ -4055,13 +4144,13 @@ _CPTokenFieldToken = HPOTokenFieldToken;
         var jsFormattedObject = [rootGroup JSObject];
         var prettyJson = JSON.stringify(jsFormattedObject, null, 2);
 
-        var selectedTrial = [trialsController selection];
-        if (selectedTrial && ![selectedTrial isMemberOfClass:[CPNull class]])
+        // Nur in die Studie schreiben, die der Editor gerade anzeigt
+        if (_editorTrial)
         {
-            var currentJson = [selectedTrial valueForKey:@"fhir_group_json"] || @"";
+            var currentJson = [_editorTrial valueForKey:@"fhir_group_json"] || @"";
             if (currentJson !== prettyJson)
             {
-                [selectedTrial setValue:prettyJson forKey:@"fhir_group_json"];
+                [_editorTrial setValue:prettyJson forKey:@"fhir_group_json"];
             }
         }
 
@@ -5503,6 +5592,7 @@ _CPTokenFieldToken = HPOTokenFieldToken;
             
             var item = _phenoVisualItems[row];
             tokenField.rowIndex = row;
+            tokenField.ownerCandidate = _editorCandidate;
             
             var tokens = [];
             if (item && item.code) {
@@ -5754,6 +5844,33 @@ _CPTokenFieldToken = HPOTokenFieldToken;
     });
 
     [tableView reloadData];
+}
+
+// Inhaltlicher JSON-Vergleich unabhängig von Key-Reihenfolge und Formatierung
+function canonicalJSON(str)
+{
+    if (str === nil || str === undefined || str === "")
+        return "";
+    if (typeof str !== "string")
+        str = JSON.stringify(str);
+
+    var sortKeys = function(v) {
+        if (Array.isArray(v))
+            return v.map(sortKeys);
+        if (v && typeof v === "object")
+        {
+            var o = {};
+            Object.keys(v).sort().forEach(function(k) { o[k] = sortKeys(v[k]); });
+            return o;
+        }
+        return v;
+    };
+
+    try {
+        return JSON.stringify(sortKeys(JSON.parse(str)));
+    } catch (e) {
+        return String(str);
+    }
 }
 
 function formatHPOId(termId)
@@ -7277,6 +7394,10 @@ function formatHPOId(termId)
     {
         tokenField = [sender object];
     }
+
+    // Editiervorgang gehört zu einem inzwischen verlassenen Kandidaten
+    if (tokenField && tokenField.ownerCandidate !== undefined && tokenField.ownerCandidate !== _editorCandidate)
+        return;
     
     if (tokenField && tokenField.rowIndex !== undefined)
     {
@@ -7487,11 +7608,10 @@ function formatHPOId(termId)
     var prettyJSON = JSON.stringify(phenopacket, null, 4);
     [_phenopacketOutputTextView setString:prettyJSON];
 
-    var selectedCandidate = [candidatesController selection];
-
-    if (selectedCandidate && ![selectedCandidate isMemberOfClass:[CPNull class]])
+    // Nur in den angezeigten Kandidaten schreiben, nie in die Selektion
+    if (_editorCandidate)
     {
-        [selectedCandidate setValue:prettyJSON forKey:@"phenopacket_json"];
+        [_editorCandidate setValue:prettyJSON forKey:@"phenopacket_json"];
     }
 }
 

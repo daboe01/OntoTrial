@@ -3,9 +3,8 @@
 # OntoTrial Backend - Step-by-Step Extraction & Deduplicated Disjunctive Assembly Engine
 # Copyright 2026 Daniel Böhringer
 
-# + FHIR Eye Normalization (Study Eye -> Right Eye, Fellow Eye -> Left Eye)
-# TODO: use a BERT model to validate idems after union ensemble (idea)
 # TODO: support orphacodes
+# TODO: Long-export with intelligent deduplication
 
 use utf8;
 use Mojolicious::Lite;
@@ -45,6 +44,9 @@ helper pg => sub {
 
 
 plugin Minion => {Pg => 'postgresql://postgres:postgres@localhost/hpo'};
+# Jobs erst nach 30 Tagen im Zustand "inactive" als hängend markieren
+# (Standard: 2 Tage, reicht bei großem Rückstand nicht)
+app->minion->stuck_after(60 * 60 * 24 * 30);
 
 # Turn browser cache off
 hook after_dispatch => sub {
@@ -272,6 +274,27 @@ helper notify_task_progress => sub {
     };
 
     $self->pg->pubsub->notify(fireside_updates => encode_json($payload));
+};
+
+# ---------------------------------------------------------
+# Phenopacket am Kandidaten speichern (per candidate_id, nie per
+# GUI-Selektion) und alle Clients per Fireside-Live-Sync informieren.
+# Kleine Payloads merged Fireside direkt, große (> 7.500 Zeichen,
+# "truncated") lädt es per GET /BBB/candidates/id/<id> nach.
+# ---------------------------------------------------------
+helper store_phenopacket => sub {
+    my ($self, $candidate_id, $pp, $narrative) = @_;
+    return 0 unless defined $candidate_id && $candidate_id =~ /^\d+$/;
+
+    my %set = (phenopacket_json => (ref $pp ? to_json($pp) : $pp));
+    $set{narrative_report} = $narrative if defined $narrative;
+
+    my $rows = $self->pg->db->update('candidates', \%set, { id => $candidate_id })->rows;
+    die "Kandidat $candidate_id existiert nicht\n" unless $rows;
+
+    eval { $self->notify_change('candidates', $candidate_id + 0, 'UPDATE', \%set); 1 }
+        or $self->app->log->warn("[PHENOPACKET NOTIFY] Kandidat $candidate_id: $@");
+    return $rows;
 };
 
 # =========================================================
@@ -748,6 +771,28 @@ sub build_ophthalmic_loinc_measurements {
 }
 
 # =========================================================================
+# MESSWERT-MASKIERUNG: Zahlen mit Vergleichsoperator oder Einheit sind keine Jahre
+# ("Endothelzelldichte >2001 Z/qmm" darf weder Datum noch Jahr 2001 werden)
+# =========================================================================
+our $MEASUREMENT_UNIT_REGEX = qr{
+    (?:Z(?:ellen)?|cells?)\s*(?:/|pro)\s*(?:q?mm²?|mm\^?2|quadratmillimeter)
+  | /\s*(?:q?mm²?|mm\^?2|µl|ul|dl|ml|min)\b
+  | mm\s*hg\b | torr\b | µm | μm | um\b(?!\s+\p{Ll}) | mm[²³23]?\b | cm\b | dpt\b | dptr\b
+  | % | mg\b | µg\b | ug\b | ng\b | pg\b | g/l\b | mmol | µmol | umol | nmol | u/l\b
+  | tsd\b | mio\b | fl\b | sek\b | db\b
+}xi;
+our $MEASUREMENT_KEY_REGEX = qr/\b(?:endothel\w*|ecd|ezd|zelldichte|zellzahl|pachymetrie|cct|hornhautdicke|rnfl)\b/i;
+
+sub mask_measurement_numbers {
+    my ($t) = @_;
+    return '' unless defined $t;
+    $t =~ s{(?:[<>≤≥]=?|~)\s*\d+(?:[.,]\d+)?}{ }g;                                  # ">2001", "≥ 1500"
+    $t =~ s{(?<![\d.,/])\b\d+(?:[.,]\d+)?\s*(?=$MEASUREMENT_UNIT_REGEX)}{ }g;       # "2050 Zellen/mm²", "520 µm"
+    $t =~ s{$MEASUREMENT_KEY_REGEX\s*[:=]?\s*(?:ca\.?\s*)?\d+(?:[.,]\d+)?}{ }g;     # "ECD 2050", "Pachymetrie 2010"
+    return $t;
+}
+
+# =========================================================================
 # QUANTITATIVE CONSTRAINT PARSER (OPHTHALMIC, LABORATORY & CLINICAL METRICS)
 # =========================================================================
 sub parse_quantitative_constraint {
@@ -920,8 +965,9 @@ sub parse_quantitative_constraint {
     $clean_text =~ s/\b(?:stabil\s+zu|progredient\s+zu|befund\s+vom?|stand|vom?|zuletzt|am)\s+(?:0?[1-9]|1[0-2])[\/\.](?:19|20)\d{2}\b/ /gi;
     $clean_text =~ s/\b(?:0?[1-9]|[12]\d|3[01])\.(?:0?[1-9]|1[0-2])\.(?:19|20)\d{2}\b/ /g; # DD.MM.YYYY
     $clean_text =~ s/\b(?:0?[1-9]|1[0-2])\/(?:19|20)\d{2}\b/ /g;                           # MM/YYYY
-    $clean_text =~ s/\b(?:19|20)\d{2}\b/ /g;                                               # Vierstelliges Jahr YYYY
-
+    unless ($clean_text =~ $MEASUREMENT_KEY_REGEX) {
+        $clean_text =~ s/(?<![<>=≥≤~\d])(?<![<>=]\s)\b(?:19|20)\d{2}\b(?!\s*$MEASUREMENT_UNIT_REGEX)/ /g;
+    }
     # Reines Datum / rein qualitativer Text übrig geblieben? -> Kein quantitativer Messwert
         if ($clean_text !~ /\d/) {
             return undef;
@@ -3971,6 +4017,7 @@ sub extract_event_date {
 
     # Vergleichs- und Vorbefundsfloskeln maskieren
     my $clean_date_text = $text;
+    $clean_date_text = mask_measurement_numbers($clean_date_text);
     $clean_date_text =~ s/\b(?:stabil\s+(?:zu|ggü\.?|gegenüber)|progredient\s+(?:zu|ggü\.?|gegenüber)|(?:im\s+)?vergleich\s+zu|vgl\.?\s*zu|kontrolle\s+zu|vorbefund(?:\s+vom)?)\s*(?:(?:0?[1-9]|1[0-2])[\/\.](?:19|20)?\d{2}|(?:19|20)\d{2})\b/ /gi;
 
     # PRIORITÄT: Deutsches Format DD.MM.YY (z. B. "05.09.26") ZUERST prüfen,
@@ -5924,9 +5971,10 @@ helper generate_phenopacket_impl => sub {
             foreach my $m (@final_measurements) {
                 next unless $m && $m->{assay} && $m->{assay}{id};
                 my $assay_id = $m->{assay}{id};
-                my $val = defined $m->{value}{quantity}{value}
-                        ? $m->{value}{quantity}{value}
-                        : ($m->{value}{ontologyClass}{id} // '');
+                my $mv  = ref $m->{value} eq 'HASH' ? $m->{value} : {};
+                my $val = (ref $mv->{quantity} eq 'HASH' && defined $mv->{quantity}{value})
+                        ? $mv->{quantity}{value}
+                        : (ref $mv->{ontologyClass} eq 'HASH' ? ($mv->{ontologyClass}{id} // '') : '');
                 my $lat = 'none';
                 foreach my $mod (@{$m->{modifiers} // []}) {
                     if ($mod->{id} =~ /^HP:001283[245]$/) {
@@ -6172,8 +6220,14 @@ helper generate_phenopacket_impl => sub {
             $self->notify_task_progress($task_id, 'finished', 100, "Phenopacket erfolgreich erzeugt");
 
             my $timestamp = strftime("%Y-%m-%dT%H:%M:%SZ", gmtime);
+            my $ref_day = normalize_reference_day($reference_date);
+            my $created = $ref_day
+                ? "${ref_day}T00:00:00Z"
+                : strftime("%Y-%m-%dT%H:%M:%SZ", gmtime);
+
             return {
                 id                 => "phenopacket-" . time(),
+                ($ref_day ? (reference_date => $ref_day) : ()),
                 subject            => $subject_obj,
                 phenotypicFeatures => \@final_features,
                 measurements       => \@final_measurements,
@@ -6181,7 +6235,7 @@ helper generate_phenopacket_impl => sub {
                 procedures         => \@final_procedures,
                 medicalActions     => \@medical_actions,
                 metaData           => {
-                    created                  => $timestamp,
+                    created                  => $created,
                     createdBy                => "OntoTrial2-DisjunctiveDeduplicatedStepEngine",
                     phenopacketSchemaVersion => "2.0.0",
                     resources                => [
@@ -6215,7 +6269,10 @@ post '/BBB/extract_phenopacket' => sub {
 
     $c->render_later;
     $c->generate_phenopacket_impl($text_content, $selected_model, $candidate_id, $reference_date, $deep_mode, $task_id)->then(sub {
-        $c->render(json => shift);
+        my $pp = shift;
+        # Persistieren übernimmt das Backend; ein Fehler landet im catch (HTTP 500)
+        $c->store_phenopacket($candidate_id, $pp) if defined $candidate_id && length $candidate_id;
+        $c->render(json => $pp);
     })->catch(sub {
         my $err = shift;
         $c->notify_task_progress($task_id, 'failed', 0, "Pipeline-Fehler: $err");
@@ -6246,14 +6303,16 @@ post '/BBB/extract_phenopacket_from_letter' => sub {
 
     $c->render_later;
     $c->generate_phenopacket_impl($text_content, $selected_model, $candidate_id, $reference_date, $deep_mode, $task_id)->then(sub {
-        $c->render(json => shift);
+        my $pp = shift;
+        # Persistieren übernimmt das Backend; ein Fehler landet im catch (HTTP 500)
+        $c->store_phenopacket($candidate_id, $pp) if defined $candidate_id && length $candidate_id;
+        $c->render(json => $pp);
     })->catch(sub {
         my $err = shift;
         $c->notify_task_progress($task_id, 'failed', 0, "Pipeline-Fehler: $err");
         $c->render(json => { error => "Pipeline failure", details => "$err" }, status => 500);
     });
 };
-
 
 # =========================================================================
 # A) ENDPUNKT: ARZTBRIEF IMPORTIEREN & ASYNCHRON EXTRAHIEREN
@@ -6331,14 +6390,14 @@ post '/BBB/import_and_extract_letter' => sub {
 
     return $c->render(json => { status => 'rejected',
         error => "Pflichtfelder 'pseudonym' (oder 'piz') und 'medical_report' (oder 'text') fehlen." }, status => 400)
-    unless defined $pseudonym && length $pseudonym && length $text;
+        unless defined $pseudonym && length $pseudonym && length $text;
     return $c->render(json => { status => 'rejected', error => "Ungültige Quelle '$source'." }, status => 400)
-    unless $source =~ /^[a-z0-9_]{1,20}$/;
+        unless $source =~ /^[a-z0-9_]{1,20}$/;
     return $c->render(json => { status => 'rejected', error => "Ungültiger Modus '$mode'." }, status => 400)
-    unless $mode =~ /^(?:hard|soft)$/;
+        unless $mode =~ /^(?:hard|soft)$/;
     return $c->render(json => { status => 'rejected',
         error => "Soft-Push braucht ein gültiges 'reference_date' (JJJJ-MM-TT oder TT.MM.JJJJ)." }, status => 422)
-    if $mode eq 'soft' && !$ref_day;
+        if $mode eq 'soft' && !$ref_day;
 
     $tol       = 0 unless defined $tol && $tol =~ /^\d{1,2}$/;
     $ref_day //= POSIX::strftime('%Y-%m-%d', localtime);
@@ -6358,41 +6417,41 @@ post '/BBB/import_and_extract_letter' => sub {
         # 1. Derselbe Brief aus derselben Quelle
         my $same = $doc_id ? $db->query(q{
             SELECT id, doc_hash, (phenopacket_json IS NOT NULL) AS has_pp, extract_job_id,
-            to_char(public.ontotrial_ref_day(reference_date::text), 'YYYY-MM-DD') AS day
-            FROM candidates
-            WHERE doc_source = ? AND doc_id::text = ?
-            ORDER BY id LIMIT 1
+                   to_char(reference_date::date, 'YYYY-MM-DD') AS day
+              FROM candidates
+             WHERE doc_source = ? AND doc_id = ?
+             ORDER BY id LIMIT 1
         }, $source, $doc_id)->hash : undef;
         my $self_id = $same ? $same->{id} : 0;
 
         # 2. Irgendein anderer Brief desselben Patienten am selben Tag (± Toleranz)
         my $same_day = $db->query(q{
             SELECT id, doc_source, doc_id::text AS doc_id,
-            to_char(public.ontotrial_ref_day(reference_date::text), 'YYYY-MM-DD') AS day
-            FROM candidates
-            WHERE pseudonym = ?
-            AND id <> ?
-            AND public.ontotrial_ref_day(reference_date::text) BETWEEN ?::date - ?::int AND ?::date + ?::int
-            ORDER BY (doc_source = 'argos') DESC,
-            abs(public.ontotrial_ref_day(reference_date::text) - ?::date), id
-            LIMIT 1
+                   to_char(reference_date::date, 'YYYY-MM-DD') AS day
+              FROM candidates
+             WHERE pseudonym = ?
+               AND id <> ?
+               AND reference_date >= ?::date - ?::int AND reference_date < ?::date + ?::int + 1
+             ORDER BY (doc_source = 'argos') DESC,
+                      abs(reference_date::date - ?::date), id
+             LIMIT 1
         }, $pseudonym, $self_id, $ref_day, $tol, $ref_day, $tol, $ref_day)->hash;
 
         # 3. Identischer Text beim selben Patienten (anderes Datum, andere ID)
         my $same_text = $db->query(q{
             SELECT id, doc_source, doc_id::text AS doc_id
-            FROM candidates
-            WHERE pseudonym = ? AND doc_hash = ? AND id <> ?
-            ORDER BY id LIMIT 1
+              FROM candidates
+             WHERE pseudonym = ? AND doc_hash = ? AND id <> ?
+             ORDER BY id LIMIT 1
         }, $pseudonym, $hash, $self_id)->hash;
 
         my $conflict = sub {
             my $x = shift;
             return { candidate_id => $x->{id}, source => $x->{doc_source}, doc_id => $x->{doc_id},
-                (defined $x->{day} ? (reference_date => $x->{day}) : ()) };
+                     (defined $x->{day} ? (reference_date => $x->{day}) : ()) };
         };
         my %row = (narrative_report => $text, doc_hash => $hash,
-        reference_date => $ref_day, phenopacket_json => undef);
+                   reference_date => $ref_day, phenopacket_json => undef);
 
         if ($same) {
             # Gleicher Text UND gleiches Datum: nichts zu tun. Ein geändertes Datum
@@ -6425,20 +6484,20 @@ post '/BBB/import_and_extract_letter' => sub {
             # hard: eine Kopie aus einer anderen (nicht manuellen) Quelle am selben Tag übernehmen
             my $adopt = $mode eq 'hard' ? $db->query(q{
                 SELECT id, doc_source, doc_id::text AS doc_id
-                FROM candidates
-                WHERE pseudonym = ?
-                AND doc_source NOT IN (?, 'manual')
-                AND public.ontotrial_ref_day(reference_date::text) BETWEEN ?::date - ?::int AND ?::date + ?::int
-                ORDER BY abs(public.ontotrial_ref_day(reference_date::text) - ?::date), id
-                LIMIT 1
+                  FROM candidates
+                 WHERE pseudonym = ?
+                   AND doc_source NOT IN (?, 'manual')
+                   AND reference_date >= ?::date - ?::int AND reference_date < ?::date + ?::int + 1
+                 ORDER BY abs(reference_date::date - ?::date), id
+                 LIMIT 1
             }, $pseudonym, $source, $ref_day, $tol, $ref_day, $tol, $ref_day)->hash : undef;
 
             if ($adopt) {
                 $db->update('candidates',
-                { %row, doc_source => $source, doc_id => $doc_id, pseudonym => $pseudonym },
-                { id => $adopt->{id} });
+                    { %row, doc_source => $source, doc_id => $doc_id, pseudonym => $pseudonym },
+                    { id => $adopt->{id} });
                 %r = (status => 'queued', action => 'adopted', candidate_id => $adopt->{id},
-                replaced => { source => $adopt->{doc_source}, doc_id => $adopt->{doc_id} });
+                      replaced => { source => $adopt->{doc_source}, doc_id => $adopt->{doc_id} });
                 $enqueue_id = $adopt->{id};
             } else {
                 my $id = $db->insert('candidates', {
@@ -6477,8 +6536,8 @@ post '/BBB/import_and_extract_letter' => sub {
     }
 
     my $log_msg = sprintf("[IMPORT %s] %s:%s PIZ %s %s -> %s%s%s",
-    uc($mode), $source, $doc_id // '-', $pseudonym, $ref_day, $r{status},
-    ($r{action} ? " ($r{action})" : ''), ($r{reason} ? " ($r{reason})" : ''));
+        uc($mode), $source, $doc_id // '-', $pseudonym, $ref_day, $r{status},
+        ($r{action} ? " ($r{action})" : ''), ($r{reason} ? " ($r{reason})" : ''));
     $r{status} eq 'skipped' ? $c->app->log->debug($log_msg) : $c->app->log->info($log_msg);
 
     $c->render(json => {
@@ -6490,6 +6549,7 @@ post '/BBB/import_and_extract_letter' => sub {
         message        => sprintf("Arztbrief %s:%s (PIZ %s, %s): %s", $source, $doc_id // '-', $pseudonym, $ref_day, $r{status}),
     });
 };
+
 
 # =========================================================================
 # B) MINION TASK: ASYNCHRONE ARZTBRIEF-EXTRAKTION (PHENOPACKET)
@@ -6532,10 +6592,8 @@ app->minion->add_task(import_and_extract_letter_task => sub {
             return $job->finish('superseded');
         }
 
-        $db->update('candidates', {
-                                        phenopacket_json => to_json($phenopacket),
-                                        narrative_report => $text_content
-                                  }, { id => $candidate_id });
+        # Speichert und benachrichtigt die GUI (Fireside Live-Sync)
+        $app->store_phenopacket($candidate_id, $phenopacket, $text_content);
 
         $app->log->info("[MINION TASK] Extraktion für Candidate ID $candidate_id ($pseudonym) erfolgreich abgeschlossen.");
         $job->note(status => 'finished', message => "Extraktion für $pseudonym abgeschlossen.", progress => 100);
@@ -6546,7 +6604,6 @@ app->minion->add_task(import_and_extract_letter_task => sub {
         $job->fail("Extraktionsfehler: $err");
     })->wait;
 });
-
 # =========================================================================
 # MATCHING & TRACING ENGINE
 # =========================================================================
@@ -9033,37 +9090,6 @@ get '/BBB/candidates/count_by_tag' => sub {
 };
 
 # =========================================================
-# GENERIC DB REST CRUD ENDPOINTS (MIT 1/1-SICHERUNG)
-# =========================================================
-helper fetchFromTable => sub {
-    my ($self, $table_raw, $sessionid, $where) = @_;
-    my $table = resolve_table_name($table_raw);
-    return $self->pg->db->select($table, ['*'], $where)->hashes->to_array;
-};
-
-get '/BBB/:table' => sub {
-    my $self  = shift;
-    my $table = resolve_table_name($self->param('table'));
-    $self->render(json => $self->pg->db->select($table, ['*'])->hashes->to_array);
-};
-
-get '/BBB/:table/:col/:pk' => [col => qr/[a-z_0-9\s]+/, pk => qr/[a-z0-9\s\-_\.]+/i] => sub {
-    my $self  = shift;
-    my $table = resolve_table_name($self->param('table'));
-    my $pk    = $self->param('pk');
-    my $col   = $self->param('col');
-
-    # SICHERUNG GEGEN ERROR: column "1" does not exist
-    # Wenn Fireside '1/1' schickt, soll Postgres kein WHERE "1" = 1 ausführen,
-    # sondern einfach alle Datensätze der Tabelle selektieren.
-    if ($col eq '1' && $pk eq '1') {
-        return $self->render(json => $self->pg->db->select($table, ['*'])->hashes->to_array);
-    }
-
-    $self->render(json => $self->pg->db->select($table, ['*'], {$col => $pk})->hashes->to_array);
-};
-
-# =========================================================
 # ENDPUNKT: KANDIDATEN NACH TAG NEU BERECHNEN (MINION QUEUE)
 # =========================================================
 post '/BBB/candidates/recompute_by_tag' => sub {
@@ -9507,8 +9533,14 @@ helper anon_phenopacket => sub {
         }
     }
 
+    my $ref_month = $ts->($pp->{reference_date});
+    my $created   = (defined $ref_month && $ref_month =~ /^\d{4}-\d{2}$/)
+                  ? "$ref_month-01T00:00:00Z"
+                  : $ctx->{created};
+
     return {
         id                 => 'phenopacket-' . _anon_random_id(8),
+        (defined $ref_month ? (reference_date => $ref_month) : ()),
         subject            => \%subject,
         phenotypicFeatures => \@features,
         measurements       => \@measurements,
@@ -9516,7 +9548,7 @@ helper anon_phenopacket => sub {
         procedures         => \@procedures,
         medicalActions     => \@actions,
         metaData           => {
-            created                  => $ctx->{created},
+            created                  => $created,
             createdBy                => 'OntoTrial-DeidentificationEngine',
             phenopacketSchemaVersion => '2.0.0',
             resources                => [ map { +{ %$_ } } @ANON_RESOURCES ],
@@ -9611,24 +9643,27 @@ post '/BBB/export/anonymized_phenopackets' => sub {
 # =========================================================
 # GENERIC DB REST CRUD ENDPOINTS
 # =========================================================
-helper fetchFromTable => sub {
-    my ($self, $table_raw, $sessionid, $where) = @_;
-    my $table = resolve_table_name($table_raw);
-    return $self->pg->db->select($table, ['*'], $where)->hashes->to_array;
-};
-
-get '/BBB/:table' => sub {
-    my $self  = shift;
-    my $table = resolve_table_name($self->param('table'));
-    $self->render(json => $self->pg->db->select($table, ['*'])->hashes->to_array);
-};
 
 get '/BBB/:table/:col/:pk' => [col => qr/[a-z_0-9\s]+/, pk => qr/[a-z0-9\s\-_\.]+/i] => sub {
     my $self  = shift;
     my $table = resolve_table_name($self->param('table'));
     my $pk    = $self->param('pk');
     my $col   = $self->param('col');
+
+    # SICHERUNG GEGEN ERROR: column "1" does not exist
+    # Wenn Fireside '1/1' schickt, soll Postgres kein WHERE "1" = 1 ausführen,
+    # sondern einfach alle Datensätze der Tabelle selektieren.
+    if ($col eq '1' && $pk eq '1') {
+        return $self->render(json => $self->pg->db->select($table, ['*'])->hashes->to_array);
+    }
+
     $self->render(json => $self->pg->db->select($table, ['*'], {$col => $pk})->hashes->to_array);
+};
+
+get '/BBB/:table' => sub {
+    my $self  = shift;
+    my $table = resolve_table_name($self->param('table'));
+    $self->render(json => $self->pg->db->select($table, ['*'])->hashes->to_array);
 };
 
 post '/BBB/:table/:pk' => sub {

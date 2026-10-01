@@ -497,7 +497,9 @@ var _allRelationships;
         }
 
         // 3. TRUNCATED PAYLOAD (> 7.500 Zeichen wie lange Arztbriefe)
-        if (payload.truncated)
+        // Nur für lokal geladene Objekte nachladen. Sonst holt jeder Client
+        // bei Bulk-Läufen (Minion, Recompute by Tag) jede geänderte Zeile.
+        if (payload.truncated && object)
         {
             // Wir laden nur die Daten für diesen EINEN Datenpunkt nach
             // und aktualisieren ihn "in place", OHNE den controller zu überschreiben!
@@ -858,8 +860,6 @@ var _allRelationships;
         if (o.hasOwnProperty(propName))
         {
             var pnv = o[propName];
-
-            console.log("PNV: "+pnv);
 
             if(pnv !== nil && ![pnv isEqual:[_data objectForKey:propName]])
             {
