@@ -9641,6 +9641,439 @@ post '/BBB/export/anonymized_phenopackets' => sub {
 };
 
 # =========================================================
+# LONG-FORMAT EXPORT FÜR STATISTIK (R, Python, Stata)
+#
+#   GET /BBB/export/long/events    eine Zeile je kodiertem Element
+#   GET /BBB/export/long/patients  eine Zeile je Arztbrief (Phenopacket)
+#
+# Spalten "events" (kompatibel zum Fellow-Eye-Skript):
+#   pseudonym, packet_id, packet_created, letter_date, candidate_id,
+#   phenopacket_id, domain, code, label, site_id, date_raw, excluded,
+#   value, unit, comparator, value_text, n_mentions, last_letter_date
+#     domain   : procedure | disease | phenotype | treatment | measurement
+#     site_id  : HP:0012834 rechts, HP:0012835 links, HP:0012832 beidseits
+#     date_raw : unverändert ('YYYY', 'YYYY-MM', 'YYYY-MM-DD', ...)
+#     packet_id: 'cand-<candidate_id>', eindeutig je Brief. Die interne
+#                Phenopacket-ID ("phenopacket-<sekunde>") kann bei
+#                gleichzeitig fertigen Extraktionen kollidieren und steht
+#                nur noch in phenopacket_id.
+#     letter_date : Briefdatum (candidates.reference_date)
+#     n_mentions / last_letter_date : wie oft und bis wann das Element in
+#                Briefen dieses Patienten vorkam (nach Deduplizierung)
+#
+# Parameter (Listen kommagetrennt oder mehrfach angegeben):
+#   tag=...           Tag(s), exakter Token-Vergleich, ohne Groß/Klein
+#   tag_scope=        patient (Default: alle Briefe getaggter Patienten) | letter
+#   has_code=...      Patient hat (nicht negiert) einen Code unterhalb, z. B. OPS:5-125
+#   pseudonyms=...    explizite Pseudonyme
+#   from=, to=        Briefdatum (JJJJ-MM-TT oder TT.MM.JJJJ), inklusiv
+#   event_from=, event_to=  Ereignisdatum (nur events); keep_undated=1 (Default)
+#   domains=...       Default: alle fünf
+#   sources=...       doc_source, z. B. argos,dwh
+#   include_excluded= 1 (Default) | 0
+#   dedup=            exact (Default) | code | none
+#   undated=          per_packet (Default) | first
+#   limit_patients=N  Testausschnitt (erste N Pseudonyme)
+#   all=1             nötig, wenn weder tag, has_code noch pseudonyms gesetzt sind
+#   format=           csv (Default) | ndjson
+#   token=...         bzw. Header X-Export-Token, falls ONTOTRIAL_EXPORT_TOKEN gesetzt
+#
+# Deduplizierung:
+#   1. Briefebene: identischer Brieftext beim selben Patienten (doc_hash,
+#      z. B. argos- und DWH-Kopie) zählt einmal; bevorzugt argos, dann die
+#      jüngste Extraktion.
+#   2. Elementebene: datierte Elemente, die in mehreren Briefen identisch
+#      vorkommen (fortgeschriebene Anamnese), erscheinen einmal, mit dem
+#      frühesten Brief als packet_id. Undatierte Elemente bleiben je Brief
+#      erhalten (undated=per_packet), weil die Auswertung sie mit dem
+#      Briefdatum datiert; undated=first behält nur die früheste Nennung.
+#      dedup=exact vergleicht auch das Label, dedup=code nur den Code.
+#
+# ACHTUNG: Ausgabe enthält Pseudonyme und exakte Daten (personenbeziehbar).
+# Für Weitergaben den anonymisierten Export verwenden.
+# =========================================================
+
+our $LX_BATCH   = 5000;
+our @LX_DOMAINS = qw(procedure disease phenotype treatment measurement);
+our $LX_LAT_IDS = q{('HP:0012834', 'HP:0012835', 'HP:0012832')};
+
+our @LX_EVENT_COLS = qw(pseudonym packet_id packet_created letter_date candidate_id phenopacket_id
+                        domain code label site_id date_raw excluded value unit comparator value_text
+                        n_mentions last_letter_date);
+our @LX_PATIENT_COLS = qw(pseudonym packet_id packet_created letter_date candidate_id phenopacket_id
+                          doc_source sex age_last_iso tags);
+our %LX_NUMERIC = map { $_ => 1 } qw(candidate_id value n_mentions);
+
+# jsonb-Feld nur entpacken, wenn es wirklich ein Array ist (sonst SQL-Fehler)
+sub _lx_arr { my ($e) = @_; return "CASE WHEN jsonb_typeof($e) = 'array' THEN $e ELSE '[]'::jsonb END" }
+sub _lx_flag { my ($e) = @_; return "(lower(COALESCE($e, '')) IN ('true', 't', '1', 'yes'))" }
+sub _lx_lat {
+    my ($e) = @_;
+    return "(SELECT mm->>'id' FROM jsonb_array_elements(" . _lx_arr($e) . ") mm "
+         . "WHERE jsonb_typeof(mm) = 'object' AND mm->>'id' IN $LX_LAT_IDS LIMIT 1)";
+}
+
+# SELECT-Zweig je Domäne. $b = Alias der Briefzeile mit Spalte pp.
+sub _lx_branch {
+    my ($dom, $b, $codes_only) = @_;
+    my $head = $codes_only
+        ? "SELECT $b.pseudonym,"
+        : "SELECT $b.pseudonym, $b.candidate_id, $b.packet_id, $b.packet_created, $b.packet_date, $b.phenopacket_id, '$dom'::text AS domain,";
+    my $tail_null = "NULL::numeric AS value, NULL::text AS unit, NULL::text AS comparator, NULL::text AS value_text";
+
+    if ($dom eq 'procedure') {
+        return "$head p->'code'->>'id' AS code, " . ($codes_only ? _lx_flag("p->>'excluded'") . " AS excluded" :
+               "p->'code'->>'label' AS label, p->'bodySite'->>'id' AS site_id, "
+             . "COALESCE(p->>'performedTime', p->'performed'->>'timestamp') AS date_raw, "
+             . _lx_flag("p->>'excluded'") . " AS excluded, $tail_null")
+             . " FROM jsonb_array_elements(" . _lx_arr("$b.pp->'procedures'") . ") p WHERE jsonb_typeof(p) = 'object'";
+    }
+    if ($dom eq 'disease') {
+        return "$head d->'term'->>'id' AS code, " . ($codes_only ? _lx_flag("d->>'excluded'") . " AS excluded" :
+               "d->'term'->>'label' AS label, d->'primarySite'->>'id' AS site_id, "
+             . "d->'onset'->>'timestamp' AS date_raw, "
+             . _lx_flag("d->>'excluded'") . " AS excluded, $tail_null")
+             . " FROM jsonb_array_elements(" . _lx_arr("$b.pp->'diseases'") . ") d WHERE jsonb_typeof(d) = 'object'";
+    }
+    if ($dom eq 'phenotype') {
+        return "$head f->'type'->>'id' AS code, " . ($codes_only ? _lx_flag("f->>'excluded'") . " AS excluded" :
+               "f->'type'->>'label' AS label, " . _lx_lat("f->'modifiers'") . " AS site_id, "
+             . "f->'onset'->>'timestamp' AS date_raw, "
+             . _lx_flag("f->>'excluded'") . " AS excluded, $tail_null")
+             . " FROM jsonb_array_elements(" . _lx_arr("$b.pp->'phenotypicFeatures'") . ") f WHERE jsonb_typeof(f) = 'object'";
+    }
+    if ($dom eq 'treatment') {
+        # medicalActions[].procedure dupliziert procedures[] und wird nicht gelesen
+        return "$head a->'treatment'->'agent'->>'id' AS code, " . ($codes_only ? _lx_flag("a->'treatment'->>'excluded'") . " AS excluded" :
+               "a->'treatment'->'agent'->>'label' AS label, a->'treatment'->'bodySite'->>'id' AS site_id, "
+             . "COALESCE(a->'treatment'->>'performedTime', a->'treatment'->'performed'->>'timestamp') AS date_raw, "
+             . _lx_flag("a->'treatment'->>'excluded'") . " AS excluded, $tail_null")
+             . " FROM jsonb_array_elements(" . _lx_arr("$b.pp->'medicalActions'") . ") a "
+             . "WHERE jsonb_typeof(a) = 'object' AND jsonb_typeof(a->'treatment') = 'object'";
+    }
+    if ($dom eq 'measurement') {
+        my $q = "m->'value'->'quantity'";
+        return "$head m->'assay'->>'id' AS code, " . ($codes_only ? _lx_flag("m->>'excluded'") . " AS excluded" :
+               "m->'assay'->>'label' AS label, " . _lx_lat("m->'modifiers'") . " AS site_id, "
+             . "m->'timeOfCollection'->>'timestamp' AS date_raw, "
+             . _lx_flag("m->>'excluded'") . " AS excluded, "
+             . "CASE WHEN ($q->>'value') ~ '^\\s*-?[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?\\s*\$' "
+             . "THEN ($q->>'value')::numeric END AS value, "
+             . "COALESCE($q->'unit'->>'label', CASE WHEN jsonb_typeof($q->'unit') = 'string' THEN $q->>'unit' END) AS unit, "
+             . "$q->>'comparator' AS comparator, "
+             . "m->'value'->'ontologyClass'->>'label' AS value_text")
+             . " FROM jsonb_array_elements(" . _lx_arr("$b.pp->'measurements'") . ") m WHERE jsonb_typeof(m) = 'object'";
+    }
+    die "unbekannte Domäne $dom\n";
+}
+
+sub _lx_list {
+    my @out;
+    for my $v (@_) {
+        next unless defined $v;
+        for my $x (ref $v eq 'ARRAY' ? @$v : ($v)) {
+            next unless defined $x;
+            push @out, grep { length } map { s/^\s+|\s+$//gr } split /[,;\n]/, $x;
+        }
+    }
+    my %seen;
+    return grep { !$seen{$_}++ } @out;
+}
+
+sub _lx_csv_field {
+    my ($v) = @_;
+    return '' unless defined $v;
+    $v = "$v";
+    return $v unless $v =~ /[",\r\n]/ || $v =~ /^\s|\s$/;
+    $v =~ s/"/""/g;
+    return qq{"$v"};
+}
+
+# Ereignisdatum wie im R-Skript (pp_date): JJJJ-MM -> 15., JJJJ -> 1. Juli
+sub _lx_event_day {
+    my ($s) = @_;
+    return undef unless defined $s;
+    return "$1-$2-$3" if $s =~ /^\s*(\d{4})-(\d{2})-(\d{2})/;
+    return "$1-$2-15" if $s =~ /^\s*(\d{4})-(\d{2})\s*$/;
+    return "$1-07-01" if $s =~ /^\s*(\d{4})\s*$/;
+    return undef;
+}
+
+# Parameter prüfen und SQL bauen. Rückgabe: { sql, bind, cols, filter, label } oder { error, status }
+helper long_export_query => sub {
+    my ($c, $what) = @_;
+    my %err;
+    my $bad = sub { $err{error} = shift; $err{status} = 400; \%err };
+
+    my @tags   = map { lc } _lx_list($c->every_param('tag'), $c->every_param('tags'));
+    my $tscope = lc($c->param('tag_scope') // 'patient');
+    my @codes  = _lx_list($c->every_param('has_code'));
+    my @pseud  = _lx_list($c->every_param('pseudonyms'), $c->every_param('pseudonym'));
+    my @srcs   = map { lc } _lx_list($c->every_param('sources'), $c->every_param('source'));
+    my @doms   = map { lc } _lx_list($c->every_param('domains'), $c->every_param('domain'));
+    my $dedup  = lc($c->param('dedup')   // 'exact');
+    my $undat  = lc($c->param('undated') // 'per_packet');
+    my $incl_x = to_bool($c->param('include_excluded') // 1);
+    my $limit  = $c->param('limit_patients');
+
+    return $bad->("tag_scope muss 'patient' oder 'letter' sein.")            unless $tscope =~ /^(?:patient|letter)$/;
+    return $bad->("dedup muss 'exact', 'code' oder 'none' sein.")            unless $dedup  =~ /^(?:exact|code|none)$/;
+    return $bad->("undated muss 'per_packet' oder 'first' sein.")            unless $undat  =~ /^(?:per_packet|first)$/;
+    return $bad->("Ungültiger Code in has_code: '$_' (Format PREFIX:CODE).") for grep { !/^[A-Za-z0-9]+:[A-Za-z0-9.\-]+$/ } @codes;
+    return $bad->("Ungültige Quelle: '$_'.")                                  for grep { !/^[a-z0-9_]{1,20}$/ } @srcs;
+    my %dom_ok = map { $_ => 1 } @LX_DOMAINS;
+    return $bad->("Ungültige Domäne: '$_' (erlaubt: @LX_DOMAINS).")           for grep { !$dom_ok{$_} } @doms;
+    @doms = @LX_DOMAINS unless @doms;
+    return $bad->("limit_patients muss eine positive Zahl sein.")            if defined $limit && $limit !~ /^[1-9]\d{0,6}$/;
+    return $bad->("Zu viele Werte (tag/has_code max. 50, pseudonyms max. 100000).")
+        if @tags > 50 || @codes > 50 || @pseud > 100000;
+
+    my %day;
+    for my $k (qw(from to event_from event_to)) {
+        my $v = $c->param($k);
+        next unless defined $v && length $v;
+        $day{$k} = normalize_reference_day($v) // return $bad->("$k: ungültiges Datum '$v' (JJJJ-MM-TT oder TT.MM.JJJJ).");
+    }
+
+    unless (@tags || @codes || @pseud || to_bool($c->param('all'))) {
+        return $bad->("Kein Kohortenfilter gesetzt. tag, has_code oder pseudonyms angeben, oder all=1 für den Gesamtbestand.");
+    }
+
+    my @bind;
+
+    # --- 1. Briefe (mit Briefebene-Deduplizierung) ---
+    my @lw = ("c.phenopacket_json IS NOT NULL", "c.pseudonym IS NOT NULL",
+              "jsonb_typeof(c.phenopacket_json) = 'object'");
+    if ($day{from}) { push @lw, "c.reference_date::date >= ?::date"; push @bind, $day{from} }
+    if ($day{to})   { push @lw, "c.reference_date::date <= ?::date"; push @bind, $day{to} }
+    if (@srcs)      { push @lw, "lower(c.doc_source) = ANY(?)";      push @bind, [@srcs] }
+    if (@pseud)     { push @lw, "c.pseudonym = ANY(?)";              push @bind, [@pseud] }
+    my $tag_match = "EXISTS (SELECT 1 FROM unnest(string_to_array(COALESCE(%s.tags, ''), ',')) tt(t) WHERE lower(trim(tt.t)) = ANY(?))";
+    if (@tags && $tscope eq 'letter') { push @lw, sprintf($tag_match, 'c'); push @bind, [@tags] }
+
+    my $sql = "WITH letters_all AS (
+  SELECT c.id AS candidate_id, c.pseudonym, c.reference_date::date AS packet_date,
+         c.doc_source, c.tags, c.phenopacket_json AS pp,
+         'cand-' || c.id AS packet_id,
+         c.phenopacket_json->>'id' AS phenopacket_id,
+         c.phenopacket_json->'metaData'->>'created' AS packet_created,
+         COALESCE(c.doc_hash, md5(c.narrative_report), 'id-' || c.id) AS text_key
+    FROM candidates c
+   WHERE " . join("\n     AND ", @lw) . "
+),
+letters AS (
+  SELECT DISTINCT ON (pseudonym, text_key) *
+    FROM letters_all
+   ORDER BY pseudonym, text_key, (lower(COALESCE(doc_source, '')) = 'argos') DESC, candidate_id DESC
+),";
+
+    # --- 2. Kohorte (Patientenebene) ---
+    my @cw;
+    if (@tags && $tscope eq 'patient') {
+        push @cw, "l.pseudonym IN (SELECT c.pseudonym FROM candidates c WHERE " . sprintf($tag_match, 'c') . ")";
+        push @bind, [@tags];
+    }
+    if (@codes) {
+        my $code_union = join("\n        UNION ALL ", map { _lx_branch($_, 'h', 1) } @LX_DOMAINS);
+        push @cw, "l.pseudonym IN (
+      SELECT x.pseudonym
+        FROM letters h,
+             LATERAL ($code_union) x
+       WHERE x.code IS NOT NULL AND NOT x.excluded
+         AND EXISTS (SELECT 1 FROM unnest(?::text[]) q(code) WHERE is_subclass_of(x.code, q.code)))";
+        push @bind, [@codes];
+    }
+    $sql .= "
+cohort AS (
+  SELECT DISTINCT l.pseudonym
+    FROM letters l
+   WHERE " . (@cw ? join("\n     AND ", @cw) : 'TRUE') . "
+   ORDER BY l.pseudonym" . (defined $limit ? "\n   LIMIT ?" : '') . "
+),
+base AS (
+  SELECT l.* FROM letters l JOIN cohort USING (pseudonym)
+)";
+    push @bind, $limit + 0 if defined $limit;
+
+    # --- 3a. Patienten / Briefe ---
+    if ($what eq 'patients') {
+        $sql .= "
+SELECT b.pseudonym, b.packet_id, b.packet_created, to_char(b.packet_date, 'YYYY-MM-DD') AS letter_date,
+       b.candidate_id, b.phenopacket_id, b.doc_source,
+       b.pp->'subject'->>'sex' AS sex,
+       b.pp->'subject'->'timeAtLastEncounter'->'age'->>'iso8601duration' AS age_last_iso,
+       b.tags
+  FROM base b
+ ORDER BY b.pseudonym, b.packet_date NULLS LAST, b.candidate_id";
+        return { sql => $sql, bind => \@bind, cols => \@LX_PATIENT_COLS, label => 'patients' };
+    }
+
+    # --- 3b. Ereignisse (mit Elementebene-Deduplizierung) ---
+    my $branches = join("\n  UNION ALL\n  ", map { "SELECT b.packet_id AS _p, x.* FROM base b, LATERAL (" . _lx_branch($_, 'b', 0) . ") x" } @doms);
+    my $undated_key = $undat eq 'per_packet' ? "'undated:' || candidate_id" : "'undated'";
+    my @key = qw(pseudonym domain code);
+    push @key, 'label' if $dedup eq 'exact';
+    push @key, qw(site_id date_key excluded value unit comparator value_text);
+    my $keys = join(', ', map { "k.$_" } @key);
+
+    $sql .= ",
+ev AS (
+  SELECT u.* FROM (
+  $branches
+  ) u
+  WHERE u.code IS NOT NULL" . ($incl_x ? '' : ' AND NOT u.excluded') . "
+),
+keyed AS (
+  SELECT ev.*,
+         CASE WHEN date_raw ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' THEN substr(date_raw, 1, 10)
+              WHEN date_raw ~ '^[0-9]{4}(-[0-9]{2})?\$'      THEN date_raw
+              ELSE $undated_key END AS date_key
+    FROM ev
+),
+ranked AS (
+  SELECT k.*,
+         count(*)           OVER w AS n_mentions,
+         max(k.packet_date) OVER w AS last_packet_date_d,
+         row_number()       OVER (w ORDER BY k.packet_date NULLS LAST, k.candidate_id) AS rn
+    FROM keyed k
+  WINDOW w AS (PARTITION BY $keys)
+)
+SELECT pseudonym, packet_id, packet_created, to_char(packet_date, 'YYYY-MM-DD') AS letter_date,
+       candidate_id, phenopacket_id, domain, code, label, site_id, date_raw, excluded,
+       value, unit, comparator, value_text, n_mentions,
+       to_char(last_packet_date_d, 'YYYY-MM-DD') AS last_letter_date
+  FROM ranked
+" . ($dedup eq 'none' ? '' : " WHERE rn = 1\n") . " ORDER BY pseudonym, packet_date NULLS LAST, candidate_id, domain, code";
+
+    # Ereignisdatum-Filter (im Stream, damit ungültige Datumsstrings die Abfrage nicht abbrechen)
+    my $filter;
+    if ($day{event_from} || $day{event_to}) {
+        my $keep_undated = to_bool($c->param('keep_undated') // 1);
+        my ($ef, $et) = ($day{event_from}, $day{event_to});
+        $filter = sub {
+            my $d = _lx_event_day($_[0]{date_raw});
+            return $keep_undated unless defined $d;
+            return 0 if $ef && $d lt $ef;
+            return 0 if $et && $d gt $et;
+            return 1;
+        };
+    }
+    return { sql => $sql, bind => \@bind, cols => \@LX_EVENT_COLS, filter => $filter, label => 'events' };
+};
+
+# Ergebnis per Server-Cursor in Blöcken streamen (nicht blockierend, wenig Speicher)
+helper long_export_stream => sub {
+    my ($c, $q, $format) = @_;
+    my $db = $c->pg->db;
+    my $tx = $db->begin;
+
+    # Eigener Cursorname je Exporttyp: Mojo::Pg cacht das FETCH-Statement pro
+    # Verbindung, und ein gecachtes FETCH auf einen Cursor mit anderer
+    # Spaltenstruktur bringt DBD::Pg zum Absturz (Segfault).
+    my $cursor = "ontotrial_lx_$q->{label}";
+    eval { $db->query("DECLARE $cursor NO SCROLL CURSOR FOR $q->{sql}", @{ $q->{bind} }); 1 } or do {
+        my $err = $@;
+        undef $tx;
+        $c->app->log->error("[LONG EXPORT] Abfrage ungültig: $err");
+        return $c->render(json => { error => 'Abfrage fehlgeschlagen', details => "$err" }, status => 500);
+    };
+
+    my @cols = @{ $q->{cols} };
+    my $stamp = POSIX::strftime('%Y%m%d-%H%M%S', localtime);
+    my $render_row = $format eq 'ndjson'
+        ? sub {
+              my $r = shift;
+              my %o = map { $_ => $r->{$_} } @cols;
+              $o{excluded} = $r->{excluded} ? Mojo::JSON->true : Mojo::JSON->false if exists $o{excluded};
+              defined $o{$_} and $o{$_} += 0 for grep { exists $o{$_} } keys %LX_NUMERIC;
+              return to_json(\%o) . "\n";
+          }
+        : sub {
+              my $r = shift;
+              local $r->{excluded} = exists $r->{excluded} ? ($r->{excluded} ? 'true' : 'false') : undef;
+              return join(',', map { _lx_csv_field($r->{$_}) } @cols) . "\n";
+          };
+
+    my $h = $c->res->headers;
+    if ($format eq 'ndjson') {
+        $h->content_type('application/x-ndjson; charset=UTF-8');
+    } else {
+        $h->content_type('text/csv; charset=UTF-8');
+        $h->content_disposition(qq{attachment; filename="ontotrial-$q->{label}-$stamp.csv"});
+    }
+
+    my ($started, $done, $n_rows, $next) = (0, 0, 0);
+    my $t0 = [gettimeofday()];
+    my $header = $format eq 'ndjson' ? '' : join(',', @cols) . "\n";
+
+    $c->render_later;
+    $c->on(finish => sub { $done = 1; undef $next });   # auch bei Verbindungsabbruch
+
+    $next = sub {
+        return if $done;
+        $db->query_p("FETCH $LX_BATCH FROM $cursor")->then(sub {
+            my $batch = shift->hashes->to_array;
+            return if $done;
+
+            if (!@$batch) {
+                eval { $tx->commit; 1 } or $c->app->log->warn("[LONG EXPORT] Commit: $@");
+                $c->app->log->info(sprintf('[LONG EXPORT] %s: %d Zeilen in %.1f s', $q->{label}, $n_rows, tv_interval($t0)));
+                my $tail = $started ? '' : $header;
+                $done = 1;
+                undef $next;
+                if (length $tail) { $c->write_chunk(encode('UTF-8', $tail) => sub { shift->finish }) }
+                elsif ($started)  { $c->finish }
+                else              { $c->rendered(200) }
+                return;
+            }
+
+            my $buf = $started ? '' : $header;
+            for my $r (@$batch) {
+                next if $q->{filter} && !$q->{filter}->($r);
+                $buf .= $render_row->($r);
+                $n_rows++;
+            }
+            if (length $buf) {
+                $started = 1;
+                $c->write_chunk(encode('UTF-8', $buf) => sub { $next->() if $next });
+            } else {
+                Mojo::IOLoop->next_tick(sub { $next->() if $next });   # leeren Chunk vermeiden (= Stream-Ende)
+            }
+        })->catch(sub {
+            my $err = shift;
+            $c->app->log->error("[LONG EXPORT] Fehler nach $n_rows Zeilen: $err");
+            $done = 1;
+            undef $next;
+            undef $tx;   # Rollback
+            if ($started) { $c->finish }   # Ausgabe unvollständig; HTTP-Status ist schon gesendet
+            else { $c->render(json => { error => 'Export fehlgeschlagen', details => "$err" }, status => 500) }
+        });
+    };
+    $next->();
+};
+
+get '/BBB/export/long/:what' => [what => [qw(events patients)]] => sub {
+    my $c = shift;
+    $c->inactivity_timeout(3600);
+
+    if (my $tok = $ENV{ONTOTRIAL_EXPORT_TOKEN}) {
+        my $given = $c->req->headers->header('X-Export-Token') // $c->param('token') // '';
+        return $c->render(json => { error => 'Export-Token fehlt oder ist falsch.' }, status => 403)
+            unless $given eq $tok;
+    }
+
+    my $format = lc($c->param('format') // 'csv');
+    return $c->render(json => { error => "format muss 'csv' oder 'ndjson' sein." }, status => 400)
+        unless $format =~ /^(?:csv|ndjson)$/;
+
+    my $q = $c->long_export_query($c->param('what'));
+    return $c->render(json => { error => $q->{error} }, status => $q->{status}) if $q->{error};
+
+    $c->app->log->info("[LONG EXPORT] $q->{label}: " . $c->req->url->query->to_string =~ s/token=[^&]*/token=***/r);
+    $c->long_export_stream($q, $format);
+};
+
+# =========================================================
 # GENERIC DB REST CRUD ENDPOINTS
 # =========================================================
 
