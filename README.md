@@ -4,7 +4,7 @@ An integrated, full-stack environment for structured clinical trial eligibility 
 
 Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology extraction, normalization and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC** and **LOINC**, with SNOMED CT laterality qualifiers.
 
-> **Research prototype.** OntoTrial is not a medical device and must not be used for diagnostic or therapeutic decisions. Process patient data only in pseudonymized form and in accordance with your local data-protection and ethics requirements. Data leaving the institution should only be produced via the [anonymized export](#anonymized-export).
+> **Research prototype.** OntoTrial is not a medical device and must not be used for diagnostic or therapeutic decisions. Process patient data only in pseudonymized form and in accordance with your local data-protection and ethics requirements. Data leaving the institution should only be produced via the [anonymized export](#anonymized-export); the [long-format export](#long-format-export-for-statistics) is for internal analyses only.
 
 <img width="2033" height="1022" alt="OntoTrial Candidates view" src="https://github.com/user-attachments/assets/421e4515-8eb7-4c70-9790-1d21a1f340d0" />
 <img width="1860" height="1028" alt="OntoTrial Phenotype Tree Browser" src="https://github.com/user-attachments/assets/f7c86a01-2ce4-4fbc-83fa-633d0b4c1e6d" />
@@ -22,6 +22,7 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 - [Matching, time-to-eligibility and patient similarity](#matching-time-to-eligibility-and-patient-similarity)
 - [Feasibility chat assistant](#feasibility-chat-assistant)
 - [Anonymized export](#anonymized-export)
+- [Long-format export for statistics](#long-format-export-for-statistics)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Keeping terminologies up to date](#keeping-terminologies-up-to-date)
@@ -49,8 +50,10 @@ Highlights added in recent versions:
 - **Database-driven configuration** – LLM prompts, intercept rules and filter rules live in PostgreSQL and are reloaded every 30 seconds without a restart.
 - **Deep mode** – optional two-stage extraction with an unconstrained reasoning trace (pre-extraction table) followed by schema-constrained JSON sampling.
 - **Anonymized export** – de-identified phenopackets for data sharing: no free text, ephemeral subject IDs, month truncation with patient-constant date shift, age top-coding and hierarchical generalization of rare codes (k ≥ 5).
+- **Long-format export** – one row per coded element as CSV or NDJSON, deduplicated across letters, streamed from a server-side cursor and directly readable from R (details [below](#long-format-export-for-statistics)).
 - **Patient similarity** – eye-mirroring distance between phenopackets, nearest-neighbour search and greedy 1:n case-control matching with caliper.
 - **Catalog maintenance** – `update_catalogs.pl` for inventory, versioned imports with backups and post-import checks.
+- **Server-side persistence and live sync** – extracted phenopackets are stored by the backend under the `candidate_id` of the request, never under the current GUI selection; all open browsers receive the update over the WebSocket.
 - **Real-time progress** – every extraction step reports progress over the WebSocket channel.
 
 ---
@@ -75,10 +78,19 @@ flowchart TD
     CORE -->|Ontology vector search| VEC
 ```
 
-1. **Frontend (Objective-J / Cappuccino)** – desktop-grade web GUI with a Cocoa-style MVC architecture: `CPRuleEditor` for nested criteria (`all-of`, `any-of`, `neither-of`), `CPOutlineView` tree browsers for all five terminologies, visual phenopacket profile, matching trace, time-to-event export and the feasibility chat.
+1. **Frontend (Objective-J / Cappuccino)** – desktop-grade web GUI with a Cocoa-style MVC architecture: `CPRuleEditor` for nested criteria (`all-of`, `any-of`, `neither-of`), `CPOutlineView` tree browsers for all five terminologies, visual phenopacket profile, matching trace, time-to-event export and the feasibility chat. Data binding uses the Fireside ORM, which keeps one object per database row and merges change notifications from the WebSocket into these objects.
 2. **Backend (Mojolicious / Perl)** – asynchronous REST and WebSocket API (`backend.pl`), Minion job queue for background letter extraction, PostgreSQL pub/sub for live updates.
 3. **LLM provider** – any OpenAI-compatible vLLM server (e.g. `gpt-oss-120b`) or Ollama (e.g. `gemma4:31b-mlx`). Routing is automatic based on the selected model name.
 4. **Patchbay** – stateless vector search per terminology; calls are serialized through an in-process queue.
+
+### Where results are written
+
+Long-running jobs write to the record they were started for, not to whatever is selected in the GUI when they finish:
+
+- **Phenopackets** are stored by the backend (`/BBB/extract_phenopacket`, `/BBB/extract_phenopacket_from_letter` with `candidate_id`, and the Minion task). The backend then sends a change notification; every browser that has the candidate loaded updates it in place, and the phenopacket view refreshes if that candidate is open.
+- **FHIR criteria** are written by the rule editor into the trial it currently displays. An extraction that finishes after the user has switched to another trial is saved to the original trial without touching the editor.
+- **Narrative summaries** are written to the match the request was started from.
+- Edits in the phenopacket table belong to the candidate shown at the time of editing; edits that finish after a switch are discarded.
 
 ---
 
@@ -196,6 +208,91 @@ Limitations to keep in mind:
 
 ---
 
+## Long-format export for statistics
+
+Two `GET` endpoints deliver the coded content of the phenopackets in a flat, analysis-ready form. They are designed to be read directly into R (`read.csv`), Python (`pandas.read_csv`) or Stata, for example for eye-level survival analyses with time-varying covariates.
+
+| Endpoint | One row per | Columns |
+| :--- | :--- | :--- |
+| `GET /BBB/export/long/events` | coded element | `pseudonym`, `packet_id`, `packet_created`, `letter_date`, `candidate_id`, `phenopacket_id`, `domain`, `code`, `label`, `site_id`, `date_raw`, `excluded`, `value`, `unit`, `comparator`, `value_text`, `n_mentions`, `last_letter_date` |
+| `GET /BBB/export/long/patients` | letter (phenopacket) | `pseudonym`, `packet_id`, `packet_created`, `letter_date`, `candidate_id`, `phenopacket_id`, `doc_source`, `sex`, `age_last_iso`, `tags` |
+
+Column notes:
+
+- `domain` is one of `procedure`, `disease`, `phenotype`, `treatment`, `measurement`. `medicalActions[].procedure` duplicates `procedures[]` and is not exported; treatments come from `medicalActions[].treatment`.
+- `site_id` is the laterality (`HP:0012834` right, `HP:0012835` left, `HP:0012832` bilateral). For phenotypes and measurements it is taken from `modifiers[]`.
+- `date_raw` is the unparsed event date as stored (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`, timestamps or placeholders such as `PAST-UK-UK`). Parsing and imputation are left to the analysis.
+- `packet_id` is `cand-<candidate_id>` and is unique per letter. The internal phenopacket ID (`phenopacket-<seconds>`) can collide when two extractions finish in the same second and is only provided as `phenopacket_id`.
+- `letter_date` is the date of the letter (`candidates.reference_date`). Use it to date undated elements instead of deriving a packet date from the data.
+- `value`, `unit`, `comparator` hold quantitative measurement results; `value_text` holds qualitative results (e.g. `Positive / Detected`).
+- `excluded` is `true` for explicitly negated findings.
+- `n_mentions` and `last_letter_date` tell how often and until when the element was documented for this patient (after deduplication).
+
+### Parameters
+
+List parameters accept comma-separated values or can be repeated.
+
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `has_code` | – | Patients with at least one non-negated element at or below this code (`is_subclass_of`), e.g. `OPS:5-125` for keratoplasty. |
+| `tag` | – | Tag(s); exact token match, case-insensitive. |
+| `tag_scope` | `patient` | `patient`: all letters of tagged patients. `letter`: only tagged letters. |
+| `pseudonyms` | – | Explicit list of pseudonyms. |
+| `all` | – | Required (`all=1`) when none of `has_code`, `tag`, `pseudonyms` is given. |
+| `from`, `to` | – | Letter date range, inclusive (`YYYY-MM-DD` or `DD.MM.YYYY`). Cohort selection only considers letters in this range. |
+| `event_from`, `event_to` | – | Event date range (events only). Dates are interpreted like in the reference R script (`YYYY-MM` → 15th, `YYYY` → 1 July). |
+| `keep_undated` | `1` | Keep undated elements when an event date range is set. |
+| `domains` | all | Subset of `procedure,disease,phenotype,treatment,measurement`. |
+| `sources` | all | Letter sources (`doc_source`), e.g. `argos,dwh`. |
+| `include_excluded` | `1` | `0` drops negated findings. |
+| `dedup` | `exact` | `exact`, `code` (merge label variants of the same code) or `none`. |
+| `undated` | `per_packet` | `per_packet` keeps undated elements once per letter; `first` keeps only the earliest mention. |
+| `limit_patients` | – | Return only the first N pseudonyms (for testing). |
+| `format` | `csv` | `csv` or `ndjson`. |
+| `token` | – | Export token, alternatively header `X-Export-Token` (required if `ONTOTRIAL_EXPORT_TOKEN` is set). |
+
+Invalid parameters are answered with HTTP 400 and a JSON message; query errors before the first data block with HTTP 500.
+
+### Deduplication
+
+1. **Letters** – identical letter texts of the same patient (`doc_hash`, e.g. an argos and a data-warehouse copy of the same letter) count once. The argos copy and then the most recent extraction are preferred.
+2. **Dated elements** – an element that appears identically in several letters (carried-forward history) is exported once, attributed to the earliest letter. `2020-03-02` and `2020-03-02T00:00:00Z` count as the same date. With `dedup=exact` the label is part of the comparison, with `dedup=code` it is not.
+3. **Undated elements** – kept once per letter by default, because analyses typically date them with the letter date. `undated=first` keeps only the earliest mention.
+
+Results are streamed from a server-side cursor in blocks of 5000 rows, so large cohorts do not need to fit into memory.
+
+### Example: R
+
+```r
+ONTOTRIAL_URL <- "https://<host>/BBB/export/long"
+EXPORT_QUERY  <- list(has_code = "OPS:5-125")
+
+fetch_long <- function(what, query = EXPORT_QUERY) {
+  qs  <- paste(names(query),
+               vapply(query, function(v) utils::URLencode(paste(v, collapse = ","), reserved = TRUE), ""),
+               sep = "=", collapse = "&")
+  f   <- tempfile(fileext = ".csv")
+  tok <- Sys.getenv("ONTOTRIAL_EXPORT_TOKEN")
+  utils::download.file(paste0(ONTOTRIAL_URL, "/", what, "?", qs), f, method = "libcurl",
+                       mode = "wb", quiet = TRUE,
+                       headers = if (nzchar(tok)) c("X-Export-Token" = tok) else NULL)
+  read.csv(f, fileEncoding = "UTF-8", na.strings = c("", "NA", "NULL"))
+}
+
+patients_raw <- fetch_long("patients")
+events_raw   <- fetch_long("events")
+```
+
+`download.file` only reports the HTTP status on errors; call the URL with `curl` or a browser to see the error message. Patients and events are two separate requests, so an extraction running in between can make them differ slightly.
+
+Do not restrict the letter date range (`from`/`to`) when the analysis defines its own study window: it removes later letters and therefore shortens follow-up.
+
+### Data protection
+
+The long-format export contains pseudonyms (PIZ) and exact dates and is therefore person-related. Use it only for internal analyses in a protected environment. For data sharing use the [anonymized export](#anonymized-export). Set `ONTOTRIAL_EXPORT_TOKEN` to require a token for these endpoints; the token is masked in the request log.
+
+---
+
 ## Feasibility chat assistant
 
 A natural-language assistant for cohort queries such as *"Patients with Sjögren syndrome, superficial punctate keratitis and OSDI > 23"*.
@@ -295,6 +392,13 @@ The PostgreSQL connection is currently set in `backend.pl` (`postgresql://postgr
 | `ONTOTRIAL_PARENT_CANDIDATE` | `1` | Add the common parent node as a "broader" rerank candidate |
 | `ONTOTRIAL_GROUND_GENERIC` | `1` | Append the anatomical site to German terms without organ reference |
 
+### Import and export
+
+| Variable | Default | Effect |
+| :--- | :---: | :--- |
+| `ONTOTRIAL_IMPORT_DATE_TOLERANCE_DAYS` | `0` | Days around the letter date within which `/BBB/import_and_extract_letter` treats another letter of the same patient as the same day |
+| `ONTOTRIAL_EXPORT_TOKEN` | unset | If set, `/BBB/export/long/*` requires this token (header `X-Export-Token` or parameter `token`) |
+
 ---
 
 ## Keeping terminologies up to date
@@ -330,9 +434,9 @@ Recommended order:
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
 | POST | `/BBB/extract_fhir_inex_criteria` | Trial text → FHIR R6 `Group` (`medical_report`, `model`, `deep_mode`, `task_id`) |
-| POST | `/BBB/extract_phenopacket` | Clinical text → Phenopacket v2 (`medical_report`, `candidate_id`, `reference_date`, `model`) |
+| POST | `/BBB/extract_phenopacket` | Clinical text → Phenopacket v2 (`medical_report`, `candidate_id`, `reference_date`, `model`). With `candidate_id` the result is stored at that candidate and announced over the WebSocket; a storage error returns HTTP 500. |
 | POST | `/BBB/extract_phenopacket_from_letter` | As above; accepts JSON or plain-text body, supports `deep_mode` |
-| POST | `/BBB/import_and_extract_letter` | Store or update a letter (`pseudonym`, `doc_id`, `medical_report`, `reference_date`) and queue extraction in Minion |
+| POST | `/BBB/import_and_extract_letter` | Store or update a letter (`pseudonym`, `doc_id`, `medical_report`, `reference_date`) and queue extraction in Minion; the result is stored and announced like above |
 | POST | `/BBB/candidates/recompute_by_tag` | Re-extract all candidates with a tag in the background |
 | POST | `/BBB/resolve_term` | Map a single phrase (`domain`, `text`, `language`) to a code |
 
@@ -347,6 +451,8 @@ Recommended order:
 | POST | `/BBB/phenopacket_distance` | Distance between two candidates or phenopackets (`a`, `b`, `weights`, `mirror`, `exact`, `explain`) |
 | POST | `/BBB/phenopacket_distance/nearest` | k nearest neighbours of a candidate (`candidate_id`, `k`, `caliper`, `tag`) |
 | POST | `/BBB/export/anonymized_phenopackets` | De-identified phenopackets for a cohort (`tag` or `candidate_ids`, `k` ≥ 5) |
+| GET | `/BBB/export/long/events` | Coded elements in long format, CSV or NDJSON ([parameters](#parameters)) |
+| GET | `/BBB/export/long/patients` | One row per letter with sex and age, same filters |
 | POST | `/BBB/propensity_match` | Greedy case-control matching (`treated_ids`/`treated_tag`, `control_ids`/`control_tag`, `ratio`, `caliper`, `replace`) |
 
 ### Cohort chat and candidates
@@ -370,11 +476,16 @@ Recommended order:
 
 Additionally: `GET /BBB/hpo/synonyms/:id`, `GET /BBB/hpo/xrefs/:id`.
 
-> **Security:** the API has no authentication and sends `Access-Control-Allow-Origin: *`. Generic table routes (`/BBB/:table`) and `/BBB/chat/execute_sql` can read narrative reports. Run the backend only in a protected network segment behind an authenticating reverse proxy.
+> **Security:** the API has no authentication and sends `Access-Control-Allow-Origin: *`. Generic table routes (`/BBB/:table`), `/BBB/chat/execute_sql` and the long-format export (unless `ONTOTRIAL_EXPORT_TOKEN` is set) can read person-related data. Run the backend only in a protected network segment behind an authenticating reverse proxy.
 
 ### Live updates
 
-`/BBB/socket` (WebSocket) delivers table changes and `TASK_PROGRESS` messages (`phase`, `progress`, `message`) for long-running extractions.
+`/BBB/socket` (WebSocket) delivers two kinds of messages:
+
+- **Table changes** `{ table, pk, type, data }` with `type` `INSERT`, `UPDATE` or `DELETE`. They are sent for writes through the generic table routes and when the backend stores a phenopacket. Payloads over 7,500 characters are sent as `truncated`; the client then reloads only that row. The Fireside client merges updates into objects it has loaded and ignores rows it has not loaded.
+- **Progress** `TASK_PROGRESS` messages (`task_id`, `phase`, `progress`, `message`) for long-running extractions.
+
+There is no conflict handling: if two users edit the same field at the same time, the last write wins.
 
 ---
 
