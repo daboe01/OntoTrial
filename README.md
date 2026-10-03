@@ -8,7 +8,6 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 
 <img width="2033" height="1022" alt="OntoTrial Candidates view" src="https://github.com/user-attachments/assets/421e4515-8eb7-4c70-9790-1d21a1f340d0" />
 <img width="1860" height="1028" alt="OntoTrial Phenotype Tree Browser" src="https://github.com/user-attachments/assets/f7c86a01-2ce4-4fbc-83fa-633d0b4c1e6d" />
-<img width="853" height="607" alt="Matching trace" src="https://github.com/user-attachments/assets/49591f73-51f6-4c49-b6ab-efd2b1a74083" />
 <img width="1326" height="835" alt="Bildschirmfoto 2026-09-26 um 20 03 07" src="https://github.com/user-attachments/assets/15928468-8d5c-4b71-b580-e546a0d5b135" />
 ---
 
@@ -152,6 +151,7 @@ flowchart LR
 ---
 
 ## Matching, time-to-eligibility and patient similarity
+<img width="853" height="607" alt="Matching trace" src="https://github.com/user-attachments/assets/49591f73-51f6-4c49-b6ab-efd2b1a74083" />
 
 ### Dual-hypothesis eye matching
 
