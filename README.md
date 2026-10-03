@@ -1,6 +1,6 @@
 # OntoTrial – Clinical Trial Eligibility & Phenotyping Framework
 
-An integrated, full-stack environment for structured clinical trial eligibility definition, cohort feasibility analysis, longitudinal patient matching and patient-similarity analysis. OntoTrial turns unstructured trial protocols and medical narrative reports (primarily German ophthalmology letters) into standardized, ontology-coded data: **FHIR R6 `Group`** resources for trial criteria and **GA4GH Phenopackets v2** for patients.
+An integrated, full-stack environment for structured clinical trial eligibility definition, cohort feasibility analysis, longitudinal patient matching and patient-similarity analysis. OntoTrial turns unstructured trial protocols and medical narrative reports (primarily German ophthalmology letters) into standardized, ontology-coded data: **FHIR R6 `Group`** resources for trial criteria and **GA4GH `Phenopackets v2`** for patients.
 
 Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology extraction, normalization and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC** and **LOINC**, with SNOMED CT laterality qualifiers.
 
