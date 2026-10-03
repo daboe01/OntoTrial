@@ -2,7 +2,7 @@
 
 An integrated, full-stack environment for structured clinical trial eligibility definition, cohort feasibility analysis, longitudinal patient matching and patient-similarity analysis. OntoTrial turns unstructured trial protocols and medical narrative reports (primarily German ophthalmology letters) into standardized, ontology-coded data: **FHIR R6 `Group`** resources for trial criteria and **GA4GH `Phenopackets v2`** for patients.
 
-Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology extraction, normalization and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC** and **LOINC**, with SNOMED CT laterality qualifiers.
+Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology extraction from narrative texts, including normalization and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC** and **LOINC**, with SNOMED CT laterality qualifiers.
 
 > **Research prototype.** OntoTrial is not a medical device and must not be used for diagnostic or therapeutic decisions. Process patient data only in pseudonymized form and in accordance with your local data-protection and ethics requirements. Data leaving the institution should only be produced via the [anonymized export](#anonymized-export); the [long-format export](#long-format-export-for-statistics) is for internal analyses only.
 
