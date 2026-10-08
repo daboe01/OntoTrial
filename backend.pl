@@ -3,6 +3,7 @@
 # OntoTrial Backend - Step-by-Step Extraction & Deduplicated Disjunctive Assembly Engine
 # Copyright 2026 Daniel Böhringer
 
+# + FHIR Eye Normalization (Study Eye -> Right Eye, Fellow Eye -> Left Eye)
 # TODO: support orphacodes
 # TODO: Long-export with intelligent deduplication
 
@@ -16,8 +17,12 @@ use Mojo::JSON qw(decode_json encode_json from_json to_json);
 use POSIX qw(strftime);
 use DateTime;
 use Time::HiRes qw(gettimeofday tv_interval);
-use Digest::MD5 qw(md5_hex);   # ONTOTRIAL-PATCHSET-2026-09-23
+use Digest::MD5 qw(md5_hex);
 use List::Util ();
+use Carp ();
+
+# Diagnosekontext für den Minion-Watchdog (welches Item, welches Muster)
+our $DIAG_CTX = '';
 
 no warnings 'uninitialized';
 no warnings 'experimental::vlb'; # Unterdrückt die Lookbehind-Warnung global
@@ -99,6 +104,9 @@ my $block_history_zcodes = $ENV{ONTOTRIAL_BLOCK_HISTORY_ZCODES}     // 1;     # 
 my $intercept_validate   = $ENV{ONTOTRIAL_INTERCEPT_VALIDATE}       // 1;     # Intercepts mit unbekanntem Code ignorieren
 my $parent_candidate_on  = $ENV{ONTOTRIAL_PARENT_CANDIDATE}         // 1;     # Elternknoten als Rerank-Kandidat
 my $ground_generic       = $ENV{ONTOTRIAL_GROUND_GENERIC}           // 1;     # Organ an Begriffe ohne okuläres Signal anhängen
+
+our $PIPELINE_CREATOR = 'OntoTrial2-DisjunctiveDeduplicatedStepEngine';
+our $PIPELINE_VERSION = '2026-10-02';
 
 
 # Concurrency throttling configuration for Patchbay
@@ -480,6 +488,13 @@ sub extract_visus_and_refraction {
 
     my $input = $raw_text;
     $input = preprocess_ophthalmic_text($input);
+    # PATCH 2026-10-02: historische Klammern ZUERST entfernen, bevor die Datums-
+    # präfixe wegfallen. Sonst bleiben ungeschlossene Klammern übrig.
+    $input =~ s/\b(?:0?[1-9]|1[0-2])[\/\.](?:19|20)?\d{2}\s*[:=]\s*(?:0[\.,]\d+|1[\.,]\d+|[1-6]\/\d+)\b//gi;
+    $input =~ s/\bBrillenpass.*$//gi;
+    $input =~ s/\(\s*(?:(?:0?[1-9]|1[0-2])[\/\.](?:19|20)\d{2}|(?:19|20)\d{2}|am\b|im\b|in\s+(?:19|20)\d{2}|zuletzt|früher|vorvisus|vor\s+\d+|brillenpass).*?\)//gi;
+    # Ungeschlossene historische Klammer bis Zeilenende ("(05/2025: eB: nur FZ ...")
+    $input =~ s/\(\s*(?:0?[1-9]|1[0-2])[\/\.](?:19|20)?\d{2}\b[^)]*$//;
 
     # 1. Führende Datums-/Visit-Präfixe entfernen
     $input =~ s/^\s*(?:(?:0?[1-9]|1[0-2])[\/\.](?:\d{2}|\d{4})|\d{1,2}\.\d{1,2}\.\d{2,4})\s*[:=]\s*//gi;
@@ -518,10 +533,7 @@ sub extract_visus_and_refraction {
         }
     }
 
-    # Historische Datumsangaben & Vorvisus-Werte abschneiden
-    $input =~ s/\b(?:0?[1-9]|1[0-2])[\/\.](?:19|20)?\d{2}\s*[:=]\s*(?:0[\.,]\d+|1[\.,]\d+|[1-6]\/\d+)\b//gi;
-    $input =~ s/\bBrillenpass.*$//gi;
-    $input =~ s/\(\s*(?:(?:0?[1-9]|1[0-2])[\/\.](?:19|20)\d{2}|(?:19|20)\d{2}|am\b|im\b|in\s+(?:19|20)\d{2}|zuletzt|früher|vorvisus|vor\s+\d+|brillenpass).*?\)//gi;
+    # (Historische Klammern werden jetzt direkt nach preprocess entfernt)
 
     # Spezialfall: Visus-Bruch + Sphäre direkt notiert (z. B. "1/15 + 8 dpt")
     if ($input =~ /\b([1-6]\/\d{1,2})\s*([+-]\s*\d+(?:[\.,]\d+)?)\s*(?:dpt|diop)?\b/i) {
@@ -575,7 +587,11 @@ sub extract_visus_and_refraction {
 
     # SCHRITT 2: Visuswerte scannen
     my $clean_for_visus = $input;
-    1 while $clean_for_visus =~ s/\((?:[^()]+|(?R))*\)//g;
+    # PATCH 2026-10-02: innerste Klammern wiederholt entfernen (linear, keine
+    # Rekursion), danach Reste ungeschlossener Klammern bis Zeilenende.
+    1 while $clean_for_visus =~ s/\([^()]*\)//g;
+    1 while $clean_for_visus =~ s/\([^()]*$//;
+    $clean_for_visus =~ tr/()//d;
 
     # Lochblendenvisus (LB) vorab isolieren, damit er den Hauptvisus nicht als Maximum verfälscht:
     my $lb_visus = undef;
@@ -1465,6 +1481,7 @@ helper check_database_intercept => sub {
         next unless defined $pattern && length($pattern);
 
         # Safe UTF-8 aware regex evaluation against input text
+        local $DIAG_CTX = "intercept $domain " . ($rule->{code} // '-') . " /$pattern/ ON: " . substr($text, 0, 200);
         my $matched = eval { $text =~ qr/$pattern/i };
         if ($@) {
             $self->app->log->warn("[INVALID REGEX IN DB] Domain: '$domain', Pattern: '$pattern' - $@");
@@ -5483,6 +5500,8 @@ helper generate_phenopacket_impl => sub {
         my $detected_age_iso = undef;
 
         foreach my $item (@$atomic_items) {
+            $DIAG_CTX = sprintf('item domain=%s | canon=%s | verbatim=%s',
+                $item->{domain} // '', $item->{canonical_term} // '', $item->{verbatim_text} // '');
             my $v_text      = $item->{verbatim_text} // '';
             my $canon_term  = $item->{canonical_term} // '';
             my $event_date  = $item->{event_date} // '';
@@ -6236,7 +6255,7 @@ helper generate_phenopacket_impl => sub {
                 medicalActions     => \@medical_actions,
                 metaData           => {
                     created                  => $created,
-                    createdBy                => "OntoTrial2-DisjunctiveDeduplicatedStepEngine",
+                    createdBy                => "$PIPELINE_CREATOR/$PIPELINE_VERSION",
                     phenopacketSchemaVersion => "2.0.0",
                     resources                => [
                         { id => "hp",     name => "human phenotype ontology", namespacePrefix => "HP" },
@@ -6570,6 +6589,23 @@ app->minion->add_task(import_and_extract_letter_task => sub {
     my $reference_date = $payload->{reference_date};
     my $deep_mode      = $payload->{deep_mode} // 0;
     my $task_id        = "minion_$candidate_id";
+
+    # PATCH 2026-10-02: Watchdog. Hängt der Job (z. B. Regex-Backtracking),
+    # werden Kontext und Perl-Stack protokolliert und der Kindprozess beendet.
+    # Minion markiert den Job dann als fehlgeschlagen und gibt den Slot frei.
+    # Ohne ->safe(1) läuft der Handler sofort, auch mitten in einem Regex.
+    my $watchdog_s = $ENV{ONTOTRIAL_JOB_TIMEOUT} // 1800;
+    POSIX::sigaction(POSIX::SIGALRM, POSIX::SigAction->new(sub {
+        my $msg = sprintf("\n[%s] [MINION WATCHDOG] Job %s, Kandidat %s, nach %d s abgebrochen\nKontext: %s\n%s\n",
+            scalar(localtime), $job->id, $candidate_id // '-', $watchdog_s,
+            $main::DIAG_CTX // '-', Carp::longmess('Stack'));
+        if (open my $fh, '>>:encoding(UTF-8)', $ENV{ONTOTRIAL_WATCHDOG_LOG} // '/tmp/ontotrial_watchdog.log') {
+            print $fh $msg;
+            close $fh;
+        }
+        POSIX::_exit(1);
+    }));
+    alarm $watchdog_s;
 
     my $my_hash    = md5_hex(encode('UTF-8', $text_content));
     my $is_current = sub {
@@ -9664,6 +9700,10 @@ post '/BBB/export/anonymized_phenopackets' => sub {
 # Parameter (Listen kommagetrennt oder mehrfach angegeben):
 #   tag=...           Tag(s), exakter Token-Vergleich, ohne Groß/Klein
 #   tag_scope=        patient (Default: alle Briefe getaggter Patienten) | letter
+#   has_tag=...       Grundgesamtheit: Patienten, bei denen irgendein Brief den Tag
+#                     trägt (exakter Token, ohne Groß/Klein). Wird vor allen anderen
+#                     Filtern angewendet, unabhängig von from/to, sources und tag_scope.
+#   has_tag_match=    any (Default) | all  – bei mehreren has_tag-Werten
 #   has_code=...      Patient hat (nicht negiert) einen Code unterhalb, z. B. OPS:5-125
 #   pseudonyms=...    explizite Pseudonyme
 #   from=, to=        Briefdatum (JJJJ-MM-TT oder TT.MM.JJJJ), inklusiv
@@ -9674,7 +9714,7 @@ post '/BBB/export/anonymized_phenopackets' => sub {
 #   dedup=            exact (Default) | code | none
 #   undated=          per_packet (Default) | first
 #   limit_patients=N  Testausschnitt (erste N Pseudonyme)
-#   all=1             nötig, wenn weder tag, has_code noch pseudonyms gesetzt sind
+#   all=1             nötig, wenn weder tag, has_tag, has_code noch pseudonyms gesetzt sind
 #   format=           csv (Default) | ndjson
 #   token=...         bzw. Header X-Export-Token, falls ONTOTRIAL_EXPORT_TOKEN gesetzt
 #
@@ -9806,6 +9846,9 @@ helper long_export_query => sub {
     my $bad = sub { $err{error} = shift; $err{status} = 400; \%err };
 
     my @tags   = map { lc } _lx_list($c->every_param('tag'), $c->every_param('tags'));
+    my %htseen;
+    my @htags  = grep { !$htseen{$_}++ } map { lc } _lx_list($c->every_param('has_tag'), $c->every_param('has_tags'));
+    my $hmatch = lc($c->param('has_tag_match') // 'any');
     my $tscope = lc($c->param('tag_scope') // 'patient');
     my @codes  = _lx_list($c->every_param('has_code'));
     my @pseud  = _lx_list($c->every_param('pseudonyms'), $c->every_param('pseudonym'));
@@ -9817,6 +9860,7 @@ helper long_export_query => sub {
     my $limit  = $c->param('limit_patients');
 
     return $bad->("tag_scope muss 'patient' oder 'letter' sein.")            unless $tscope =~ /^(?:patient|letter)$/;
+    return $bad->("has_tag_match muss 'any' oder 'all' sein.")               unless $hmatch =~ /^(?:any|all)$/;
     return $bad->("dedup muss 'exact', 'code' oder 'none' sein.")            unless $dedup  =~ /^(?:exact|code|none)$/;
     return $bad->("undated muss 'per_packet' oder 'first' sein.")            unless $undat  =~ /^(?:per_packet|first)$/;
     return $bad->("Ungültiger Code in has_code: '$_' (Format PREFIX:CODE).") for grep { !/^[A-Za-z0-9]+:[A-Za-z0-9.\-]+$/ } @codes;
@@ -9825,8 +9869,8 @@ helper long_export_query => sub {
     return $bad->("Ungültige Domäne: '$_' (erlaubt: @LX_DOMAINS).")           for grep { !$dom_ok{$_} } @doms;
     @doms = @LX_DOMAINS unless @doms;
     return $bad->("limit_patients muss eine positive Zahl sein.")            if defined $limit && $limit !~ /^[1-9]\d{0,6}$/;
-    return $bad->("Zu viele Werte (tag/has_code max. 50, pseudonyms max. 100000).")
-        if @tags > 50 || @codes > 50 || @pseud > 100000;
+    return $bad->("Zu viele Werte (tag/has_tag/has_code max. 50, pseudonyms max. 100000).")
+        if @tags > 50 || @htags > 50 || @codes > 50 || @pseud > 100000;
 
     my %day;
     for my $k (qw(from to event_from event_to)) {
@@ -9835,8 +9879,8 @@ helper long_export_query => sub {
         $day{$k} = normalize_reference_day($v) // return $bad->("$k: ungültiges Datum '$v' (JJJJ-MM-TT oder TT.MM.JJJJ).");
     }
 
-    unless (@tags || @codes || @pseud || to_bool($c->param('all'))) {
-        return $bad->("Kein Kohortenfilter gesetzt. tag, has_code oder pseudonyms angeben, oder all=1 für den Gesamtbestand.");
+    unless (@tags || @htags || @codes || @pseud || to_bool($c->param('all'))) {
+        return $bad->("Kein Kohortenfilter gesetzt. tag, has_tag, has_code oder pseudonyms angeben, oder all=1 für den Gesamtbestand.");
     }
 
     my @bind;
@@ -9848,6 +9892,24 @@ helper long_export_query => sub {
     if ($day{to})   { push @lw, "c.reference_date::date <= ?::date"; push @bind, $day{to} }
     if (@srcs)      { push @lw, "lower(c.doc_source) = ANY(?)";      push @bind, [@srcs] }
     if (@pseud)     { push @lw, "c.pseudonym = ANY(?)";              push @bind, [@pseud] }
+    if (@htags) {
+        # Grundgesamtheit: Tag an irgendeinem Brief des Patienten, unabhängig von Datum und Quelle.
+        # Steht vor Briefdeduplizierung, has_code und limit_patients, damit diese nur noch
+        # die Briefe der Grundgesamtheit sehen.
+        my $pop = "c.pseudonym IN (
+        SELECT ht.pseudonym
+          FROM candidates ht
+         CROSS JOIN LATERAL unnest(string_to_array(COALESCE(ht.tags, ''), ',')) tt(t)
+         WHERE ht.pseudonym IS NOT NULL
+           AND lower(trim(tt.t)) = ANY(?)
+         GROUP BY ht.pseudonym";
+        push @bind, [@htags];
+        if ($hmatch eq 'all' && @htags > 1) {
+            $pop .= "\n        HAVING count(DISTINCT lower(trim(tt.t))) = ?";
+            push @bind, scalar(@htags);
+        }
+        push @lw, "$pop)";
+    }
     my $tag_match = "EXISTS (SELECT 1 FROM unnest(string_to_array(COALESCE(%s.tags, ''), ',')) tt(t) WHERE lower(trim(tt.t)) = ANY(?))";
     if (@tags && $tscope eq 'letter') { push @lw, sprintf($tag_match, 'c'); push @bind, [@tags] }
 

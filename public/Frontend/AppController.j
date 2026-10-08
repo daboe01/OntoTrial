@@ -212,7 +212,18 @@ window.G_SESSION = ''
 
 // --------------------------------------------------------------------------------
 // SelectionColorTextField Subclass (Ensures readability in selected/unselected rows)
+// Weisser Text nur, wenn die Zeile selektiert UND die Tabelle fokussiert ist.
+// Sonst schwarz bzw. die per setUnselectedColor: gesetzte Farbe.
 // --------------------------------------------------------------------------------
+
+// Liefert die umschliessende Tabelle einer Zelle (oder nil)
+function EnclosingTableViewOfView(aView)
+{
+    var v = aView ? [aView superview] : nil;
+    while (v && ![v isKindOfClass:[CPTableView class]])
+        v = [v superview];
+    return v;
+}
 
 @implementation SelectionColorTextField : CPTextField
 {
@@ -222,34 +233,40 @@ window.G_SESSION = ''
 - (void)setUnselectedColor:(CPColor)aColor
 {
     _unselectedColor = aColor;
-    if ([self hasThemeState:CPThemeStateSelectedDataView])
-    {
+    [self _updateSelectionTextColor];
+}
+
+- (void)_updateSelectionTextColor
+{
+    var table   = EnclosingTableViewOfView(self),
+        focused = table ? [table _isFocused] : NO;
+
+    if (focused && [self hasThemeState:CPThemeStateSelectedDataView])
         [self setTextColor:[CPColor whiteColor]];
-    }
     else
-    {
-        [self setTextColor:_unselectedColor];
-    }
+        [self setTextColor:_unselectedColor || [CPColor blackColor]];
 }
 
 - (BOOL)setThemeState:(CPThemeState)aState
 {
     var result = [super setThemeState:aState];
-    if (aState === CPThemeStateSelectedDataView)
-    {
-        [self setTextColor:[CPColor whiteColor]];
-    }
+    [self _updateSelectionTextColor];
     return result;
 }
 
 - (BOOL)unsetThemeState:(CPThemeState)aState
 {
     var result = [super unsetThemeState:aState];
-    if (aState === CPThemeStateSelectedDataView)
-    {
-        [self setTextColor:_unselectedColor || [CPColor blackColor]];
-    }
+    [self _updateSelectionTextColor];
     return result;
+}
+
+// Die Selektion wird in _preparedViewAtColumn: gesetzt, BEVOR die Zelle
+// in die Tabelle eingehaengt wird. Deshalb hier nachziehen.
+- (void)viewDidMoveToSuperview
+{
+    [super viewDidMoveToSuperview];
+    [self _updateSelectionTextColor];
 }
 
 @end
@@ -427,6 +444,11 @@ window.G_SESSION = ''
             {
                 isRowSelected = YES;
             }
+
+            // Nicht fokussierte Tabelle: dunkle Schrift wie bei normalen Tabellen
+            var tokenTable = EnclosingTableViewOfView(self._tokenField);
+            if (isRowSelected && tokenTable && ![tokenTable _isFocused])
+                isRowSelected = NO;
 
             if ([self hasThemeState:CPThemeStateHighlighted] || [self hasThemeState:CPThemeStateSelected] || isRowSelected) {
                 textStyle.color = "rgb(235, 245, 255)";
@@ -786,6 +808,21 @@ _CPTokenFieldToken = HPOTokenFieldToken;
 
 @implementation NoCibTableView : CPTableView
 
+// Spalten verschieben ist bei view-basierten Tabellen fehlerhaft
+// (alte Zellen bleiben nach dem Drop liegen) -> deaktiviert.
+- (id)initWithFrame:(CGRect)aFrame
+{
+    self = [super initWithFrame:aFrame];
+    if (self)
+        _allowsColumnReordering = NO;
+    return self;
+}
+
+- (BOOL)allowsColumnReordering
+{
+    return NO;
+}
+
 - (id)makeViewWithIdentifier:(CPString)anIdentifier owner:(id)anOwner
 {
     if (!anIdentifier)
@@ -801,6 +838,37 @@ _CPTokenFieldToken = HPOTokenFieldToken;
 }
 
 - sizeToFit {return nil}
+
+// Sichtbare Zellen nach Fokus-/Key-Window-Wechsel neu einfaerben
+- (void)_refreshSelectionTextColors
+{
+    [self _enumerateViewsInRows:_exposedRows columns:_exposedColumns usingBlock:function(view, row, column, stop)
+    {
+        if ([view respondsToSelector:@selector(_updateSelectionTextColor)])
+            [view _updateSelectionTextColor];
+        else
+            [view setNeedsLayout];   // z. B. HPOTokenField-Zellen
+    }];
+}
+
+- (void)_firstResponderDidChange:(CPNotification)aNotification
+{
+    [super _firstResponderDidChange:aNotification];
+    [self _refreshSelectionTextColors];
+}
+
+- (void)becomeKeyWindow
+{
+    [super becomeKeyWindow];
+    [self _refreshSelectionTextColors];
+}
+
+- (void)resignKeyWindow
+{
+    [super resignKeyWindow];
+    [self _refreshSelectionTextColors];
+}
+
 @end
 
 // --------------------------------------------------------------------------------
@@ -1925,7 +1993,6 @@ _CPTokenFieldToken = HPOTokenFieldToken;
     
     _chatFoundPatients = [CPMutableArray array];
     [_chatPatientsTableView setDataSource:self];
-    [_chatPatientsTableView setDelegate:self];
     [_chatPatientsTableView setTarget:self];
     [_chatPatientsTableView setDoubleAction:@selector(doubleClickChatPatient:)];
     
@@ -5665,24 +5732,6 @@ _CPTokenFieldToken = HPOTokenFieldToken;
         [cellView setStringValue:value || @""];
         return cellView;
     }
-    else if (aTableView === _chatPatientsTableView)
-        {
-            if (row >= [_chatFoundPatients count])
-                return nil;
-
-            var cellIdentifier = identifier + @"ChatPatientCell";
-            var cellView = [aTableView makeViewWithIdentifier:cellIdentifier owner:self];
-            if (!cellView) {
-                cellView = [[SelectionColorTextField alloc] initWithFrame:CGRectMake(0, 0, [tableColumn width], 24)];
-                [cellView setIdentifier:cellIdentifier];
-                [cellView setEditable:NO];
-                [cellView setBezeled:NO];
-            }
-
-            var value = [self tableView:aTableView objectValueForTableColumn:tableColumn row:row];
-            [cellView setStringValue:value || @""];
-            return cellView;
-        }
 
     return nil;
 }

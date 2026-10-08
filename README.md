@@ -1,15 +1,13 @@
 # OntoTrial – Clinical Trial Eligibility & Phenotyping Framework
 
-An integrated, full-stack environment for structured clinical trial eligibility definition, cohort feasibility analysis, longitudinal patient matching and patient-similarity analysis. OntoTrial turns unstructured trial protocols and medical narrative reports (primarily German ophthalmology letters) into standardized, ontology-coded data: **FHIR R6 `Group`** resources for trial criteria and **GA4GH Phenopackets v2** for patients.
+An integrated, full-stack environment for structured clinical trial eligibility definition, cohort feasibility analysis, longitudinal patient matching and patient-similarity analysis. OntoTrial turns unstructured trial protocols and medical narrative reports (primarily German ophthalmology letters) into standardized, ontology-coded data: **FHIR R6 `Group`** resources for trial criteria and **GA4GH `Phenopackets v2`** for patients.
 
-Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology extraction, normalization and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC** and **LOINC**, with SNOMED CT laterality qualifiers.
+Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers unified multi-ontology extraction from narrative texts, including normalization and hierarchical querying across **HPO**, **ICD-10-GM**, **OPS**, **ATC** and **LOINC**, with SNOMED CT laterality qualifiers.
 
 > **Research prototype.** OntoTrial is not a medical device and must not be used for diagnostic or therapeutic decisions. Process patient data only in pseudonymized form and in accordance with your local data-protection and ethics requirements. Data leaving the institution should only be produced via the [anonymized export](#anonymized-export); the [long-format export](#long-format-export-for-statistics) is for internal analyses only.
 
 <img width="2033" height="1022" alt="OntoTrial Candidates view" src="https://github.com/user-attachments/assets/421e4515-8eb7-4c70-9790-1d21a1f340d0" />
 <img width="1860" height="1028" alt="OntoTrial Phenotype Tree Browser" src="https://github.com/user-attachments/assets/f7c86a01-2ce4-4fbc-83fa-633d0b4c1e6d" />
-<img width="853" height="607" alt="Matching trace" src="https://github.com/user-attachments/assets/49591f73-51f6-4c49-b6ab-efd2b1a74083" />
-<img width="1326" height="835" alt="Bildschirmfoto 2026-09-26 um 20 03 07" src="https://github.com/user-attachments/assets/15928468-8d5c-4b71-b580-e546a0d5b135" />
 ---
 
 ## Contents
@@ -152,6 +150,7 @@ flowchart LR
 ---
 
 ## Matching, time-to-eligibility and patient similarity
+<img width="853" height="607" alt="Matching trace" src="https://github.com/user-attachments/assets/49591f73-51f6-4c49-b6ab-efd2b1a74083" />
 
 ### Dual-hypothesis eye matching
 
@@ -186,6 +185,7 @@ On top of this, OntoTrial offers k-nearest-neighbour search and greedy 1:ratio c
 ---
 
 ## Anonymized export
+<img width="1326" height="835" alt="Bildschirmfoto 2026-09-26 um 20 03 07" src="https://github.com/user-attachments/assets/15928468-8d5c-4b71-b580-e546a0d5b135" />
 
 `POST /BBB/export/anonymized_phenopackets` produces de-identified phenopackets for a cohort (selected by `tag` or `candidate_ids`), one per letter, following the project's data-protection impact assessment (DSFA) and technical anonymization concept. Nothing about the mapping between pseudonyms and export IDs is stored or logged.
 
@@ -233,12 +233,14 @@ List parameters accept comma-separated values or can be repeated.
 
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
+| `has_tag` | – | Population: patients with at least one letter carrying this tag (exact token match, case-insensitive), regardless of letter date or source. Applied before all other filters, see [Selecting the population](#selecting-the-population). |
+| `has_tag_match` | `any` | With several `has_tag` values: `any` (at least one tag) or `all` (every tag, possibly on different letters). |
 | `has_code` | – | Patients with at least one non-negated element at or below this code (`is_subclass_of`), e.g. `OPS:5-125` for keratoplasty. |
 | `tag` | – | Tag(s); exact token match, case-insensitive. |
 | `tag_scope` | `patient` | `patient`: all letters of tagged patients. `letter`: only tagged letters. |
 | `pseudonyms` | – | Explicit list of pseudonyms. |
-| `all` | – | Required (`all=1`) when none of `has_code`, `tag`, `pseudonyms` is given. |
-| `from`, `to` | – | Letter date range, inclusive (`YYYY-MM-DD` or `DD.MM.YYYY`). Cohort selection only considers letters in this range. |
+| `all` | – | Required (`all=1`) when none of `has_tag`, `has_code`, `tag`, `pseudonyms` is given. |
+| `from`, `to` | – | Letter date range, inclusive (`YYYY-MM-DD` or `DD.MM.YYYY`). `has_code` and `tag_scope=letter` only consider letters in this range; `has_tag` does not. |
 | `event_from`, `event_to` | – | Event date range (events only). Dates are interpreted like in the reference R script (`YYYY-MM` → 15th, `YYYY` → 1 July). |
 | `keep_undated` | `1` | Keep undated elements when an event date range is set. |
 | `domains` | all | Subset of `procedure,disease,phenotype,treatment,measurement`. |
@@ -251,6 +253,28 @@ List parameters accept comma-separated values or can be repeated.
 | `token` | – | Export token, alternatively header `X-Export-Token` (required if `ONTOTRIAL_EXPORT_TOKEN` is set). |
 
 Invalid parameters are answered with HTTP 400 and a JSON message; query errors before the first data block with HTTP 500.
+
+### Selecting the population
+
+The filters are applied in this order:
+
+1. **Population** – `has_tag` selects the patients that are considered at all. A patient belongs to the population if any of their letters carries the tag, independent of `from`/`to`, `sources` and `tag_scope`.
+2. **Letters** – the letters of these patients are restricted by `from`/`to`, `sources`, `pseudonyms` and, with `tag_scope=letter`, by `tag`. Identical letter texts are merged (see [Deduplication](#deduplication)).
+3. **Cohort** – `tag` (with `tag_scope=patient`) and `has_code` select patients among the remaining letters; `limit_patients` is applied last.
+4. **Elements** (events only) – `domains`, `include_excluded`, `event_from`/`event_to` and element deduplication.
+
+`has_tag` and `tag` with the default `tag_scope=patient` select the same patients. The difference is when the filter is applied: `has_tag` restricts the data before the `has_code` search, which is considerably faster on large databases, and can be combined with `tag_scope=letter` to export only certain letters of a tagged population.
+
+```
+# Keratoplasty patients within the AMD register
+/BBB/export/long/events?has_tag=AMD-Register&has_code=OPS:5-125
+
+# Population from two cohorts (either one), only study-visit letters exported
+/BBB/export/long/events?has_tag=Cohort-A,Cohort-B&tag=Study-Visit&tag_scope=letter
+
+# Only patients tagged with both cohorts
+/BBB/export/long/patients?has_tag=Cohort-A,Cohort-B&has_tag_match=all
+```
 
 ### Deduplication
 

@@ -4,10 +4,11 @@
     <objects>
         <sortDescriptor id="by_pseudonym" key="pseudonym"/>
         <sortDescriptor id="by_name" key="name"/>
+        <sortDescriptor id="by_id" key="id" numeric="YES"/>
         <sortDescriptor id="by_timestamp" key="timestamp" ascending="NO"/>
         
         <arrayController id="trials_controller" entity="trials" autoFetchSync="YES" sortDescriptor="by_name"/>
-        <arrayController id="candidates_controller" entity="candidates" autoFetchSync="YES" sortDescriptor="by_pseudonym"/>
+        <arrayController id="candidates_controller" entity="candidates" autoFetchSync="YES" sortDescriptor="by_id"/>
         <arrayController id="matches_controller" entity="matches" autoFetchSync="YES" sortDescriptor="by_timestamp"/>
     </objects>
     <entities>
