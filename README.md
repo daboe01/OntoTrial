@@ -16,7 +16,7 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 - [Architecture](#architecture)
 - [Extraction and mapping pipeline](#extraction-and-mapping-pipeline)
 - [Ophthalmology engine](#ophthalmology-engine)
-- [Matching, time-to-eligibility and patient similarity](#matching-time-to-eligibility-and-patient-similarity)
+- [Matching and patient similarity](#matching-and-patient-similarity)
 - [Feasibility chat assistant](#feasibility-chat-assistant)
 - [Anonymized export](#anonymized-export)
 - [Long-format export for statistics](#long-format-export-for-statistics)
@@ -36,21 +36,21 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 | **Phenotypes & symptoms** | **HPO** | Recursive `isas` hierarchy, synonym and xref lookup, subsumption testing, ancestor-based similarity. |
 | **Diagnoses** | **ICD-10-GM** | German modification incl. Freiburg Alpha-ID suffix normalization, drug-allergy coding (`Z88.8` + ATC), allergen categories (insect venom, pollen, food, contact). |
 | **Procedures** | **OPS** | BfArM hierarchy, lateral body-site tracking, direction guard (removal vs. insertion). |
-| **Medications** | **ATC** | Active agents and trade names, eye drops, anti-VEGF/steroid IVOM auto-detection, dosage-pattern stripping. |
+| **Medications** | **ATC** | Active agents and trade names, eye drops, anti-VEGF/steroid IVOM auto-detection. |
 | **Measurements** | **LOINC** | Clinical chemistry, haematology, coagulation, thyroid, serology, blood pressure, BMI, PROMs (e.g. OSDI) and quantitative ophthalmic measurements. Supports local extension codes (`86290-4a`, `86301-9b`, …). |
 | **Anatomy & laterality** | **SNOMED CT / HPO** | Right/left/both eyes (`SNOMED:18944008`, `8966001`, `40638003`; `HP:0012834/5/2`). |
-| **Output standards** | **FHIR R6 `Group`**, **Phenopacket v2.0.0** | Nested definitional/conceptual criteria groups; patient phenopackets with features, measurements, diseases, procedures and medical actions. |
+| **Output standards** | **FHIR R6 `Group`**, `**Phenopacket v2.0.0**` | Nested definitional/conceptual criteria groups; patient phenopackets with features, measurements, diseases, procedures and medical actions. |
 
 Highlights added in recent versions:
 
 - **Multi-stage mapping quality control** – curated regex intercepts, LLM translation with cache, dense vector retrieval, LLM reranking of the top-k candidates in a "gray zone", lexical label gate and anatomy/scope guards (details [below](#extraction-and-mapping-pipeline)).
-- **Database-driven configuration** – LLM prompts, intercept rules and filter rules live in PostgreSQL and are reloaded every 30 seconds without a restart.
+- **Database-driven configuration** – LLM prompts, intercept rules and filter rules live in PostgreSQL.
 - **Deep mode** – optional two-stage extraction with an unconstrained reasoning trace (pre-extraction table) followed by schema-constrained JSON sampling.
 - **Anonymized export** – de-identified phenopackets for data sharing: no free text, ephemeral subject IDs, month truncation with patient-constant date shift, age top-coding and hierarchical generalization of rare codes (k ≥ 5).
 - **Long-format export** – one row per coded element as CSV or NDJSON, deduplicated across letters, streamed from a server-side cursor and directly readable from R (details [below](#long-format-export-for-statistics)).
-- **Patient similarity** – eye-mirroring distance between phenopackets, nearest-neighbour search and greedy 1:n case-control matching with caliper.
+- **Patient similarity** – nearest-neighbour search and greedy 1:n case-control matching with caliper.
 - **Catalog maintenance** – `update_catalogs.pl` for inventory, versioned imports with backups and post-import checks.
-- **Server-side persistence and live sync** – extracted phenopackets are stored by the backend under the `candidate_id` of the request, never under the current GUI selection; all open browsers receive the update over the WebSocket.
+- **Server-side persistence and live sync** – extracted phenopackets are stored by the backend under the `candidate_id` of the request; all open browsers receive the update over the WebSocket.
 - **Real-time progress** – every extraction step reports progress over the WebSocket channel.
 
 ---
@@ -77,17 +77,8 @@ flowchart TD
 
 1. **Frontend (Objective-J / Cappuccino)** – desktop-grade web GUI with a Cocoa-style MVC architecture: `CPRuleEditor` for nested criteria (`all-of`, `any-of`, `neither-of`), `CPOutlineView` tree browsers for all five terminologies, visual phenopacket profile, matching trace, time-to-event export and the feasibility chat. Data binding uses the Fireside ORM, which keeps one object per database row and merges change notifications from the WebSocket into these objects.
 2. **Backend (Mojolicious / Perl)** – asynchronous REST and WebSocket API (`backend.pl`), Minion job queue for background letter extraction, PostgreSQL pub/sub for live updates.
-3. **LLM provider** – any OpenAI-compatible vLLM server (e.g. `gpt-oss-120b`) or Ollama (e.g. `gemma4:31b-mlx`). Routing is automatic based on the selected model name.
+3. **LLM provider** – any OpenAI-compatible vLLM server (e.g. `gpt-oss-120b`) or Ollama (e.g. `gemma4:31b-mlx`). Routing is automatic based on the model suffix.
 4. **Patchbay** – stateless vector search per terminology; calls are serialized through an in-process queue.
-
-### Where results are written
-
-Long-running jobs write to the record they were started for, not to whatever is selected in the GUI when they finish:
-
-- **Phenopackets** are stored by the backend (`/BBB/extract_phenopacket`, `/BBB/extract_phenopacket_from_letter` with `candidate_id`, and the Minion task). The backend then sends a change notification; every browser that has the candidate loaded updates it in place, and the phenopacket view refreshes if that candidate is open.
-- **FHIR criteria** are written by the rule editor into the trial it currently displays. An extraction that finishes after the user has switched to another trial is saved to the original trial without touching the editor.
-- **Narrative summaries** are written to the match the request was started from.
-- Edits in the phenopacket table belong to the candidate shown at the time of editing; edits that finish after a switch are discarded.
 
 ---
 
@@ -95,7 +86,7 @@ Long-running jobs write to the record they were started for, not to whatever is 
 
 ### Step 1 – Atomization
 
-The input text is cleaned (HTML, KIS macros), common abbreviations are expanded (RZA, AAION, NAION, PDR, NPDR) and the text is split into section-aware chunks. Ophthalmic section headers (`Visus R:`, `VAA L:`, `Fundus BA:` …) are recognized, laterality is injected as a directive, and right/left findings of the same examination are never split across chunks.
+The input text is cleaned (HTML, KIS macros) and the text is split into section-aware chunks. Ophthalmic section headers (`Visus R:`, `VAA L:`, `Fundus BA:` …) are recognized, laterality is injected as a directive, and right/left findings of the same examination are never split across chunks.
 
 Each chunk is sent to the LLM with a strict JSON schema. Every extracted row carries:
 
@@ -149,7 +140,7 @@ flowchart LR
 
 ---
 
-## Matching, time-to-eligibility and patient similarity
+## Matching and patient similarity
 <img width="853" height="607" alt="Matching trace" src="https://github.com/user-attachments/assets/49591f73-51f6-4c49-b6ab-efd2b1a74083" />
 
 ### Dual-hypothesis eye matching
@@ -336,7 +327,7 @@ A natural-language assistant for cohort queries such as *"Patients with Sjögren
 - Perl 5.30 or newer
 - PostgreSQL 14 or newer (16 recommended)
 - An OpenAI-compatible vLLM server or an Ollama instance
-- A Patchbay instance with vector indices for the five terminologies
+- A Patchbay instance with vector catalogues for the five terminologies
 
 ### Perl dependencies
 
@@ -500,7 +491,7 @@ Recommended order:
 
 Additionally: `GET /BBB/hpo/synonyms/:id`, `GET /BBB/hpo/xrefs/:id`.
 
-> **Security:** the API has no authentication and sends `Access-Control-Allow-Origin: *`. Generic table routes (`/BBB/:table`), `/BBB/chat/execute_sql` and the long-format export (unless `ONTOTRIAL_EXPORT_TOKEN` is set) can read person-related data. Run the backend only in a protected network segment behind an authenticating reverse proxy.
+> **Security:** the API has no authentication and sends `Access-Control-Allow-Origin: *`. Generic table routes (`/BBB/:table`), `/BBB/chat/execute_sql` and the long-format export (unless `ONTOTRIAL_EXPORT_TOKEN` is set) can read person-related data. **Run the backend only in a protected network segment behind an authenticating reverse proxy.**
 
 ### Live updates
 
