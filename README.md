@@ -16,7 +16,7 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 - [Architecture](#architecture)
 - [Extraction and mapping pipeline](#extraction-and-mapping-pipeline)
 - [Ophthalmology engine](#ophthalmology-engine)
-- [Matching and patient similarity](#matching-time-to-eligibility-and-patient-similarity)
+- [Matching and patient similarity](#matching-and-patient-similarity)
 - [Feasibility chat assistant](#feasibility-chat-assistant)
 - [Anonymized export](#anonymized-export)
 - [Long-format export for statistics](#long-format-export-for-statistics)
