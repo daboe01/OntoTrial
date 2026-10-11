@@ -50,7 +50,7 @@ Highlights added in recent versions:
 - **Long-format export** – one row per coded element as CSV or NDJSON, deduplicated across letters, streamed from a server-side cursor and directly readable from R (details [below](#long-format-export-for-statistics)).
 - **Patient similarity** – nearest-neighbour search and greedy 1:n case-control matching with caliper.
 - **Catalog maintenance** – `update_catalogs.pl` for inventory, versioned imports with backups and post-import checks.
-- **Server-side persistence and live sync** – extracted phenopackets are stored by the backend under the `candidate_id` of the request, never under the current GUI selection; all open browsers receive the update over the WebSocket.
+- **Server-side persistence and live sync** – extracted phenopackets are stored by the backend under the `candidate_id` of the request; all open browsers receive the update over the WebSocket.
 - **Real-time progress** – every extraction step reports progress over the WebSocket channel.
 
 ---
