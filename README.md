@@ -16,7 +16,7 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 - [Architecture](#architecture)
 - [Extraction and mapping pipeline](#extraction-and-mapping-pipeline)
 - [Ophthalmology engine](#ophthalmology-engine)
-- [Matching, time-to-eligibility and patient similarity](#matching-time-to-eligibility-and-patient-similarity)
+- [Matching and patient similarity](#matching-time-to-eligibility-and-patient-similarity)
 - [Feasibility chat assistant](#feasibility-chat-assistant)
 - [Anonymized export](#anonymized-export)
 - [Long-format export for statistics](#long-format-export-for-statistics)
@@ -140,7 +140,7 @@ flowchart LR
 
 ---
 
-## Matching, time-to-eligibility and patient similarity
+## Matching and patient similarity
 <img width="853" height="607" alt="Matching trace" src="https://github.com/user-attachments/assets/49591f73-51f6-4c49-b6ab-efd2b1a74083" />
 
 ### Dual-hypothesis eye matching
