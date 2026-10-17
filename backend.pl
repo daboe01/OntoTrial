@@ -5,13 +5,30 @@
 
 # + FHIR Eye Normalization (Study Eye -> Right Eye, Fellow Eye -> Left Eye)
 # TODO: support orphacodes
-# TODO: Long-export with intelligent deduplication
 
 use utf8;
+# Optionale .env neben backend.pl laden (Bare-Metal-Betrieb).
+# Bereits gesetzte Umgebungsvariablen (z. B. aus docker compose) haben Vorrang.
+BEGIN {
+    require File::Basename;
+    require File::Spec;
+    my $f = File::Spec->catfile(File::Basename::dirname(File::Spec->rel2abs(__FILE__)), '.env');
+    if (open my $fh, '<:encoding(UTF-8)', $f) {
+        while (my $l = <$fh>) {
+            next if $l =~ /^\s*(?:#|$)/;
+            next unless $l =~ /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/;
+            my ($k, $v) = ($1, $2);
+            $v =~ s/^(['"])(.*)\1$/$2/;
+            $ENV{$k} //= $v;
+        }
+    }
+}
+
 use Mojolicious::Lite;
 use Mojo::Pg;
 use Data::Dumper;
 use Mojo::UserAgent;
+use Mojo::URL;
 use Encode qw(decode_utf8 is_utf8 encode decode);
 use Mojo::JSON qw(decode_json encode_json from_json to_json);
 use POSIX qw(strftime);
@@ -43,12 +60,38 @@ sub resolve_table_name {
 # =========================================================
 # DATABASE CONNECTION (Mojo::Pg)
 # =========================================================
+# PATCH 2026-10-14: Verbindungen über das Environment konfigurierbar
+#   ONTOTRIAL_PG         Hauptdatenbank (Ontologien, Kandidaten, Caches)
+#                        Default: postgresql://postgres:postgres@localhost/hpo
+#   ONTOTRIAL_MINION_PG  vollständige Verbindung für die Minion-Queue (hat Vorrang)
+#   ONTOTRIAL_MINION_DB  nur der Datenbankname für Minion; Host, Port, Benutzer,
+#                        Passwort und Optionen kommen aus ONTOTRIAL_PG
+# Ohne Angaben teilen sich Hauptdatenbank und Minion wie bisher dieselbe Datenbank.
+my $pg_dsn = (defined $ENV{ONTOTRIAL_PG} && length $ENV{ONTOTRIAL_PG})
+    ? $ENV{ONTOTRIAL_PG}
+    : 'postgresql://postgres:postgres@localhost/hpo';
+
+my $minion_dsn = $ENV{ONTOTRIAL_MINION_PG};
+unless (defined $minion_dsn && length $minion_dsn) {
+    my $name = $ENV{ONTOTRIAL_MINION_DB};
+    if (defined $name && length $name) {
+        die "Ungültiger Datenbankname in ONTOTRIAL_MINION_DB: '$name'\n"
+            unless $name =~ /^[A-Za-z0-9_\-]{1,63}$/;
+        $minion_dsn = Mojo::URL->new($pg_dsn)->path("/$name")->to_unsafe_string;
+    } else {
+        $minion_dsn = $pg_dsn;
+    }
+}
+
 helper pg => sub {
-    state $pg = Mojo::Pg->new('postgresql://postgres:postgres@localhost/hpo')
+    state $pg = Mojo::Pg->new($pg_dsn)
 };
 
 
-plugin Minion => {Pg => 'postgresql://postgres:postgres@localhost/hpo'};
+plugin Minion => {Pg => $minion_dsn};
+# to_string lässt Benutzer und Passwort weg
+app->log->info(sprintf('[CONFIG] Hauptdatenbank: %s | Minion: %s',
+    Mojo::URL->new($pg_dsn)->to_string, Mojo::URL->new($minion_dsn)->to_string));
 # Jobs erst nach 30 Tagen im Zustand "inactive" als hängend markieren
 # (Standard: 2 Tage, reicht bei großem Rückstand nicht)
 app->minion->stuck_after(60 * 60 * 24 * 30);
@@ -76,7 +119,7 @@ app->hook(before_dispatch => sub {
 # =========================================================
 # GLOBAL CONFIGURATION & LLM SETTINGS
 # =========================================================
-my $api_key      = $ENV{VLLM_API_KEY}   // 'ap-';
+my $api_key      = $ENV{VLLM_API_KEY}   // '';
 my $endpoint     = $ENV{VLLM_ENDPOINT}  // 'https://inference-api.aipier.kn.uniklinik-freiburg.de/v1/chat/completions';
 my $model        = $ENV{VLLM_MODEL}     // 'gpt-oss-120b';
 
@@ -106,7 +149,7 @@ my $parent_candidate_on  = $ENV{ONTOTRIAL_PARENT_CANDIDATE}         // 1;     # 
 my $ground_generic       = $ENV{ONTOTRIAL_GROUND_GENERIC}           // 1;     # Organ an Begriffe ohne okuläres Signal anhängen
 
 our $PIPELINE_CREATOR = 'OntoTrial2-DisjunctiveDeduplicatedStepEngine';
-our $PIPELINE_VERSION = '2026-10-02';
+our $PIPELINE_VERSION = '2026-10-14';
 
 
 # Concurrency throttling configuration for Patchbay
@@ -114,14 +157,33 @@ my $max_patchbay_concurrency = 1;
 my $active_patchbay_calls    = 0;
 my @patchbay_queue;
 
+# PATCH 2026-10-14: Patchbay-Prompt-IDs aus dem Environment, Fallback wie bisher
+#   ONTOTRIAL_PROMPT_ID_HPO           (51)
+#   ONTOTRIAL_PROMPT_ID_HPO_MODIFIER  (52)
+#   ONTOTRIAL_PROMPT_ID_ICD10         (64)
+#   ONTOTRIAL_PROMPT_ID_OPS           (65)
+#   ONTOTRIAL_PROMPT_ID_ATC           (66)
+#   ONTOTRIAL_PROMPT_ID_LOINC         (69)
+sub _env_prompt_id {
+    my ($var, $default) = @_;
+    my $v = $ENV{$var};
+    return $default unless defined $v && length $v;
+    die "Ungültige Prompt-ID in $var: '$v' (ganze Zahl erwartet)\n" unless $v =~ /^\s*(\d+)\s*$/;
+    return $1 + 0;
+}
+
 use constant {
-    LLM_HPO_RETRIEVAL_PROMPT_ID          => 51,
-    LLM_HPO_MODIFIER_RETRIEVAL_PROMPT_ID => 52,
-    LLM_ICD10_RETRIEVAL_PROMPT_ID        => 64,
-    LLM_OPS_RETRIEVAL_PROMPT_ID          => 65,
-    LLM_ATC_RETRIEVAL_PROMPT_ID          => 66,
-    LLM_LOINC_RETRIEVAL_PROMPT_ID        => 69,
+    LLM_HPO_RETRIEVAL_PROMPT_ID          => _env_prompt_id('ONTOTRIAL_PROMPT_ID_HPO',          51),
+    LLM_HPO_MODIFIER_RETRIEVAL_PROMPT_ID => _env_prompt_id('ONTOTRIAL_PROMPT_ID_HPO_MODIFIER', 52),
+    LLM_ICD10_RETRIEVAL_PROMPT_ID        => _env_prompt_id('ONTOTRIAL_PROMPT_ID_ICD10',        64),
+    LLM_OPS_RETRIEVAL_PROMPT_ID          => _env_prompt_id('ONTOTRIAL_PROMPT_ID_OPS',          65),
+    LLM_ATC_RETRIEVAL_PROMPT_ID          => _env_prompt_id('ONTOTRIAL_PROMPT_ID_ATC',          66),
+    LLM_LOINC_RETRIEVAL_PROMPT_ID        => _env_prompt_id('ONTOTRIAL_PROMPT_ID_LOINC',        69),
 };
+
+app->log->info(sprintf('[CONFIG] Patchbay %s, Prompt-IDs: HPO %d, HPO-Modifier %d, ICD10 %d, OPS %d, ATC %d, LOINC %d',
+    $patchbay_url, LLM_HPO_RETRIEVAL_PROMPT_ID, LLM_HPO_MODIFIER_RETRIEVAL_PROMPT_ID, LLM_ICD10_RETRIEVAL_PROMPT_ID,
+    LLM_OPS_RETRIEVAL_PROMPT_ID, LLM_ATC_RETRIEVAL_PROMPT_ID, LLM_LOINC_RETRIEVAL_PROMPT_ID));
 
 # Initialize Mojo::UserAgent
 my $ua = Mojo::UserAgent->new(request_timeout => 0, inactivity_timeout => 0, connect_timeout => 0);
@@ -594,10 +656,15 @@ sub extract_visus_and_refraction {
     $clean_for_visus =~ tr/()//d;
 
     # Lochblendenvisus (LB) vorab isolieren, damit er den Hauptvisus nicht als Maximum verfälscht:
+    # PATCH 2026-10-14: Wert auch nach "LB" ("0,9 mit LB") und Werte > 1,0 ("LB 1,25")
     my $lb_visus = undef;
-    if ($clean_for_visus =~ /\b(?:mit\s+)?(?:LB|Lochblende)\s*[:=]?\s*(0[\.,]\d+|1[\.,]0|[1-6]\/\d{1,2})/i) {
+    my $lb_val_re = qr/0[\.,]\d+|1[\.,]\d{1,2}|[1-6]\/\d{1,2}/;
+    if ($clean_for_visus =~ /\b(?:mit\s+)?(?:LB|Lochblende)\s*[:=]?\s*($lb_val_re)/i) {
         $lb_visus = prune_visus_val($1);
-        $clean_for_visus =~ s/\b(?:mit\s+)?(?:LB|Lochblende)\s*[:=]?\s*(?:0[\.,]\d+|1[\.,]0|[1-6]\/\d{1,2})//gi;
+        $clean_for_visus =~ s/\b(?:mit\s+)?(?:LB|Lochblende)\s*[:=]?\s*(?:$lb_val_re)//gi;
+    } elsif ($clean_for_visus =~ /(?<![\d.,\/])($lb_val_re)\s*(?:mit\s+)*(?:LB|Lochblende)\b/i) {
+        $lb_visus = prune_visus_val($1);
+        $clean_for_visus =~ s/(?<![\d.,\/])(?:$lb_val_re)\s*(?:mit\s+)*(?:LB|Lochblende)\b//gi;
     }
 
     my @candidate_values;
@@ -630,7 +697,8 @@ sub extract_visus_and_refraction {
         $max_visus = $sorted[0];
     }
 
-    return undef unless defined $max_visus || defined $sph;
+    # PATCH 2026-10-14: reiner Lochblendenvisus ist ebenfalls ein Ergebnis
+    return undef unless defined $max_visus || defined $sph || defined $lb_visus;
 
     # Korrekturstatus sauber differenzieren
     my $is_own_glasses  = ($clean_for_visus =~ /\b(?:eB|m\.?e\.?B|eigene\s+brille)\b/i) ? 1 : 0;
@@ -654,6 +722,7 @@ sub extract_visus_and_refraction {
     return {
         visus_value          => $max_visus,
         eb_value             => $eb_visus,
+        lb_value             => $lb_visus,
         is_best_corrected    => $is_corrected,
         is_own_glasses       => $is_own_glasses,
         sphere               => $sph,
@@ -666,10 +735,45 @@ sub extract_visus_and_refraction {
 
 
 # =========================================================================
-# OPHTHALMOLOGY LOINC MEASUREMENT BUILDER MIT LOGS
+# OPHTHALMOLOGY LOINC MEASUREMENT BUILDER
+# PATCH 2026-10-12: Codes kommen aus ontology_intercepts (domain 'loinc',
+# pattern exakt '^<schlüssel>$', z. B. '^refraction axis right eye$').
+# Die bisher fest eingetragenen Refraktionscodes waren falsch
+# (65898-9 = Eye fields photographed, 65891-4 = Cylinder axis Right eye
+# als "Sphäre links", 65895-5 = Cylinder axis Left eye als "Zylinder links").
+# Fallbacks unten sind gegen loinc_terms geprüft. Sphäre und Zylinder
+# haben bewusst KEINEN Fallback: ohne Intercept entfällt die Messung.
 # =========================================================================
+our %OPHTH_LOINC_FALLBACK = (
+    'refraction axis right eye'                 => ['LOINC:79844-7', 'Right eye Axis--WO cycloplegia by Subjective refraction'],
+    'refraction axis left eye'                  => ['LOINC:79845-4', 'Left eye Axis--WO cycloplegia by Subjective refraction'],
+    'refraction spherical equivalent right eye' => ['LOINC:95327-3', 'Right corrective lens Spherical equivalent Calculated'],
+    'refraction spherical equivalent left eye'  => ['LOINC:95328-1', 'Left corrective lens Spherical equivalent Calculated'],
+);
+our %OPHTH_LOINC_WARNED;
+
+# PATCH 2026-10-14: erwartete Einheit und Wertebereich je Assay.
+# Ein Messwert außerhalb dieser Grenzen ist fast immer ein Parserfehler
+# (z. B. Monat aus "10/23: 699 Zellen/mm²" als Wert "10 score").
+# require: Assay ohne quantitativen Wert ebenfalls verwerfen.
+our %LOINC_PLAUSIBLE = (
+    'LOINC:100076-9' => { unit => '{cells}/mm2', min => 200, max => 4500, require => 1 },  # Endothel rechts
+    'LOINC:100077-7' => { unit => '{cells}/mm2', min => 200, max => 4500, require => 1 },  # Endothel links
+    'LOINC:79887-6'  => { unit => 'um',          min => 250, max => 900,  require => 1 },  # Pachymetrie links
+    'LOINC:79888-4'  => { unit => 'um',          min => 250, max => 900,  require => 1 },  # Pachymetrie rechts
+);
+
+sub loinc_value_plausible {
+    my ($id, $q) = @_;
+    my $r = $LOINC_PLAUSIBLE{$id // ''} or return 1;
+    return ($r->{require} ? 0 : 1) unless ref $q eq 'HASH' && defined $q->{value};
+    return 0 if $r->{unit} && ($q->{unit} // '') ne $r->{unit};
+    return 0 if $q->{value} < $r->{min} || $q->{value} > $r->{max};
+    return 1;
+}
+
 sub build_ophthalmic_loinc_measurements {
-    my ($parsed_ref, $laterality, $ref_date) = @_;
+    my ($parsed_ref, $laterality, $ref_date, $resolve) = @_;
     return () unless ref $parsed_ref eq 'HASH';
 
     my $lat = lc($laterality // 'none');
@@ -680,111 +784,90 @@ sub build_ophthalmic_loinc_measurements {
                 : $is_right ? { id => "HP:0012834", label => "Right" }
                 : undef;
 
+    # Refraktion ohne Seitenangabe wurde schon bisher dem rechten Auge zugeordnet
+    my $rside  = $is_left ? 'left eye' : 'right eye';
+    my $vside  = $is_left ? ' left eye' : $is_right ? ' right eye' : '';
+    my $vlabel = $is_left ? ' Left eye' : $is_right ? ' Right eye' : '';
+
+    my $resolve_code = sub {
+        my ($key, $fb_id, $fb_label) = @_;
+        my $hit = $resolve ? eval { $resolve->($key) } : undef;
+        return ($hit->{id}, $hit->{label} // $fb_label) if ref $hit eq 'HASH' && $hit->{id};
+        if (!$fb_id && (my $fb = $OPHTH_LOINC_FALLBACK{$key})) { ($fb_id, $fb_label) = @$fb; }
+        return ($fb_id, $fb_label) if $fb_id;
+        warn "[OPHTH LOINC] Kein Intercept für '$key' – Messung entfällt.\n" unless $OPHTH_LOINC_WARNED{$key}++;
+        return;
+    };
+
     my @measurements;
+    my $add = sub {
+        my (%a) = @_;
+        my ($id, $label) = $resolve_code->($a{key}, $a{fb_id}, $a{fb_label});
+        return unless $id;
+        my @mods = ({ id => "LP7753-9", label => "Measurement: = $a{value} $a{mod_unit}" }, @{ $a{extra} // [] });
+        push @mods, $lat_obj if $lat_obj;
+        push @measurements, {
+            assay => { id => $id, label => $label },
+            value => { quantity => { comparator => '=', value => $a{value}, unit => { label => $a{unit} } } },
+            modifiers => \@mods,
+            ($ref_date ? (timeOfCollection => { timestamp => $ref_date }) : ())
+        };
+    };
 
     # 1. Visus mit eigener Brille (eB)
     if (defined $parsed_ref->{eb_value}) {
-        my $loinc_id    = "LOINC:28637-7";
-        my $loinc_label = $is_left  ? "Visual acuity with own glasses Left eye"
-                        : ($is_right ? "Visual acuity with own glasses Right eye" : "Visual acuity with own glasses");
-        my @mods = ({ id => "LP7753-9", label => "Measurement: = $parsed_ref->{eb_value} decimal" });
-        push @mods, { id => "LP7753-9", label => "with own glasses (eB)" };
-        push @mods, $lat_obj if $lat_obj;
-
-        push @measurements, {
-            assay => { id => $loinc_id, label => $loinc_label },
-            value => { quantity => { comparator => '=', value => $parsed_ref->{eb_value}, unit => { label => "decimal" } } },
-            modifiers => \@mods,
-            ($ref_date ? (timeOfCollection => { timestamp => $ref_date }) : ())
-        };
+        $add->(key => "visual acuity own glasses$vside", fb_id => "LOINC:28637-7",
+               fb_label => "Visual acuity with own glasses$vlabel",
+               value => $parsed_ref->{eb_value}, unit => "decimal", mod_unit => "decimal",
+               extra => [{ id => "LP7753-9", label => "with own glasses (eB)" }]);
     }
 
-    # 2. Bestkorrigierter Visus (cc) - separat erfassen, wenn vorhanden und abweichend
+    # 2. Bestkorrigierter (cc) bzw. unkorrigierter (sc) Visus
     if (defined $parsed_ref->{visus_value} && (!$parsed_ref->{is_own_glasses} || defined $parsed_ref->{sphere})) {
-        my ($loinc_id, $loinc_label);
-        if ($parsed_ref->{is_best_corrected}) {
-            $loinc_id    = $is_left ? "LOINC:65897-1" : ($is_right ? "LOINC:65893-0" : "LOINC:28637-7");
-            $loinc_label = $is_left ? "Visual acuity best corrected Left eye"
-                                    : ($is_right ? "Visual acuity best corrected Right eye" : "Visual acuity best corrected");
-        } else {
-            # Unkorrigierter Visus (s.c.)
-            $loinc_id    = $is_left ? "LOINC:65896-3" : ($is_right ? "LOINC:65892-2" : "LOINC:28637-7");
-            $loinc_label = $is_left ? "Visual acuity uncorrected Left eye"
-                                    : ($is_right ? "Visual acuity uncorrected Right eye" : "Visual acuity uncorrected");
-        }
-        my @mods = ({ id => "LP7753-9", label => "Measurement: = $parsed_ref->{visus_value} decimal" });
-        push @mods, $lat_obj if $lat_obj;
-
-        push @measurements, {
-            assay => { id => $loinc_id, label => $loinc_label },
-            value => { quantity => { comparator => '=', value => $parsed_ref->{visus_value}, unit => { label => "decimal" } } },
-            modifiers => \@mods,
-            ($ref_date ? (timeOfCollection => { timestamp => $ref_date }) : ())
-        };
+        my $bc   = $parsed_ref->{is_best_corrected} ? 1 : 0;
+        my $kind = $bc ? 'best corrected' : 'uncorrected';
+        my $fb   = $bc
+            ? ($is_left ? "LOINC:65897-1" : $is_right ? "LOINC:65893-0" : "LOINC:28637-7")
+            : ($is_left ? "LOINC:98498-9" : $is_right ? "LOINC:98499-7" : "LOINC:28637-7");
+        $add->(key => "visual acuity $kind$vside", fb_id => $fb, fb_label => "Visual acuity $kind$vlabel",
+               value => $parsed_ref->{visus_value}, unit => "decimal", mod_unit => "decimal");
     }
 
-    # 2. Sphere
-    if (defined $parsed_ref->{sphere}) {
-        my $loinc_id    = $is_left ? "LOINC:65891-4" : "LOINC:65890-6";
-        my $loinc_label = $is_left ? "Spherical power [Inverse Length] Left eye" : "Spherical power [Inverse Length] Right eye";
-        my @mods = ({ id => "LP7753-9", label => "Measurement: = $parsed_ref->{sphere} [diop]" });
-        push @mods, $lat_obj if $lat_obj;
-
-        push @measurements, {
-            assay => { id => $loinc_id, label => $loinc_label },
-            value => { quantity => { comparator => '=', value => $parsed_ref->{sphere}, unit => { label => "diopter" } } },
-            modifiers => \@mods,
-            ($ref_date ? (timeOfCollection => { timestamp => $ref_date }) : ())
-        };
+    # PATCH 2026-10-14: Lochblendenvisus (LB). Ohne eigenen Intercept
+    # ('^visual acuity pinhole right eye$' usw.) als bestkorrigierter Visus
+    # geführt, erkennbar am Modifier "with pinhole (LB)".
+    if (defined $parsed_ref->{lb_value}) {
+        my $fb = $is_left ? "LOINC:65897-1" : $is_right ? "LOINC:65893-0" : "LOINC:28637-7";
+        $add->(key => "visual acuity pinhole$vside", fb_id => $fb, fb_label => "Visual acuity best corrected$vlabel",
+               value => $parsed_ref->{lb_value}, unit => "decimal", mod_unit => "decimal",
+               extra => [{ id => "LP7753-9", label => "with pinhole (LB)" }]);
     }
 
-    # 3. Cylinder
-    if (defined $parsed_ref->{cylinder}) {
-        my $loinc_id    = $is_left ? "LOINC:65895-5" : "LOINC:65894-8";
-        my $loinc_label = $is_left ? "Cylinder power [Inverse Length] Left eye" : "Cylinder power [Inverse Length] Right eye";
-        my @mods = ({ id => "LP7753-9", label => "Measurement: = $parsed_ref->{cylinder} [diop]" });
-        push @mods, $lat_obj if $lat_obj;
-
-        push @measurements, {
-            assay => { id => $loinc_id, label => $loinc_label },
-            value => { quantity => { comparator => '=', value => $parsed_ref->{cylinder}, unit => { label => "diopter" } } },
-            modifiers => \@mods,
-            ($ref_date ? (timeOfCollection => { timestamp => $ref_date }) : ())
-        };
-    }
-
-    # 4. Axis
-    if (defined $parsed_ref->{axis}) {
-        my $loinc_id    = $is_left ? "LOINC:65899-7" : "LOINC:65898-9";
-        my $loinc_label = $is_left ? "Cylinder axis [Angle] Left eye" : "Cylinder axis [Angle] Right eye";
-        my @mods = ({ id => "LP7753-9", label => "Measurement: = $parsed_ref->{axis} deg" });
-        push @mods, $lat_obj if $lat_obj;
-
-        push @measurements, {
-            assay => { id => $loinc_id, label => $loinc_label },
-            value => { quantity => { comparator => '=', value => $parsed_ref->{axis}, unit => { label => "deg" } } },
-            modifiers => \@mods,
-            ($ref_date ? (timeOfCollection => { timestamp => $ref_date }) : ())
-        };
-    }
-
-    # 5. Spherical Equivalent
-    if (defined $parsed_ref->{spherical_equivalent}) {
-        my $loinc_id    = $is_left ? "LOINC:76588-3" : "LOINC:76587-5";
-        my $loinc_label = $is_left ? "Spherical equivalent.refraction [Diopters] Left eye" : "Spherical equivalent.refraction [Diopters] Right eye";
-        my @mods = ({ id => "LP7753-9", label => "Measurement: = $parsed_ref->{spherical_equivalent} [diop]" });
-        push @mods, $lat_obj if $lat_obj;
-
-        push @measurements, {
-            assay => { id => $loinc_id, label => $loinc_label },
-            value => { quantity => { comparator => '=', value => $parsed_ref->{spherical_equivalent}, unit => { label => "diopter" } } },
-            modifiers => \@mods,
-            ($ref_date ? (timeOfCollection => { timestamp => $ref_date }) : ())
-        };
-    }
+    # 3. Sphäre, Zylinder, Achse, sphärisches Äquivalent
+    $add->(key => "refraction sphere $rside", value => $parsed_ref->{sphere},
+           unit => "diopter", mod_unit => "[diop]") if defined $parsed_ref->{sphere};
+    $add->(key => "refraction cylinder $rside", value => $parsed_ref->{cylinder},
+           unit => "diopter", mod_unit => "[diop]") if defined $parsed_ref->{cylinder};
+    $add->(key => "refraction axis $rside", value => $parsed_ref->{axis},
+           unit => "deg", mod_unit => "deg") if defined $parsed_ref->{axis};
+    $add->(key => "refraction spherical equivalent $rside", value => $parsed_ref->{spherical_equivalent},
+           unit => "diopter", mod_unit => "[diop]") if defined $parsed_ref->{spherical_equivalent};
 
     return @measurements;
 }
+
+# Liefert zu einem Schlüssel den Intercept mit exakt '^<schlüssel>$'.
+# Breitere LOINC-Intercepts (z. B. /visus/) werden bewusst ignoriert.
+helper ophthalmic_loinc_resolver => sub {
+    my ($self) = @_;
+    return sub {
+        my ($key) = @_;
+        my $want = '^' . $key . '$';
+        my ($r) = grep { !$_->{suppress} && ($_->{pattern} // '') eq $want }
+                  @{ $self->get_domain_intercepts('loinc') };
+        return $r ? { id => $r->{code}, label => $r->{label} } : undef;
+    };
+};
 
 # =========================================================================
 # MESSWERT-MASKIERUNG: Zahlen mit Vergleichsoperator oder Einheit sind keine Jahre
@@ -866,18 +949,20 @@ sub parse_quantitative_constraint {
     }
 
     # 3. Visus & Refraktion Intercept
-    if ($text =~ /\b(?:visus|sehschärfe|visual\s*acuity|aufnahmevisus|entlassvisus|sc\b|cc\b|hbw\b|lsp\b|lsw\b|nulla\s*lux|handbewegung|fingerzählen)\b/i) {
+    if ($text =~ /\b(?:visus|sehschärfe|visual\s*acuity|aufnahmevisus|entlassvisus|sc\b|cc\b|hbw\b|lsp\b|lsw\b|nulla\s*lux|handbewegung|fingerzählen|lochblende|lb\b)\b/i) {
         my $parsed_eye = extract_visus_and_refraction($text);
-        if ($parsed_eye && defined $parsed_eye->{visus_value}) {
+        # PATCH 2026-10-14: reiner Lochblendenvisus ("mit LB 1,0") ebenfalls dezimal
+        my $vv = $parsed_eye ? ($parsed_eye->{visus_value} // $parsed_eye->{lb_value}) : undef;
+        if (defined $vv) {
             my $comp = '=';
             $comp = '>=' if $text =~ /(?:at least|mindestens|≥|>|or better|besser)/i;
             $comp = '<=' if $text =~ /(?:at most|maximal|≤|<|or worse|schlechter)/i;
 
             return {
                 comparator => $comp,
-                value      => $parsed_eye->{visus_value},
+                value      => $vv,
                 unit       => 'decimal',
-                formatted  => "$comp $parsed_eye->{visus_value} decimal"
+                formatted  => "$comp $vv decimal"
             };
         }
     }
@@ -953,6 +1038,18 @@ sub parse_quantitative_constraint {
         };
     }
 
+    # PATCH 2026-10-14: Endothelzelldichte direkt am Einheitenmuster erkennen,
+    # unabhängig von vorangestellten Datumsangaben ("10/23: 699 Zellen/mm²")
+    if ($text =~ /([<>]=?)?\s*(?<![\d.,\/])(\d{3,4})\s*(?:zellen|z|cells)\s*(?:\/|pro)\s*(?:qmm|mm2|quadratmillimeter)\b/i) {
+        my ($cmp, $v) = ($1 // '=', $2 + 0);
+        return {
+            comparator => $cmp,
+            value      => $v,
+            unit       => '{cells}/mm2',
+            formatted  => "$cmp $v {cells}/mm2"
+        };
+    }
+
     # 6. Clinical Rating Scale / Instrument Name extraction
     my $scale_name = undef;
     if ($text =~ /\b(VAS|VBR-?10|NEI(?:-VFQ)?|Foster|SUN|Oxford|OSDI|SPEED|McMonnies|Efron|Jenvis|ETDRS|Snellen|LogMAR|CDR|Hertel)\b/i) {
@@ -978,7 +1075,9 @@ sub parse_quantitative_constraint {
     # Datumsangaben (z. B. "01/2023", "14.08.2023", "stabil zu 2023")
     # maskieren/entfernen, damit Tage/Monate nicht als Messwert "1" geparst werden!
     # -------------------------------------------------------------
-    $clean_text =~ s/\b(?:stabil\s+zu|progredient\s+zu|befund\s+vom?|stand|vom?|zuletzt|am)\s+(?:0?[1-9]|1[0-2])[\/\.](?:19|20)\d{2}\b/ /gi;
+    # PATCH 2026-10-14: Visit-Präfix mit zweistelligem Jahr ("10/23: 699 Zellen/mm²", "05/24: Astigmatismus ...")
+    $clean_text =~ s/(?:^|(?<=[\s;,]))(?:0?[1-9]|1[0-2])\/(?:19|20)?\d{2}\s*[:=]/ /g;
+    $clean_text =~ s/\b(?:stabil\s+zu|progredient\s+zu|befund\s+vom?|stand|vom?|zuletzt|am)\s+(?:0?[1-9]|1[0-2])[\/\.](?:19|20)?\d{2}\b/ /gi;
     $clean_text =~ s/\b(?:0?[1-9]|[12]\d|3[01])\.(?:0?[1-9]|1[0-2])\.(?:19|20)\d{2}\b/ /g; # DD.MM.YYYY
     $clean_text =~ s/\b(?:0?[1-9]|1[0-2])\/(?:19|20)\d{2}\b/ /g;                           # MM/YYYY
     unless ($clean_text =~ $MEASUREMENT_KEY_REGEX) {
@@ -4915,7 +5014,7 @@ post '/BBB/extract_fhir_inex_criteria' => sub {
                 if ($is_visus_candidate) {
                     my $parsed_eye = extract_visus_and_refraction($v_text);
                     if ($parsed_eye && (defined $parsed_eye->{visus_value} || defined $parsed_eye->{sphere})) {
-                        my $loinc_id = $parsed_eye->{is_best_corrected} ? "LOINC:65893-0" : "LOINC:65892-2";
+                        my $loinc_id = $parsed_eye->{is_best_corrected} ? "LOINC:65893-0" : "LOINC:98499-7";
                         my $loinc_lbl = $parsed_eye->{is_best_corrected} ? "Visual acuity best corrected" : "Visual acuity uncorrected";
 
                         my $assay_node = {
@@ -5406,12 +5505,27 @@ helper generate_phenopacket_impl => sub {
             if (($item->{domain} // '') eq 'ops' && $v =~ /\b(?:iol\s+in\s+loco|iridektomie\s+offen|hinterkapsel\s+eröffnet|transplantat\s+anliegend)\b/i) {
                 $item->{domain} = 'skip';
             }
-            if ($v =~ /\b(?:absto[ßs]ung\w*|graft\s*rejection\w*|transplantatversagen\w*)\b/i
-                || $c =~ /\b(?:absto[ßs]ung\w*|graft\s*rejection\w*|transplantatversagen\w*)\b/i) {
-                # Wenn es bereits als Prozedur (OPS) erkannt wurde (z.B. Re-DMEK, PKP), behalte OPS bei!
-                unless (($item->{domain} // '') eq 'ops' || $v =~ /\b(?:z\.?\s*n\.?|re[- ]?dmek|dmek|dsaek|pkp|keratoplastik)\b/i) {
+            # Abstoßung (immunologisch) und Transplantatversagen getrennt halten.
+            # Beide fallen in ICD-10-GM auf T86.83, sind klinisch aber verschieden.
+            # Der kanonische Begriff entscheidet vor dem Verbatim-Text, damit
+            # "keine Abstoßung, primäres Transplantatversagen" richtig landet.
+            unless (($item->{domain} // '') eq 'ops'
+                    || $v =~ /\b(?:z\.?\s*n\.?|re[- ]?dmek|dmek|dsaek|pkp|keratoplastik)\b/i) {
+                my $rej_re  = qr/(?:absto[ßs]ung|graft\s*rejection)/i;
+                my $fail_re = qr/(?:transplantatversagen|graft\s*failure)/i;
+                my $kind = $c =~ $rej_re  ? 'rejection'
+                         : $c =~ $fail_re ? 'failure'
+                         : $v =~ $rej_re  ? 'rejection'
+                         : $v =~ $fail_re ? 'failure'
+                         : '';
+                if ($kind eq 'rejection') {
                     $item->{domain}         = 'icd10';
                     $item->{canonical_term} = 'Hornhauttransplantatabstoßung';
+                } elsif ($kind eq 'failure') {
+                    $item->{domain}         = 'icd10';
+                    $item->{canonical_term} = ("$v $c" =~ /\bprim[äa]r/i)
+                        ? 'Primäres Hornhauttransplantatversagen'
+                        : 'Hornhauttransplantatversagen';
                 }
             }
             if ($v =~ /\b(?:re[- ]?dmek|re[- ]?dsaek)\b/i || $c =~ /\bre[- ]?dmek\b/i) {
@@ -5579,7 +5693,7 @@ helper generate_phenopacket_impl => sub {
 
                 my $is_visus_candidate = (
                     $canon_term =~ /\b(?:visual\s*acuity|visus|refraction|refraktion|skiaskop\w*|c[- ]?skia\w*|sphere|sphäre|cylinder|zylinder)\b/i
-                    || $v_text =~ /\b(?:visus|sehschärfe|visual\s*acuity|aufnahmevisus|entlassvisus|refraktion|skiaskop\w*|c[- ]?skia\w*|sc\b|cc\b|hbw\b|lsp\b|lsw\b|nulla\s*lux)\b/i
+                    || $v_text =~ /\b(?:visus|sehschärfe|visual\s*acuity|aufnahmevisus|entlassvisus|refraktion|skiaskop\w*|c[- ]?skia\w*|sc\b|cc\b|hbw\b|lsp\b|lsw\b|nulla\s*lux|lochblende|lb\b)\b/i
                 ) && ($v_text !~ /\b(?:osdi|vas|but|tbut|pachymetrie|k1|k2|kmax|astigmatismus|rr|blutdruck)\b/i);
 
                 my $time_obs = $item_timestamp;
@@ -5592,8 +5706,10 @@ helper generate_phenopacket_impl => sub {
 
                 if ($is_visus_candidate) {
                     my $parsed_eye = extract_visus_and_refraction($v_text, $text_content);
-                    if ($parsed_eye && (defined $parsed_eye->{visus_value} || defined $parsed_eye->{sphere})) {
-                        my @eye_meas = build_ophthalmic_loinc_measurements($parsed_eye, $item_lat, $time_obs);
+                    if ($parsed_eye && (defined $parsed_eye->{visus_value} || defined $parsed_eye->{sphere}
+                                        || defined $parsed_eye->{lb_value})) {   # PATCH 2026-10-14
+                        my @eye_meas = build_ophthalmic_loinc_measurements($parsed_eye, $item_lat, $time_obs,
+                                                                           $self->ophthalmic_loinc_resolver);
                         if (@eye_meas) {
                             push @measurement_promises, Mojo::Promise->resolve(\@eye_meas);
                             next;
@@ -5710,6 +5826,14 @@ helper generate_phenopacket_impl => sub {
 
                     my $quant = parse_quantitative_constraint($v_text)
                              // parse_quantitative_constraint($demo_val);
+
+                    # PATCH 2026-10-14: unplausible Messwerte verwerfen statt falsch zu speichern
+                    unless (loinc_value_plausible($mapped->{id}, $quant)) {
+                        $self->app->log->warn(sprintf("[LOINC IMPLAUSIBLE] '%s' -> %s: %s verworfen.",
+                            $v_text, $mapped->{id},
+                            (ref $quant eq 'HASH' && defined $quant->{value}) ? "$quant->{value} $quant->{unit}" : 'kein Messwert'));
+                        return [];
+                    }
 
                     my $meas_obj = {
                         assay => { id => $mapped->{id}, label => $mapped->{label} // $v_text },
@@ -6343,6 +6467,8 @@ post '/BBB/extract_phenopacket_from_letter' => sub {
 #   force               true: Text immer übernehmen und neu extrahieren
 #   dry_run             true: nur prüfen, nichts schreiben, nichts einreihen
 #   tags                optionaler Tag-String für neu angelegte Kandidaten
+#   priority            -100..100, Minion-Priorität (Default: argos 0, sonst -5).
+#                       Hebt auch einen noch wartenden Job desselben Briefs an.
 #
 # hard: gleicher Brief (source + doc_id) -> aktualisieren, nur neu extrahieren,
 #       wenn sich der Text geändert hat. Liegt für PIZ + Tag bereits ein Brief
@@ -6374,9 +6500,9 @@ helper extraction_pending => sub {
 };
 
 helper enqueue_letter_extraction => sub {
-    my ($c, $cand, $model, $deep_mode) = @_;
-    # Live-Briefe aus argos vor dem Altbestand abarbeiten
-    my $priority = ($cand->{source} // '') eq 'argos' ? 0 : -5;
+    my ($c, $cand, $model, $deep_mode, $priority) = @_;
+    # Ohne Vorgabe: Live-Briefe aus argos vor dem Altbestand abarbeiten
+    $priority //= ($cand->{source} // '') eq 'argos' ? 0 : -5;
     my $job_id = $c->minion->enqueue(import_and_extract_letter_task => [{
         candidate_id   => $cand->{id},
         pseudonym      => $cand->{pseudonym},
@@ -6406,6 +6532,7 @@ post '/BBB/import_and_extract_letter' => sub {
     my $tags      = (defined $p->{tags} && !ref $p->{tags} && length $p->{tags}) ? $p->{tags} : undef;
     my $model     = $p->{model};
     my $deep_mode = $p->{deep_mode} // 0;
+    my $prio      = $p->{priority};
 
     return $c->render(json => { status => 'rejected',
         error => "Pflichtfelder 'pseudonym' (oder 'piz') und 'medical_report' (oder 'text') fehlen." }, status => 400)
@@ -6414,6 +6541,14 @@ post '/BBB/import_and_extract_letter' => sub {
         unless $source =~ /^[a-z0-9_]{1,20}$/;
     return $c->render(json => { status => 'rejected', error => "Ungültiger Modus '$mode'." }, status => 400)
         unless $mode =~ /^(?:hard|soft)$/;
+    if (defined $prio && !ref $prio && length $prio) {
+        return $c->render(json => { status => 'rejected',
+            error => "Ungültige Priorität '$prio' (ganze Zahl von -100 bis 100)." }, status => 400)
+            unless $prio =~ /^-?\d{1,3}$/ && abs($prio) <= 100;
+        $prio += 0;
+    } else {
+        $prio = undef;    # Standard je Quelle (enqueue_letter_extraction)
+    }
     return $c->render(json => { status => 'rejected',
         error => "Soft-Push braucht ein gültiges 'reference_date' (JJJJ-MM-TT oder TT.MM.JJJJ)." }, status => 422)
         if $mode eq 'soft' && !$ref_day;
@@ -6425,7 +6560,7 @@ post '/BBB/import_and_extract_letter' => sub {
     my $hash   = md5_hex(encode('UTF-8', $text));
 
     my $db = $c->pg->db;
-    my (%r, $enqueue_id);
+    my (%r, $enqueue_id, $bump_job);
 
     eval {
         my $tx = $db->begin;
@@ -6480,6 +6615,7 @@ post '/BBB/import_and_extract_letter' => sub {
                     %r = (status => 'unchanged', candidate_id => $same->{id});
                 } elsif ($c->extraction_pending($same->{extract_job_id})) {
                     %r = (status => 'already_queued', candidate_id => $same->{id});
+                    $bump_job = $same->{extract_job_id};
                 } else {
                     # Text gleich, aber (noch) kein Phenopacket und kein laufender Job
                     %r = (status => 'queued', action => 'requeued', candidate_id => $same->{id});
@@ -6547,12 +6683,26 @@ post '/BBB/import_and_extract_letter' => sub {
         return $c->render(json => { status => 'error', error => "$err" }, status => 500);
     };
 
+    # Noch wartenden Job desselben Briefs umpriorisieren. Laufende Jobs bleiben
+    # unberührt (state = 'inactive' wird atomar im UPDATE geprüft).
+    if ($bump_job && defined $prio && !$dry_run) {
+        my $n = eval {
+            # PATCH 2026-10-14: minion_jobs liegt in der Minion-Datenbank, nicht zwingend in der Hauptdatenbank
+            $c->minion->backend->pg->db->query(
+                q{UPDATE minion_jobs SET priority = ? WHERE id = ? AND state = 'inactive' AND priority <> ?},
+                $prio, $bump_job, $prio)->rows;
+        };
+        $c->app->log->warn("[IMPORT] Priorität für Job $bump_job nicht geändert: $@") if $@;
+        $r{priority_changed} = Mojo::JSON->true if $n;
+    }
+
     if ($enqueue_id) {
         $r{job_id} = $c->enqueue_letter_extraction({
             id => $enqueue_id, pseudonym => $pseudonym, doc_id => $doc_id, source => $source,
             text => $text, reference_date => $ref_day,
-        }, $model, $deep_mode);
+        }, $model, $deep_mode, $prio);
     }
+    $r{priority} = $prio if defined $prio;
 
     my $log_msg = sprintf("[IMPORT %s] %s:%s PIZ %s %s -> %s%s%s",
         uc($mode), $source, $doc_id // '-', $pseudonym, $ref_day, $r{status},
@@ -8552,11 +8702,11 @@ our %PPD_LOINC_PAIRS = (
     iop    => ['79892-6',  '79893-4'],
     cct    => ['79888-4',  '79887-6'],
     va_bc  => ['65893-0',  '65897-1'],
-    va_uc  => ['65892-2',  '65896-3'],
-    sphere => ['65890-6',  '65891-4'],
-    cyl    => ['65894-8',  '65895-5'],
-    axis   => ['65898-9',  '65899-7'],
-    se     => ['76587-5',  '76588-3'],
+    va_uc  => ['98499-7',  '98498-9'],
+    # sphere/cyl/axis: Gruppe wird über das Label erkannt (_ppd_refraction_group),
+    # weil die Codes jetzt aus ontology_intercepts kommen.
+    axis   => ['79844-7',  '79845-4'],
+    se     => ['95327-3',  '95328-1'],
     hertel => ['28998-3',  '28999-1'],
     rnfl   => ['86300-1',  '86299-5'],
     cdr    => ['71485-7',  '71484-0'],
@@ -8670,6 +8820,17 @@ sub _ppd_ts {
     return $t =~ /^(\d{4}(?:-\d{2}(?:-\d{2})?)?)/ ? $1 : '0000';   # "PAST-UK-UK" ganz nach hinten
 }
 
+# Refraktionsgröße am LOINC-Label erkennen (Codes sind konfigurierbar)
+sub _ppd_refraction_group {
+    my $l = lc(shift // '');
+    return undef unless $l =~ /(?:refraction|refractor|phoropter|lensmeter|corrective lens|cylinder axis|spherical power|cylinder power)/;
+    return 'se'     if $l =~ /spherical equivalent/;
+    return 'axis'   if $l =~ /\baxis\b/;
+    return 'cyl'    if $l =~ /\bcylinder\b/;
+    return 'sphere' if $l =~ /\bsphere\b|spherical power/;
+    return undef;
+}
+
 # ---------------------------------------------------------
 # Merkmalsextraktion aus einem Phenopacket
 # ---------------------------------------------------------
@@ -8723,7 +8884,7 @@ sub extract_ppd_features {
         next unless length $aid;
         my ($grp, $side) = $PPD_LOINC_LOOKUP{$aid}
             ? @{ $PPD_LOINC_LOOKUP{$aid} }
-            : ($aid, _ppd_side_of_mods($m->{modifiers}));
+            : (_ppd_refraction_group($m->{assay}{label}) // $aid, _ppd_side_of_mods($m->{modifiers}));
         next if $PPD_SKIP_GROUPS{$grp};
         $val += 0;
         $val = -log(($val > 0.001 ? $val : 0.001)) / log(10) if $grp =~ /^va_/;   # dezimal -> logMAR
