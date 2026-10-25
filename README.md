@@ -48,7 +48,7 @@ Highlights added in recent versions:
 - **Deep mode** – optional two-stage extraction with an unconstrained reasoning trace (pre-extraction table) followed by schema-constrained JSON sampling.
 - **Anonymized export** – de-identified phenopackets for data sharing: no free text, ephemeral subject IDs, month truncation with patient-constant date shift, age top-coding and hierarchical generalization of rare codes (k ≥ 5).
 - **Long-format export** – one row per coded element as CSV or NDJSON, deduplicated across letters, streamed from a server-side cursor and directly readable from R (details [below](#long-format-export-for-statistics)).
-- **Patient similarity** – nearest-neighbour search and greedy 1:n case-control matching with caliper.
+- **Patient similarity** – laterality-agnostic distance (unilateral vs. bilateral), nearest-neighbour search and greedy 1:n case-control matching with caliper.
 - **Catalog maintenance** – `update_catalogs.pl` for inventory, versioned imports with backups and post-import checks.
 - **Server-side persistence and live sync** – extracted phenopackets are stored by the backend under the `candidate_id` of the request; all open browsers receive the update over the WebSocket.
 - **Real-time progress** – every extraction step reports progress over the WebSocket channel.
@@ -150,6 +150,8 @@ Trials often define criteria for the study eye and safety rules for the fellow e
 - **Hypothesis A:** right eye (OD) = study eye, left eye (OS) = fellow eye.
 - **Hypothesis B:** left eye = study eye, using an on-the-fly mirrored phenopacket.
 
+Mirroring is used only here, where study eye and fellow eye play different roles in the criteria. Patient similarity and case-control matching do not mirror (see [below](#phenopacket-distance-and-case-control-matching)).
+
 The result states whether the patient qualifies via OD, OS or both. Every criterion is written to a trace with status `inclusion_met`, `inclusion_missing`, `exclusion_clear` or `exclusion_violation`; explicitly negated findings count as evidence of absence. Temporal constraints (`relativeTime`) are evaluated against the procedure or medication date of the same group.
 
 ### Longitudinal time-to-eligibility
@@ -167,9 +169,11 @@ A weighted, interpretable distance between two phenopackets in the range 0–1:
 | Phenotypes | 0.20 | Best-match average with HPO ancestor-set (Jaccard) similarity. |
 | Procedures | 0.15 | Best-match average over the OPS hierarchy. |
 | Medications | 0.10 | Best-match average over the ATC levels. |
-| Measurements | 0.15 | Latest value per parameter and eye, scaled difference (visual acuity in logMAR). |
+| Measurements | 0.15 | Latest value per parameter and eye, scaled difference (visual acuity in logMAR); the two eyes are compared as an unordered pair. |
 
-Laterality mismatches are penalized, and the comparison is repeated with the second patient mirrored so that "right eye of A" can match "left eye of B". Missing blocks are ignored and reported as `coverage`. Weights, mirroring and exact matching on sex are configurable per request; `explain: true` returns the matched pairs.
+Laterality is reduced to one class per code: **unilateral** (right or left eye only), **bilateral** (coded as both eyes, or documented for the right and the left eye) or **unknown**. Right and left eye are treated as equivalent; only unilateral vs. bilateral is distinguished (similarity factor 0.8, unknown side 0.9). Phenopackets are not mirrored.
+
+Measurements stay eye-specific. Because right and left are equivalent, the two eyes of both patients are paired either straight (R–R, L–L) or crossed (R–L, L–R), consistently across all parameters: the pairing with more shared parameters wins, then the one with the smaller distance. The result reports the choice as `meas_eyes_crossed`. Missing blocks are ignored and reported as `coverage`. Weights and exact matching on sex are configurable per request; `explain: true` returns the matched pairs.
 
 On top of this, OntoTrial offers k-nearest-neighbour search and greedy 1:ratio case-control matching with optional caliper, with or without replacement.
 
@@ -463,7 +467,7 @@ Recommended order:
 | GET | `/BBB/matches` | Match results with status |
 | POST | `/BBB/trials/:id/time_to_eligibility` | Time-to-eligibility as JSON; optional list of pseudonyms |
 | GET | `/BBB/trials/:id/time_to_eligibility.csv` | Same as CSV; optional `?piz=a,b,c` |
-| POST | `/BBB/phenopacket_distance` | Distance between two candidates or phenopackets (`a`, `b`, `weights`, `mirror`, `exact`, `explain`) |
+| POST | `/BBB/phenopacket_distance` | Distance between two candidates or phenopackets (`a`, `b`, `weights`, `exact`, `explain`) |
 | POST | `/BBB/phenopacket_distance/nearest` | k nearest neighbours of a candidate (`candidate_id`, `k`, `caliper`, `tag`) |
 | POST | `/BBB/export/anonymized_phenopackets` | De-identified phenopackets for a cohort (`tag` or `candidate_ids`, `k` ≥ 5) |
 | GET | `/BBB/export/long/events` | Coded elements in long format, CSV or NDJSON ([parameters](#parameters)) |
