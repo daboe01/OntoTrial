@@ -527,6 +527,7 @@ The full schema is in `ontotrial_schema.sql`.
 This project is licensed under the MIT License – see [LICENSE](LICENSE).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+For scientific reference, please cite it as [![DOI](https://zenodo.org/badge/1371450472.svg)](https://doi.org/10.5281/zenodo.23659642)
 
 OntoTrial interfaces with medical terminologies that retain their own copyright and terms of use. They are **not** included in this repository and must be obtained from their publishers:
 
