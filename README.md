@@ -39,7 +39,7 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 | **Medications** | **ATC** | Active agents and trade names, eye drops, anti-VEGF/steroid IVOM auto-detection. |
 | **Measurements** | **LOINC** | Clinical chemistry, haematology, coagulation, thyroid, serology, blood pressure, BMI, PROMs (e.g. OSDI) and quantitative ophthalmic measurements. Supports local extension codes (`86290-4a`, `86301-9b`, …). |
 | **Anatomy & laterality** | **SNOMED CT / HPO** | Right/left/both eyes (`SNOMED:18944008`, `8966001`, `40638003`; `HP:0012834/5/2`). |
-| **Output standards** | **FHIR R6 `Group`**, **Phenopacket v2.0.0** | Nested definitional/conceptual criteria groups; patient phenopackets with features, measurements, diseases, procedures and medical actions. |
+| **Output standards** | **FHIR R6 `Group`**, **`Phenopacket v2`** | Nested definitional/conceptual criteria groups; patient phenopackets with features, measurements, diseases, procedures and medical actions. |
 
 Highlights added in recent versions:
 
