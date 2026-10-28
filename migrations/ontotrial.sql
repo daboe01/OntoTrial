@@ -4,7 +4,7 @@
 -- Bestehende Datenbanken, die das Schema schon haben, werden beim ersten Start
 -- nur als Version 1 markiert, ohne dass etwas ausgeführt wird.
 --
--- Schemaänderungen: neuen Abschnitt "-- 3 up" (und "-- 3 down") unten anfügen,
+-- Schemaänderungen: neuen Abschnitt "-- 4 up" (und "-- 4 down") unten anfügen,
 -- nie eine bereits ausgerollte Version nachträglich ändern.
 --
 -- Nicht enthalten: Minion-Tabellen (verwaltet Minion selbst), mojo_migrations,
@@ -963,3 +963,27 @@ DELETE FROM mojo_migrations WHERE name = 'ontotrial_validation';
 -- 2 down
 DROP TABLE IF EXISTS validation_ai_reviews, validation_run_items, validation_runs, validation_reviews, validation_items, validation_sets;
 DROP FUNCTION IF EXISTS validation_set_guard(), validation_item_guard(), validation_review_guard(), validation_ai_guard();
+
+-- 3 up
+-- Fehlerhafte KI-Bewertungen (Verbindungsfehler, zurückgehaltene Briefe …) dürfen
+-- auch in gesperrten Datensätzen gelöscht werden; gültige Bewertungen bleiben geschützt.
+CREATE OR REPLACE FUNCTION validation_ai_guard() RETURNS trigger AS $$
+DECLARE s validation_sets%ROWTYPE;
+BEGIN
+    SELECT vs.* INTO s FROM validation_sets vs JOIN validation_items vi ON vi.set_id = vs.id WHERE vi.id = OLD.item_id;
+    IF s.locked AND OLD.error IS NULL THEN
+        RAISE EXCEPTION 'KI-Bewertungen eines gesperrten Datensatzes können nicht gelöscht werden';
+    END IF;
+    RETURN OLD;
+END $$ LANGUAGE plpgsql;
+
+-- 3 down
+CREATE OR REPLACE FUNCTION validation_ai_guard() RETURNS trigger AS $$
+DECLARE s validation_sets%ROWTYPE;
+BEGIN
+    SELECT vs.* INTO s FROM validation_sets vs JOIN validation_items vi ON vi.set_id = vs.id WHERE vi.id = OLD.item_id;
+    IF s.locked THEN
+        RAISE EXCEPTION 'KI-Bewertungen eines gesperrten Datensatzes können nicht gelöscht werden';
+    END IF;
+    RETURN OLD;
+END $$ LANGUAGE plpgsql;

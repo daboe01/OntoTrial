@@ -12127,12 +12127,19 @@ get '/BBB/validation/sets/:id/judgments.csv' => sub {
 #   ONTOTRIAL_JUDGE_PII_GUARD      1 (Default) = Briefe mit Geburtsdatum oder
 #                                  Name mit Anrede werden nicht gesendet
 #   ONTOTRIAL_JUDGE_PII_REGEX      zusätzliche eigene Sperr-Regel
-# Lokaler Judge:
-#   ONTOTRIAL_JUDGE_LOCAL_MODEL    Modellname, z. B. glm-5 (ohne ihn ist der lokale Judge aus)
-#   ONTOTRIAL_JUDGE_LOCAL_URL      Chat-Completions-Endpunkt; Default wie die Pipeline (VLLM_ENDPOINT)
-#   ONTOTRIAL_JUDGE_LOCAL_KEY      API-Schlüssel; Default VLLM_API_KEY
+# Lokale Judges (Auswahl im Validierungsfenster):
+#   ONTOTRIAL_JUDGE_LOCAL_MODELS   kommagetrennte Liste, z. B. "gpt-oss-120b,glm-5";
+#                                  ohne sie: ONTOTRIAL_JUDGE_LOCAL_MODEL und das Pipeline-Modell (VLLM_MODEL)
+#   ONTOTRIAL_JUDGE_URL_<MODELL>   eigener Endpunkt je Modell, Name in Großbuchstaben, Sonderzeichen als _
+#   ONTOTRIAL_JUDGE_KEY_<MODELL>   eigener API-Schlüssel je Modell (z. B. ONTOTRIAL_JUDGE_KEY_GLM_5)
+#                                  ohne beides: Endpunkt und Schlüssel der Pipeline (VLLM_ENDPOINT, VLLM_API_KEY)
+#   ONTOTRIAL_JUDGE_LOCAL_MODEL    älteres Einzelmodell; ONTOTRIAL_JUDGE_LOCAL_URL und
+#   ONTOTRIAL_JUDGE_LOCAL_URL      ONTOTRIAL_JUDGE_LOCAL_KEY gelten nur für dieses Modell
+#   ONTOTRIAL_JUDGE_LOCAL_KEY
+#   ONTOTRIAL_JUDGE_REASONING_EFFORT  Default medium (für gpt-oss; andere Modelle ignorieren es);
+#                                  bei abgeschnittener Antwort wird einmal mit low wiederholt
 #   ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS  Default 32000 (Platz für den Denkprozess)
-#   ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE Default 0
+#   ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE Default: Modell-Standard (0 führt bei gpt-oss leicht zu Schleifen)
 #   ONTOTRIAL_JUDGE_LOCAL_THINKING    0 = Denkmodus über chat_template_kwargs abschalten
 #   ONTOTRIAL_JUDGE_LOCAL_PII_GUARD   Default 0 (Briefe bleiben im Haus)
 # ---------------------------------------------------------
@@ -12258,36 +12265,55 @@ sub _val_pii_hit {
 
 sub _val_judge_model { return $ENV{ONTOTRIAL_JUDGE_MODEL} || 'claude-opus-5-5' }
 
+sub _val_local_models {
+    my @m;
+    if (defined $ENV{ONTOTRIAL_JUDGE_LOCAL_MODELS}) {
+        push @m, split /\s*,\s*/, $ENV{ONTOTRIAL_JUDGE_LOCAL_MODELS};
+    } else {
+        push @m, resolve_llm_config(undef)->{model} // ();
+    }
+    push @m, $ENV{ONTOTRIAL_JUDGE_LOCAL_MODEL} if $ENV{ONTOTRIAL_JUDGE_LOCAL_MODEL};
+    my %seen;
+    return grep { defined && length && !$seen{$_}++ } @m;
+}
+
 sub _val_judge_providers {
     return [
-        { id => 'anthropic', label => 'Claude (externe API)', model => _val_judge_model(), external => 1,
+        (map { { id => "local:$_", label => "$_ (lokal)", model => $_, external => 0, configured => 1 } } _val_local_models()),
+        { id => 'anthropic', label => _val_judge_model() . ' (extern)', model => _val_judge_model(), external => 1,
           configured => $ENV{ANTHROPIC_API_KEY} ? 1 : 0 },
-        { id => 'local', label => 'lokales Modell', model => $ENV{ONTOTRIAL_JUDGE_LOCAL_MODEL} // '', external => 0,
-          configured => $ENV{ONTOTRIAL_JUDGE_LOCAL_MODEL} ? 1 : 0 },
     ];
 }
 
 sub _val_judge_provider {
     my $id = shift // '';
-    my ($p) = grep { $_->{id} eq $id } @{ _val_judge_providers() };
+    my @all = @{ _val_judge_providers() };
+    ($id) = map { $_->{id} } grep { $_->{id} =~ /^local:/ } @all if $id eq 'local';   # ältere Aufrufe
+    my ($p) = grep { $_->{id} eq $id } @all;
     return $p;
 }
 
 sub _val_judge_call_local {
-    my ($item) = @_;
-    my $model = $ENV{ONTOTRIAL_JUDGE_LOCAL_MODEL} or die "ONTOTRIAL_JUDGE_LOCAL_MODEL ist nicht gesetzt\n";
-    my $cfg   = resolve_llm_config($model);
-    my $url   = $ENV{ONTOTRIAL_JUDGE_LOCAL_URL} || $cfg->{endpoint};
-    my %hdr   = (%{ $cfg->{headers} // {} });
-    $hdr{Authorization} = "Bearer $ENV{ONTOTRIAL_JUDGE_LOCAL_KEY}" if $ENV{ONTOTRIAL_JUDGE_LOCAL_KEY};
-    my $ollama = $cfg->{is_ollama} && !$ENV{ONTOTRIAL_JUDGE_LOCAL_URL} ? 1 : ($url =~ m{/api/chat\b} ? 1 : 0);
-    my $temp   = $ENV{ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE} // '0';
+    my ($item, $model) = @_;
+    die "Kein lokales Judge-Modell angegeben\n" unless $model;
+    my $tag    = uc($model =~ s/[^A-Za-z0-9]+/_/gr);
+    my $legacy = ($ENV{ONTOTRIAL_JUDGE_LOCAL_MODEL} // '') eq $model;
+    my $cfg    = resolve_llm_config($model);
+    my $own    = $ENV{"ONTOTRIAL_JUDGE_URL_$tag"} || ($legacy ? $ENV{ONTOTRIAL_JUDGE_LOCAL_URL} : undef);
+    my $key    = $ENV{"ONTOTRIAL_JUDGE_KEY_$tag"} || ($legacy ? $ENV{ONTOTRIAL_JUDGE_LOCAL_KEY} : undef);
+    my $url    = $own || $cfg->{endpoint};
+    my %hdr    = (%{ $cfg->{headers} // {} });
+    $hdr{Authorization} = "Bearer $key" if $key;
+    my $ollama = $cfg->{is_ollama} && !$own ? 1 : ($url =~ m{/api/chat\b} ? 1 : 0);
+    # Kein Greedy-Decoding als Standard: gpt-oss neigt bei Temperatur 0 zu Endlosschleifen
+    my $temp   = $ENV{ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE} // '';
     my $maxtok = ($ENV{ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS} || 32000) + 0;
     my @msgs   = ({ role => 'system', content => $VAL_JUDGE_SYSTEM }, { role => 'user', content => _val_judge_user_message($item) });
     my $body = $ollama
         ? { model => $model, messages => \@msgs, format => _val_judge_schema(), stream => Mojo::JSON->false,
             options => { (length $temp ? (temperature => $temp + 0) : ()), num_predict => $maxtok, num_ctx => 65536 } }
         : { model => $model, messages => \@msgs, max_tokens => $maxtok, (length $temp ? (temperature => $temp + 0) : ()),
+            reasoning_effort => $ENV{ONTOTRIAL_JUDGE_REASONING_EFFORT} || 'medium',
             response_format => { type => 'json_schema', json_schema => { name => 'validation_judgment', strict => \1, schema => _val_judge_schema() } } };
     $body->{chat_template_kwargs} = { enable_thinking => Mojo::JSON->false }
         if !$ollama && ($ENV{ONTOTRIAL_JUDGE_LOCAL_THINKING} // '1') eq '0';
@@ -12295,7 +12321,8 @@ sub _val_judge_call_local {
     my $ua = Mojo::UserAgent->new(connect_timeout => 30, inactivity_timeout => 1800, request_timeout => 1800);
     $ua->proxy->detect;
     my $last = '';
-    for my $try (1 .. 3) {
+    my $downgraded = 0;
+    for my $try (1 .. 4) {
         my $tx  = $ua->post($url => \%hdr => json => $body);
         my $res = $tx->res;
         if (my $err = $tx->error) {
@@ -12316,18 +12343,30 @@ sub _val_judge_call_local {
             $finish  = $ch->{finish_reason} // '';
             %usage   = (input_tokens => $j->{usage}{prompt_tokens} // 0, output_tokens => $j->{usage}{completion_tokens} // 0);
         }
-        die "Antwort abgeschnitten (ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS zu klein)\n" if $finish eq 'length';
+        if ($finish eq 'length') {
+            my $reason = ref $j->{choices} eq 'ARRAY' ? ($j->{choices}[0]{message}{reasoning_content} // $j->{choices}[0]{message}{reasoning} // '') : '';
+            my $diag = sprintf('%d Ausgabe-Tokens, davon %d Zeichen Denkprozess und %d Zeichen Antwort%s', $usage{output_tokens},
+                               length $reason, length $content, ($content =~ /\s{200,}\z/ ? ', Antwort endet in Leerraum' : ''));
+            app->log->warn("[JUDGE] $model: Antwort abgeschnitten ($diag)");
+            # einmal mit weniger Denkaufwand wiederholen
+            if (!$ollama && !$downgraded && ($body->{reasoning_effort} // '') ne 'low') {
+                $downgraded = 1;
+                $body->{reasoning_effort} = 'low';
+                next;
+            }
+            die "Antwort abgeschnitten nach $diag; ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS erhöhen oder ONTOTRIAL_JUDGE_REASONING_EFFORT=low setzen\n";
+        }
         my $out = clean_and_parse_json($content);
         if (ref $out ne 'HASH' && $content =~ /(\{.*\})/s) { $out = clean_and_parse_json($1) }
         die "Antwort des lokalen Modells ist kein gültiges JSON\n" unless ref $out eq 'HASH' && ref $out->{entries} eq 'ARRAY';
         return ($out, \%usage, $model);
     }
-    die "Lokales Modell nicht erreichbar ($last)\n";
+    die "Lokales Modell $model nicht erreichbar ($last)\n";
 }
 
 sub _val_judge_call {
-    my ($item, $provider) = @_;
-    return _val_judge_call_local($item) if ($provider // 'anthropic') eq 'local';
+    my ($item, $prov) = @_;
+    return _val_judge_call_local($item, $prov->{model}) unless $prov->{external};
     my $key = $ENV{ANTHROPIC_API_KEY} or die "ANTHROPIC_API_KEY ist nicht gesetzt\n";
     my $model = _val_judge_model();
     my $body = {
@@ -12451,16 +12490,30 @@ get '/BBB/validation/sets/:id/judge' => sub {
     }, $set->{id})->hashes->to_array;
     for my $m (@$models) {
         $m->{$_} += 0 for qw(n_ok n_errors tokens_in tokens_out);
-        $m->{errors} = $db->query(q{SELECT i.position, a.error FROM validation_ai_reviews a JOIN validation_items i ON i.id = a.item_id
-                                    WHERE i.set_id = ? AND a.model = ? AND a.error IS NOT NULL ORDER BY i.position LIMIT 10},
+        $m->{errors} = $db->query(q{SELECT i.position, regexp_replace(a.error, '\s+', ' ', 'g') AS error FROM validation_ai_reviews a
+                                    JOIN validation_items i ON i.id = a.item_id
+                                    WHERE i.set_id = ? AND a.model = ? AND a.error IS NOT NULL ORDER BY a.created_at DESC LIMIT 3},
                                   $set->{id}, $m->{model})->hashes->to_array;
     }
-    my @running;
+    # laufende und wartende Judge-Jobs mit Fortschritt
+    my (@running, @jobs);
+    my %alive = map { $_->{id} => 1 } @{ $c->minion->backend->list_workers(0, 1000)->{workers} // [] };
     my $jobs = $c->minion->jobs({ tasks => ['validation_judge_task'], states => [qw(inactive active)] });
-    while (my $job = $jobs->next) { push @running, $job->{args}[0]{provider} // 'anthropic' if ($job->{args}[0]{set_id} // 0) == $set->{id} }
+    while (my $job = $jobs->next) {
+        my $a = $job->{args}[0] // {};
+        next unless ($a->{set_id} // 0) == $set->{id};
+        my $prov = $a->{provider} // 'anthropic';
+        my $n = $job->{notes} // {};
+        push @running, $prov;
+        push @jobs, { id => $job->{id}, provider => $prov, state => $job->{state}, progress => $n->{progress} // 0,
+                      done => $n->{done} // 0, failed => $n->{failed} // 0, cancel => $n->{cancel} ? 1 : 0,
+                      current => $n->{current}, current_s => $n->{current_since} ? int(time - $n->{current_since}) : undef,
+                      waiting => int(time - ($job->{created} // time)), running_s => $job->{started} ? int(time - $job->{started}) : undef,
+                      worker_alive => ($job->{worker} ? ($alive{ $job->{worker} } ? 1 : 0) : undef) };
+    }
     my $n_items = $db->query('SELECT count(*) AS n FROM validation_items WHERE set_id = ?', $set->{id})->hash->{n};
     $c->render(json => { providers => _val_judge_providers(), prompt_version => $VAL_JUDGE_PROMPT_VERSION, n_items => $n_items + 0,
-                         running => \@running, reference_source => $set->{reference_source}, models => $models });
+                         running => \@running, jobs => \@jobs, workers => scalar(keys %alive), reference_source => $set->{reference_source}, models => $models });
 };
 
 post '/BBB/validation/sets/:id/judge' => sub {
@@ -12485,6 +12538,52 @@ post '/BBB/validation/sets/:id/judge' => sub {
     $c->render(json => { ok => 1, job => $id, provider => $prov->{id}, model => $prov->{model} });
 };
 
+# Fehlerhafte KI-Bewertungen eines Datensatzes löschen (z. B. alte Verbindungsfehler).
+# Gültige Bewertungen bleiben; Modelle mit laufendem Job werden übersprungen.
+post '/BBB/validation/sets/:id/judge/clear_errors' => sub {
+    my $c   = shift;
+    my $p   = $c->req->json // {};
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my %busy;
+    my $jobs = $c->minion->jobs({ tasks => ['validation_judge_task'], states => [qw(inactive active)] });
+    while (my $j = $jobs->next) {
+        my $a = $j->{args}[0] // {};
+        next unless ($a->{set_id} // 0) == $set->{id};
+        my $prov = _val_judge_provider($a->{provider} // 'anthropic');
+        $busy{ $prov->{model} } = 1 if $prov;
+    }
+    my @busy = sort keys %busy;
+    my $n = $db->query(q{DELETE FROM validation_ai_reviews a USING validation_items i
+                         WHERE a.item_id = i.id AND i.set_id = ? AND a.error IS NOT NULL
+                           AND (?::text IS NULL OR a.model = ?) AND NOT (a.model = ANY(?))},
+                       $set->{id}, $p->{model}, $p->{model}, \@busy)->rows;
+    $c->render(json => { ok => 1, deleted => $n + 0, skipped_models => \@busy });
+};
+
+# Laufende oder wartende Judge-Läufe eines Datensatzes beenden. Wartende Jobs
+# werden entfernt; aktive beenden sich nach dem Brief, an dem sie gerade
+# arbeiten. Aktive Jobs ohne lebenden Worker werden sofort als fehlgeschlagen markiert.
+post '/BBB/validation/sets/:id/judge/stop' => sub {
+    my $c   = shift;
+    my $p   = $c->req->json // {};
+    my $set = _val_load_set($c->pg->db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $minion = $c->minion;
+    my %alive = map { $_->{id} => 1 } @{ $minion->backend->list_workers(0, 1000)->{workers} // [] };
+    my ($removed, $signalled, $failed) = (0, 0, 0);
+    my $jobs = $minion->jobs({ tasks => ['validation_judge_task'], states => [qw(inactive active)] });
+    while (my $info = $jobs->next) {
+        my $a = $info->{args}[0] // {};
+        next unless ($a->{set_id} // 0) == $set->{id};
+        next if $p->{provider} && ($a->{provider} // 'anthropic') ne $p->{provider};
+        my $job = $minion->job($info->{id}) or next;
+        if ($info->{state} eq 'inactive') { $removed++ if $job->remove; next }
+        if ($info->{worker} && !$alive{ $info->{worker} }) { $failed++ if $job->fail('abgebrochen (Worker nicht mehr aktiv)'); next }
+        $signalled++ if $job->note(cancel => 1);
+    }
+    $c->render(json => { ok => 1, removed => $removed, stopping => $signalled, failed => $failed });
+};
+
 app->minion->add_task(validation_judge_task => sub {
     my ($job, $payload) = @_;
     my $app   = $job->app;
@@ -12497,14 +12596,18 @@ app->minion->add_task(validation_judge_task => sub {
     my $task  = "validation_judge_$set->{id}";
     my ($k, $n, $done, $failed, $skipped) = (0, scalar @$items, 0, 0, 0);
 
+    my $cancelled = 0;
     for my $i (@$items) {
         $k++;
+        if (($job->info->{notes} // {})->{cancel}) { $cancelled = 1; last }
         if ($have->{ $i->{id} } && !$have->{ $i->{id} }{error} && !$payload->{overwrite}) { $skipped++; next }
         my ($out, $usage, $model, $err);
+        my $t0 = time;
+        $job->note(current => $k, current_since => $t0);
         if (my $why = $guard ? _val_pii_hit($i->{narrative}) : undef) {
             $err = "nicht gesendet: Brief enthält möglicherweise identifizierende Angaben ($why)";
         } else {
-            ($out, $usage, $model) = eval { _val_judge_call($i, $prov->{id}) };
+            ($out, $usage, $model) = eval { _val_judge_call($i, $prov) };
             $err = $@ =~ s/\s+$//r if $@;
         }
         my ($judg, $missing, $unjudged) = $out ? _val_ai_convert($app, $i, $out) : ({}, [], 0);
@@ -12517,12 +12620,13 @@ app->minion->add_task(validation_judge_task => sub {
                    $i->{id}, $prov->{model}, $VAL_JUDGE_PROMPT_VERSION, to_json($judg), to_json($missing),
                    $out ? to_json($out) : undef, to_json($usage // {}), $err);
         $err ? $failed++ : $done++;
+        $app->log->info(sprintf('[JUDGE] %s Brief %d/%d in %ds: %s', $prov->{model}, $k, $n, time - $t0, $err // 'ok'));
         my $pct = int(100 * $k / ($n || 1));
         $job->note(progress => $pct, done => $done, failed => $failed);
         $app->notify_task_progress($task, 'running', $pct, "KI-Judge ($prov->{model}): Brief $k von $n");
     }
-    $app->notify_task_progress($task, 'finished', 100, 'KI-Judge abgeschlossen');
-    $job->finish({ done => $done, failed => $failed, skipped => $skipped });
+    $app->notify_task_progress($task, 'finished', 100, $cancelled ? 'KI-Judge abgebrochen' : 'KI-Judge abgeschlossen');
+    $job->finish({ done => $done, failed => $failed, skipped => $skipped, cancelled => $cancelled });
 });
 
 # Vergleich KI-Judge gegen die aufgelöste ärztliche Bewertung

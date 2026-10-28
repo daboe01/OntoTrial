@@ -40,7 +40,7 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 | **Medications** | **ATC** | Active agents and trade names, eye drops, anti-VEGF/steroid IVOM auto-detection. |
 | **Measurements** | **LOINC** | Clinical chemistry, haematology, coagulation, thyroid, serology, blood pressure, BMI, PROMs (e.g. OSDI) and quantitative ophthalmic measurements. Supports local extension codes (`86290-4a`, `86301-9b`, …). |
 | **Anatomy & laterality** | **SNOMED CT / HPO** | Right/left/both eyes (`SNOMED:18944008`, `8966001`, `40638003`; `HP:0012834/5/2`). |
-| **Output standards** | **FHIR R6 `Group`**, **`Phenopacket v2`** | Nested definitional/conceptual criteria groups; patient phenopackets with features, measurements, diseases, procedures and medical actions. |
+| **Output standards** | **FHIR R6 `Group`**, `**Phenopacket v2.0.0**` | Nested definitional/conceptual criteria groups; patient phenopackets with features, measurements, diseases, procedures and medical actions. |
 
 Highlights added in recent versions:
 
@@ -49,6 +49,7 @@ Highlights added in recent versions:
 - **Deep mode** – optional two-stage extraction with an unconstrained reasoning trace (pre-extraction table) followed by schema-constrained JSON sampling.
 - **Anonymized export** – de-identified phenopackets for data sharing: no free text, ephemeral subject IDs, month truncation with patient-constant date shift, age top-coding and hierarchical generalization of rare codes (k ≥ 5).
 - **Long-format export** – one row per coded element as CSV or NDJSON, deduplicated across letters, streamed from a server-side cursor and directly readable from R (details [below](#long-format-export-for-statistics)).
+- **Validation** – protected reference data sets drawn from the stock, physician review per extracted element, regression tests of the pipeline against the frozen reference, study metrics with bootstrap confidence intervals and optional LLM judges (Claude or a local model) (details [below](#validation)).
 - **Patient similarity** – laterality-agnostic distance (unilateral vs. bilateral), nearest-neighbour search and greedy 1:n case-control matching with caliper.
 - **Catalog maintenance** – `update_catalogs.pl` for inventory, versioned imports with backups and post-import checks.
 - **Server-side persistence and live sync** – extracted phenopackets are stored by the backend under the `candidate_id` of the request; all open browsers receive the update over the WebSocket.
@@ -329,9 +330,9 @@ The validation window (actions menu of the candidate list → *Validation...*) s
 | Judge | Variables | Notes |
 | :--- | :--- | :--- |
 | Claude (external API) | `ANTHROPIC_API_KEY`, `ONTOTRIAL_JUDGE_MODEL` (default `claude-opus-5-5`), `ONTOTRIAL_JUDGE_MAX_TOKENS`, `ONTOTRIAL_JUDGE_TEMPERATURE` | Letters leave the institution. Requires approval by data protection; every run must be confirmed with `EXTERN`. Letters with a date of birth or a name with salutation are withheld (`ONTOTRIAL_JUDGE_PII_GUARD`, `ONTOTRIAL_JUDGE_PII_REGEX`). |
-| Local model, e.g. GLM-5 | `ONTOTRIAL_JUDGE_LOCAL_MODEL`, `ONTOTRIAL_JUDGE_LOCAL_URL` (default `VLLM_ENDPOINT`), `ONTOTRIAL_JUDGE_LOCAL_KEY` (default `VLLM_API_KEY`), `ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS` (default 32000), `ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE` (default 0), `ONTOTRIAL_JUDGE_LOCAL_THINKING` | OpenAI-compatible endpoint (vLLM) or Ollama; letters stay in-house. |
+| Local models, e.g. gpt-oss-120b, GLM-5 | `ONTOTRIAL_JUDGE_LOCAL_MODELS` (comma-separated; default: the pipeline model `VLLM_MODEL`), `ONTOTRIAL_JUDGE_URL_<MODEL>` and `ONTOTRIAL_JUDGE_KEY_<MODEL>` per model (name in upper case, other characters as `_`, e.g. `ONTOTRIAL_JUDGE_KEY_GLM_5`; default: `VLLM_ENDPOINT`, `VLLM_API_KEY`), `ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS` (default 32000), `ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE` (default 0), `ONTOTRIAL_JUDGE_REASONING_EFFORT` (default `high`), `ONTOTRIAL_JUDGE_LOCAL_THINKING` | OpenAI-compatible endpoint (vLLM) or Ollama; letters stay in-house. |
 
-Judge runs and regression runs are Minion jobs: the variables must be set for the Minion worker, and the worker must be restarted after updating `backend.pl`.
+The judge is chosen from a pop-up menu in the validation window; *Stop run* ends a running judge after the current letter, *Clear error log* removes failed ratings (valid ratings stay protected). Progress is shown in the background-process panel. Judge runs and regression runs are Minion jobs: the variables must be set for the Minion worker, and the worker must be restarted after updating `backend.pl`.
 
 ---
 
@@ -369,11 +370,11 @@ cpanm Mojolicious Mojo::Pg Minion DateTime
 createdb hpo
 ```
 
-The schema is created automatically when `backend.pl` starts for the first time. It is maintained as a Mojo::Pg migration in `migrations/ontotrial.sql`: version 1 is the core schema (tables, views, functions, indexes and the extensions `pg_trgm` and `fuzzystrmatch`), version 2 adds the validation tables. The applied version is tracked in `mojo_migrations` under the name `ontotrial`; each version runs exactly once per database. The database user must be allowed to create the two extensions; since PostgreSQL 13 both are trusted, so owning the database is sufficient.
+The schema is created automatically when `backend.pl` starts for the first time. It is maintained as a Mojo::Pg migration in `migrations/ontotrial.sql`: version 1 is the core schema (tables, views, functions, indexes and the extensions `pg_trgm` and `fuzzystrmatch`), version 2 adds the validation tables, version 3 allows deleting failed LLM-judge ratings in locked sets. The applied version is tracked in `mojo_migrations` under the name `ontotrial`; each version runs exactly once per database. The database user must be allowed to create the two extensions; since PostgreSQL 13 both are trusted, so owning the database is sufficient.
 
 A database that already contains the schema (installations from before the migration) is detected on the first start and registered as core schema version 1 without any change.
 
-To change the schema, append a new section (`-- 3 up`, `-- 3 down`, …) to `migrations/ontotrial.sql`. Never edit a version that has already been rolled out.
+To change the schema, append a new section (`-- 4 up`, `-- 4 down`, …) to `migrations/ontotrial.sql`. Never edit a version that has already been rolled out.
 
 Then load the terminologies (see [Keeping terminologies up to date](#keeping-terminologies-up-to-date)) and insert the active prompts into `llm_prompts`:
 
@@ -564,8 +565,6 @@ The schema is in `migrations/ontotrial.sql`. Minion manages its own tables, and 
 This project is licensed under the MIT License – see [LICENSE](LICENSE).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-For scientific reference, please cite it as [![DOI](https://zenodo.org/badge/1371450472.svg)](https://doi.org/10.5281/zenodo.23659642)
 
 OntoTrial interfaces with medical terminologies that retain their own copyright and terms of use. They are **not** included in this repository and must be obtained from their publishers:
 

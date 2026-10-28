@@ -25,6 +25,7 @@
 var SharedValidationController = nil;
 var OVConsensusName = "Konsens";
 var OVReviewerStorageKey = "ontotrial_validation_reviewer";
+var OVJudgeStorageKey = "ontotrial_validation_judge";
 
 var OVDomains      = ["disease", "phenotype", "procedure", "treatment", "measurement"];
 var OVDomainTitles = { disease: "Diagnose", phenotype: "Befund", procedure: "Eingriff", treatment: "Medikation", measurement: "Messwert" };
@@ -187,6 +188,96 @@ function OVTextArea(frame, monospace)
     return { scroll: scroll, text: tv };
 }
 
+// ================================================================================
+// Dialoge mit CPAlert statt alert/confirm/prompt des Browsers. CPAlert blockiert
+// nicht; das Ergebnis kommt über einen Callback.
+// ================================================================================
+
+var OVOpenDialogs = [];
+
+@implementation OVDialog : CPObject
+{
+    CPAlert     _alert;
+    CPTextField _field;
+    Function    _callback;
+    BOOL        _isPrompt;
+}
+
+// Meldung mit OK
++ (void)message:(CPString)aMessage info:(CPString)anInfo
+{
+    [self choose:aMessage info:anInfo buttons:["OK"] then:nil];
+}
+
+// Rückfrage; callback(YES/NO)
++ (void)confirm:(CPString)aMessage info:(CPString)anInfo ok:(CPString)anOkTitle then:(Function)aCallback
+{
+    [self choose:aMessage info:anInfo buttons:[anOkTitle || "OK", "Abbrechen"] then:function(index) { aCallback(index === 0); }];
+}
+
+// Auswahl zwischen Knöpfen; callback(Index des Knopfs)
++ (void)choose:(CPString)aMessage info:(CPString)anInfo buttons:(CPArray)titles then:(Function)aCallback
+{
+    var d = [[OVDialog alloc] init];
+    [d _runWithMessage:aMessage info:anInfo buttons:titles field:nil then:aCallback];
+}
+
+// Eingabe; callback(Text) oder callback(nil) bei Abbruch
++ (void)prompt:(CPString)aMessage info:(CPString)anInfo value:(CPString)aValue ok:(CPString)anOkTitle then:(Function)aCallback
+{
+    var d = [[OVDialog alloc] init];
+    var field = [CPTextField textFieldWithStringValue:(aValue || "") placeholder:"" width:320];
+    [d _runWithMessage:aMessage info:anInfo buttons:[anOkTitle || "OK", "Abbrechen"] field:field then:function(index, text)
+    {
+        if (aCallback)
+            aCallback(index === 0 ? text : nil);
+    }];
+}
+
+- (void)_runWithMessage:(CPString)aMessage info:(CPString)anInfo buttons:(CPArray)titles field:(CPTextField)aField then:(Function)aCallback
+{
+    _callback = aCallback;
+    _field = aField;
+    _alert = [[CPAlert alloc] init];
+    [_alert setMessageText:aMessage || ""];
+    if (anInfo)
+        [_alert setInformativeText:anInfo];
+
+    // CPAlert vergibt als Tag die Reihenfolge des Hinzufügens (0, 1, 2 …) und liefert
+    // diesen Tag als returnCode. Das Array -buttons ist dagegen umgekehrt sortiert,
+    // deshalb wird nur der returnCode ausgewertet.
+    for (var i = 0; i < titles.length; i++)
+        [_alert addButtonWithTitle:titles[i]];
+    var buttons = [_alert buttons];
+    for (var k = 0; k < buttons.length; k++)
+        if ([buttons[k] title] === "Abbrechen")
+            [buttons[k] setKeyEquivalent:CPEscapeFunctionKey];
+
+    if (_field)
+        [_alert setAccessoryView:_field];
+
+    OVOpenDialogs.push(self);
+    var dialog = self;
+    [_alert runModalWithDidEndBlock:function(alert, returnCode)
+    {
+        var text = dialog._field ? [dialog._field stringValue] : nil;
+        var idx = OVOpenDialogs.indexOf(dialog);
+        if (idx >= 0)
+            OVOpenDialogs.splice(idx, 1);
+        if (dialog._callback)
+            window.setTimeout(function() { dialog._callback(returnCode, text); }, 0);
+    }];
+    if (_field)
+        [[_alert window] makeFirstResponder:_field];
+}
+
+@end
+
+function OVAlert(aMessage, anInfo)
+{
+    [OVDialog message:aMessage info:anInfo];
+}
+
 @implementation ValidationController : CPObject
 {
     id              _app;
@@ -264,6 +355,9 @@ function OVTextArea(frame, monospace)
     BOOL            _runsActive;
     BOOL            _judgeActive;
     id              _judgeStatus;
+    CPPopUpButton   _judgePopUp;
+    id              _hudTasks;
+    id              _judgeProviders;
     CPString        _statusText;
     CPString        _judgeText;
 
@@ -382,6 +476,7 @@ function OVTextArea(frame, monospace)
     _missing = [];
     _checklist = { lines: [], done: 0 };
     _runs = [];
+    _hudTasks = {};
 
     _window = [[CPWindow alloc] initWithContentRect:CGRectMake(0, 0, 1300, 800)
                                           styleMask:CPTitledWindowMask | CPClosableWindowMask | CPResizableWindowMask];
@@ -591,7 +686,7 @@ function OVTextArea(frame, monospace)
 {
     if (OTTrim([_nsConfirm stringValue]) !== "ANLEGEN")
     {
-        alert("Bitte zum Bestätigen ANLEGEN eintragen.");
+        OVAlert("Bitte zum Bestätigen ANLEGEN eintragen.");
         return;
     }
     var payload = {
@@ -613,11 +708,11 @@ function OVTextArea(frame, monospace)
     {
         if (!res || res.error)
         {
-            alert("Datensatz nicht angelegt: " + (res && res.error ? res.error : "keine Antwort vom Server"));
+            OVAlert("Datensatz nicht angelegt: " + (res && res.error ? res.error : "keine Antwort vom Server"));
             return;
         }
         [_newPanel orderOut:self];
-        alert("Datensatz „" + res.name + "“ angelegt: " + res.n + " Briefe aus " + res.pool + " geeigneten, " +
+        OVAlert("Datensatz „" + res.name + "“ angelegt: " + res.n + " Briefe aus " + res.pool + " geeigneten, " +
               res.strata + " Schichten" + (res.double ? ", " + res.double + " doppelt zu prüfen" : "") +
               (res.injected ? ", " + res.injected + " mit eingestreutem Fehler" : "") + ".");
         _currentSet = { id: res.id };
@@ -758,7 +853,7 @@ function OVTextArea(frame, monospace)
     {
         if (!res || res.error)
         {
-            alert("Brief konnte nicht geladen werden: " + (res && res.error ? res.error : "keine Antwort"));
+            OVAlert("Brief konnte nicht geladen werden: " + (res && res.error ? res.error : "keine Antwort"));
             return;
         }
         _item = res;
@@ -824,12 +919,12 @@ function OVTextArea(frame, monospace)
 {
     if (![self reviewer].length)
     {
-        alert("Bitte oben einen Prüfernamen eintragen.");
+        OVAlert("Bitte oben einen Prüfernamen eintragen.");
         return NO;
     }
     if (_item && _item.frozen)
     {
-        alert("Die Referenz dieses Datensatzes ist eingefroren; Bewertungen sind nicht mehr änderbar.");
+        OVAlert("Die Referenz dieses Datensatzes ist eingefroren; Bewertungen sind nicht mehr änderbar.");
         return NO;
     }
     return !!_item;
@@ -842,7 +937,7 @@ function OVTextArea(frame, monospace)
     {
         if (!res || res.error)
         {
-            alert("Nicht gespeichert: " + (res && res.error ? res.error : "keine Antwort vom Server"));
+            OVAlert("Nicht gespeichert: " + (res && res.error ? res.error : "keine Antwort vom Server"));
             return;
         }
         if (aCallback)
@@ -883,10 +978,15 @@ function OVTextArea(frame, monospace)
 
 - (void)markUnclear:(id)sender
 {
-    var comment = prompt("Warum ist der Eintrag nicht beurteilbar? (Pflichtkommentar)", "");
-    if (comment === null || !OTTrim(comment).length)
+    var e = [self _selectedEntry];
+    if (!e)
         return;
-    [self _setJudgment:{ verdict: "unclear", comment: OTTrim(comment) } forEntry:[self _selectedEntry] advance:YES];
+    [OVDialog prompt:"Warum ist der Eintrag nicht beurteilbar?" info:"Ein Kommentar ist Pflicht." value:"" ok:"Speichern" then:function(comment)
+    {
+        if (!comment || !OTTrim(comment).length)
+            return;
+        [self _setJudgment:{ verdict: "unclear", comment: OTTrim(comment) } forEntry:e advance:YES];
+    }];
 }
 
 - (void)clearJudgment:(id)sender
@@ -898,27 +998,24 @@ function OVTextArea(frame, monospace)
 {
     if (![self _requireReviewer])
         return;
-    var reviews = [];
+    var reviews = [], ok = { verdict: "correct", concept: "ok", status: "ok", side: "ok", date: "ok", value: "ok" };
     for (var i = 0; i < _item.entries.length; i++)
     {
-        var e = _item.entries[i];
-        var j = _judgments[e.key];
-        if (j && j.verdict)
-            continue;
-        j = { verdict: "correct", concept: "ok", status: "ok", side: "ok", date: "ok", value: "ok" };
-        _judgments[e.key] = j;
-        reviews.push({ entry_key: e.key, judgment: j });
+        var e = _item.entries[i], j = _judgments[e.key];
+        if (!j || !j.verdict)
+            reviews.push({ entry_key: e.key, judgment: ok });
     }
     if (!reviews.length)
         return;
-    if (!confirm(reviews.length + " noch nicht bewertete Einträge als korrekt markieren?"))
+    [OVDialog confirm:reviews.length + " noch nicht bewertete Einträge als korrekt markieren?" info:nil ok:"Als korrekt markieren" then:function(yes)
     {
+        if (!yes)
+            return;
         for (var r = 0; r < reviews.length; r++)
-            delete _judgments[reviews[r].entry_key];
-        return;
-    }
-    [_entriesTable reloadData];
-    [self _save:reviews then:function() { [self _refreshItemRow]; }];
+            _judgments[reviews[r].entry_key] = ok;
+        [_entriesTable reloadData];
+        [self _save:reviews then:function() { [self _refreshItemRow]; }];
+    }];
 }
 
 - (void)_refreshItemRow
@@ -958,7 +1055,7 @@ function OVTextArea(frame, monospace)
         }
         if (open)
         {
-            alert(open + " Einträge sind noch nicht bewertet.");
+            OVAlert(open + " Einträge sind noch nicht bewertet.");
             return;
         }
         if (_currentSet.purpose === "study")
@@ -966,7 +1063,7 @@ function OVTextArea(frame, monospace)
             for (var l = 0; l < _checklist.lines.length; l++)
                 if (!_checklist.lines[l].match)
                 {
-                    alert("Bitte für jede Checklistenzeile den Abgleich setzen (gefunden, Attributfehler oder fehlt).");
+                    OVAlert("Bitte für jede Checklistenzeile den Abgleich setzen (gefunden, Attributfehler oder fehlt).");
                     return;
                 }
         }
@@ -995,7 +1092,7 @@ function OVTextArea(frame, monospace)
             return;
         }
     }
-    alert("Alle Briefe dieses Datensatzes sind von " + [self reviewer] + " abgeschlossen.");
+    OVAlert("Alle Briefe dieses Datensatzes sind von " + [self reviewer] + " abgeschlossen.");
 }
 
 // --- Fehler-Panel -----------------------------------------------------------------
@@ -1180,7 +1277,7 @@ function OVTextArea(frame, monospace)
     var text = OTTrim([_enLabel stringValue]);
     if (!text.length)
     {
-        alert("Bitte zuerst die Bezeichnung eintragen.");
+        OVAlert("Bitte zuerst die Bezeichnung eintragen.");
         return;
     }
     [_enLookup setEnabled:NO];
@@ -1190,11 +1287,15 @@ function OVTextArea(frame, monospace)
         if (res && res.hit && res.id)
         {
             [_enCode setStringValue:res.id];
-            if (res.label && confirm("Gefunden: " + res.id + " – " + res.label + "\nBezeichnung übernehmen?"))
-                [_enLabel setStringValue:res.label];
+            if (res.label)
+                [OVDialog confirm:"Gefunden: " + res.id + " – " + res.label info:"Bezeichnung aus der Terminologie übernehmen?" ok:"Übernehmen" then:function(yes)
+                {
+                    if (yes)
+                        [_enLabel setStringValue:res.label];
+                }];
         }
         else
-            alert("Kein passender Code gefunden. Bitte den Code von Hand eintragen.");
+            OVAlert("Kein passender Code gefunden. Bitte den Code von Hand eintragen.");
     });
 }
 
@@ -1208,7 +1309,7 @@ function OVTextArea(frame, monospace)
     var label = OTTrim([_enLabel stringValue]);
     if (!label.length)
     {
-        alert("Bitte eine Bezeichnung eintragen.");
+        OVAlert("Bitte eine Bezeichnung eintragen.");
         return;
     }
     var side = OVPopUpKey(_enSide, OVSideOpts);
@@ -1218,8 +1319,12 @@ function OVTextArea(frame, monospace)
     if (_entryMode === "missing")
     {
         var code = OTTrim([_enCode stringValue]);
-        if (!code.length && !confirm("Ohne Code zählt der Eintrag in der Studie, aber nicht im Regressionstest. Trotzdem übernehmen?"))
+        if (!code.length && sender !== "ohne-code")
+        {
+            [OVDialog confirm:"Eintrag ohne Code übernehmen?" info:"Ohne Code zählt der Eintrag in der Studie, aber nicht im Regressionstest."
+                           ok:"Ohne Code übernehmen" then:function(yes) { if (yes) [self saveEntryPanel:"ohne-code"]; }];
             return;
+        }
         var m = {
             missing: 1, domain: OVDomains[[_enDomain indexOfSelectedItem]], label: label, code: code, side: side,
             date: OTTrim([_enDate stringValue]), value: OTTrim([_enValue stringValue]), unit: OTTrim([_enUnit stringValue]),
@@ -1259,8 +1364,12 @@ function OVTextArea(frame, monospace)
 
 - (void)addChecklistLine:(id)sender
 {
-    if (_checklist.done && _item && !_item.blind && !confirm("Die Checkliste ist bereits abgeschlossen. Trotzdem eine Zeile ergänzen?"))
+    if (_checklist.done && _item && !_item.blind && sender !== "bestaetigt")
+    {
+        [OVDialog confirm:"Die Checkliste ist bereits abgeschlossen." info:"Trotzdem eine Zeile ergänzen?" ok:"Ergänzen"
+                     then:function(yes) { if (yes) [self addChecklistLine:"bestaetigt"]; }];
         return;
+    }
     [self _showEntryPanel:"checklist"];
 }
 
@@ -1269,8 +1378,12 @@ function OVTextArea(frame, monospace)
     var row = [_checklistTable selectedRow];
     if (row < 0 || row >= _checklist.lines.length || ![self _requireReviewer])
         return;
-    if (_checklist.done && !confirm("Die Checkliste ist bereits abgeschlossen. Zeile trotzdem entfernen?"))
+    if (_checklist.done && sender !== "bestaetigt")
+    {
+        [OVDialog confirm:"Die Checkliste ist bereits abgeschlossen." info:"Zeile trotzdem entfernen?" ok:"Entfernen"
+                     then:function(yes) { if (yes) [self removeChecklistLine:"bestaetigt"]; }];
         return;
+    }
     _checklist.lines.splice(row, 1);
     [self _saveChecklist];
 }
@@ -1286,8 +1399,12 @@ function OVTextArea(frame, monospace)
 {
     if (![self _requireReviewer])
         return;
-    if (!_checklist.lines.length && !confirm("Die Checkliste ist leer. Trotzdem abschließen?"))
+    if (!_checklist.lines.length && sender !== "bestaetigt")
+    {
+        [OVDialog confirm:"Die Checkliste ist leer." info:"Trotzdem abschließen und die Extraktion zeigen?" ok:"Abschließen"
+                     then:function(yes) { if (yes) [self finishChecklist:"bestaetigt"]; }];
         return;
+    }
     _checklist.done = 1;
     _judgments["_checklist"] = _checklist;
     var itemId = _item.id;
@@ -1305,7 +1422,7 @@ function OVTextArea(frame, monospace)
         return;
     if (_item.blind)
     {
-        alert("Der Abgleich ist erst nach Abschluss der Checkliste möglich.");
+        OVAlert("Der Abgleich ist erst nach Abschluss der Checkliste möglich.");
         return;
     }
     _checklist.lines[row].match = aMatch;
@@ -1337,9 +1454,16 @@ function OVTextArea(frame, monospace)
     [v addSubview:OTButton(CGRectMake(bx + 210, 26, 200, 26), "Sperren / Entsperren …", self, @selector(toggleLock:))];
     [v addSubview:OTButton(CGRectMake(bx + 210, 58, 200, 26), "Datensatz löschen …", self, @selector(deleteSet:))];
     [v addSubview:OTLabel(CGRectMake(bx + 420, 5, 200, 18), "KI-Judge", YES)];
-    [v addSubview:OTButton(CGRectMake(bx + 420, 26, 200, 26), "KI-Judge bewerten lassen …", self, @selector(startJudge:))];
-    [v addSubview:OTButton(CGRectMake(bx + 420, 58, 200, 26), "KI-Referenz einfrieren …", self, @selector(freezeJudgeSet:))];
-    [v addSubview:OTLabel(CGRectMake(bx, 124, 620, 52),
+    _judgePopUp = [[CPPopUpButton alloc] initWithFrame:CGRectMake(bx + 420, 26, 200, 26) pullsDown:NO];
+    [_judgePopUp addItemWithTitle:@"– wird geladen –"];
+    [_judgePopUp setTarget:self];
+    [_judgePopUp setAction:@selector(judgeChanged:)];
+    [v addSubview:_judgePopUp];
+    [v addSubview:OTButton(CGRectMake(bx + 420, 58, 200, 26), "Bewerten lassen …", self, @selector(startJudge:))];
+    [v addSubview:OTButton(CGRectMake(bx + 420, 90, 200, 26), "Lauf beenden", self, @selector(stopJudge:))];
+    [v addSubview:OTButton(CGRectMake(bx + 420, 122, 200, 26), "KI-Referenz einfrieren …", self, @selector(freezeJudgeSet:))];
+    [v addSubview:OTButton(CGRectMake(bx + 420, 154, 200, 26), "Fehlerprotokoll löschen …", self, @selector(clearJudgeErrors:))];
+    [v addSubview:OTLabel(CGRectMake(bx, 120, 410, 66),
         "Einfrieren übernimmt die Bewertungen als Referenz und schützt sie vor Änderungen. Abweichungen zwischen zwei Prüfern " +
         "klärt ein Prüfer mit dem Namen „Konsens“; er sieht die Urteile beider. Eine KI-Referenz entsteht aus den Urteilen des KI-Judge.", NO)];
 
@@ -1411,7 +1535,30 @@ function OVTextArea(frame, monospace)
 
 - (void)_renderStatus
 {
-    [_statusView setString:(_statusText || "") + (_judgeText ? "\n\n" + _judgeText : "")];
+    [_statusView setString:(_judgeText ? _judgeText + "\n\n" : "") + (_statusText || "")];
+    [_statusView scrollPoint:CGPointMake(0, 0)];
+}
+
+// --- Hintergrundprozesse im HUD-Panel („OntoTrial Hintergrundprozesse“) -------------
+// Das Backend meldet Fortschritt per WebSocket (TASK_PROGRESS) unter den Kennungen
+// validation_judge_<Datensatz> und validation_run_<Lauf>. Das Panel zeigt aber nur
+// Aufgaben an, die vorher angelegt wurden; das übernimmt diese Methode. Zusätzlich
+// wird der Stand aus der Statusabfrage nachgetragen, falls eine Meldung fehlt.
+
+- (void)_hudTask:(CPString)anId name:(CPString)aName state:(CPString)aState message:(CPString)aMessage progress:(int)aProgress
+{
+    if (!_app || ![_app respondsToSelector:@selector(addTaskWithName:identifier:)])
+        return;
+    if (!_hudTasks[anId])
+    {
+        if (aState !== "active")
+            return;
+        [_app addTaskWithName:aName identifier:anId];
+        _hudTasks[anId] = 1;
+    }
+    [_app updateTaskWithIdentifier:anId state:aState message:aMessage progress:aProgress];
+    if (aState !== "active")
+        delete _hudTasks[anId];
 }
 
 // --- KI-Judge -----------------------------------------------------------------------
@@ -1430,12 +1577,47 @@ function OVTextArea(frame, monospace)
         }
         else
         {
-            var L = [], provs = res.providers || [], running = res.running || [];
-            var conf = [];
-            for (var p = 0; p < provs.length; p++)
-                if (provs[p].configured)
-                    conf.push(provs[p].label + " " + provs[p].model + (running.indexOf(provs[p].id) >= 0 ? " – läuft" : ""));
-            L.push("KI-Judge:    " + (conf.length ? conf.join(", ") : "nicht konfiguriert") + "   Prompt " + res.prompt_version);
+            var L = [], provs = res.providers || [], running = res.running || [], jobs = res.jobs || [];
+            [self _fillJudgePopUp:provs];
+            var labelOf = function(id)
+            {
+                for (var p = 0; p < provs.length; p++)
+                    if (provs[p].id === id)
+                        return provs[p].label;
+                return id;
+            };
+            var now = new Date().getTime();
+            if (!jobs.length)
+                L.push("KI-Judge:    kein Lauf aktiv   (Prompt " + res.prompt_version + ")");
+            for (var j = 0; j < jobs.length; j++)
+            {
+                var jb = jobs[j], line = "KI-Judge:    " + labelOf(jb.provider) + " – ";
+                if (jb.state === "inactive")
+                {
+                    var waited = jb.waiting || 0;
+                    line += "wartet auf den Minion-Worker" + (waited > 20 ? " (seit " + waited + " s – läuft der Worker? perl backend.pl minion worker)" : "");
+                    if (!res.workers)
+                        line += " – KEIN WORKER AKTIV";
+                }
+                else if (jb.worker_alive === 0)
+                    line += "hängt (Worker beendet) – mit „Lauf beenden“ aufräumen";
+                else
+                    line += (jb.cancel ? "wird beendet, " : "läuft, ") + jb.progress + " % (" + jb.done + " bewertet, " + jb.failed + " Fehler)" +
+                            (jb.current ? ", bewertet gerade Brief " + jb.current + " seit " + jb.current_s + " s" : "");
+                L.push(line);
+            }
+            var hudId = "validation_judge_" + _currentSet.id;
+            if (jobs.length)
+            {
+                var hj = jobs[0];
+                var hmsg = hj.state === "inactive" ? "wartet auf den Minion-Worker" :
+                           (hj.worker_alive === 0 ? "hängt (Worker beendet)" :
+                            (hj.current ? "Brief " + hj.current + " (" + hj.current_s + " s) · " : "") + hj.done + " bewertet, " + hj.failed + " Fehler");
+                [self _hudTask:hudId name:"KI-Judge " + labelOf(hj.provider) state:"active" message:hmsg progress:hj.progress || 0];
+            }
+            else if (res.jobs && _hudTasks[hudId])
+                [self _hudTask:hudId name:"" state:"finished" message:"abgeschlossen" progress:100];
+
             var models = res.models || [];
             for (var m = 0; m < models.length; m++)
             {
@@ -1443,8 +1625,8 @@ function OVTextArea(frame, monospace)
                 L.push("  " + OVPad(md.model, 18) + "bewertet " + md.n_ok + " von " + res.n_items + " Briefen" +
                        (md.n_errors > 0 ? ", " + md.n_errors + " mit Fehler" : "") + "   Tokens " + md.tokens_in + " ein / " + md.tokens_out + " aus");
                 var errs = md.errors || [];
-                for (var i = 0; i < errs.length && i < 5; i++)
-                    L.push("    Brief " + errs[i].position + ": " + errs[i].error);
+                for (var i = 0; i < errs.length; i++)
+                    L.push("    zuletzt Brief " + errs[i].position + ": " + errs[i].error);
             }
             _judgeText = L.join("\n");
             _judgeActive = running.length > 0;
@@ -1454,105 +1636,216 @@ function OVTextArea(frame, monospace)
     });
 }
 
+- (void)_fillJudgePopUp:(id)providers
+{
+    var list = [];
+    for (var i = 0; i < providers.length; i++)
+        if (providers[i].configured)
+            list.push(providers[i]);
+    var ids = list.map(function(x) { return x.id; }).join("|");
+    var old = (_judgeProviders || []).map(function(x) { return x.id; }).join("|");
+    if (ids === old && list.length)
+        return;
+    var want = nil;
+    try { want = window.localStorage.getItem(OVJudgeStorageKey); } catch (e) { want = nil; }
+    var cur = [self _selectedJudge];
+    if (cur)
+        want = cur.id;
+    _judgeProviders = list;
+    [_judgePopUp removeAllItems];
+    if (!list.length)
+    {
+        [_judgePopUp addItemWithTitle:@"– kein Judge konfiguriert –"];
+        [_judgePopUp setEnabled:NO];
+        return;
+    }
+    [_judgePopUp setEnabled:YES];
+    var sel = 0;
+    for (var k = 0; k < list.length; k++)
+    {
+        [_judgePopUp addItemWithTitle:list[k].label];
+        if (list[k].id === want)
+            sel = k;
+    }
+    [_judgePopUp selectItemAtIndex:sel];
+}
+
+- (id)_selectedJudge
+{
+    var i = [_judgePopUp indexOfSelectedItem];
+    return (_judgeProviders && i >= 0 && i < _judgeProviders.length) ? _judgeProviders[i] : nil;
+}
+
+- (void)judgeChanged:(id)sender
+{
+    var j = [self _selectedJudge];
+    if (j)
+        try { window.localStorage.setItem(OVJudgeStorageKey, j.id); } catch (e) {}
+}
+
 - (void)startJudge:(id)sender
 {
     if (!_currentSet)
         return;
-    var st = _judgeStatus || {}, provs = [];
-    for (var i = 0; i < (st.providers || []).length; i++)
-        if (st.providers[i].configured)
-            provs.push(st.providers[i]);
-    if (!provs.length)
+    var st = _judgeStatus || {}, prov = [self _selectedJudge];
+    if (!prov)
     {
-        alert("Kein KI-Judge konfiguriert. Im Backend ANTHROPIC_API_KEY (Claude) und/oder ONTOTRIAL_JUDGE_LOCAL_MODEL (lokales Modell) setzen " +
-              "und Backend sowie Minion-Worker neu starten.");
+        OVAlert("Kein KI-Judge konfiguriert.", "Lokale Modelle über ONTOTRIAL_JUDGE_LOCAL_MODELS, Claude über ANTHROPIC_API_KEY in der .env eintragen " +
+                "und Backend sowie Minion-Worker neu starten.");
         return;
     }
-    var prov = provs[0];
-    if (provs.length > 1)
+    var setId = _currentSet.id, payload = { provider: prov.id };
+
+    var send = function()
     {
-        var q = "Welcher KI-Judge soll bewerten?\n";
-        for (var k = 0; k < provs.length; k++)
-            q += "\n" + (k + 1) + " = " + provs[k].label + " (" + provs[k].model + ")";
-        var pick = prompt(q + "\n\nNummer eingeben:", "1");
-        if (pick === null)
-            return;
-        prov = provs[parseInt(pick, 10) - 1];
-        if (!prov)
+        OTPostJSON("/BBB/validation/sets/" + setId + "/judge", payload, 60.0, function(res, error)
         {
-            alert("Ungültige Auswahl. Abgebrochen.");
+            if (!res || res.error)
+            {
+                OVAlert("KI-Judge nicht gestartet.", res && res.error ? res.error : "Keine Antwort vom Server.");
+                return;
+            }
+            _judgeActive = YES;
+            [self _hudTask:"validation_judge_" + setId name:"KI-Judge " + prov.label state:"active" message:"gestartet" progress:0];
+            [self loadJudgeStatus:nil];
+        });
+    };
+    var askOverwrite = function()
+    {
+        var done = 0;
+        for (var m = 0; m < (st.models || []).length; m++)
+            if (st.models[m].model === prov.model)
+                done = st.models[m].n_ok;
+        if (!done)
+        {
+            payload.overwrite = 0;
+            send();
             return;
         }
-    }
+        [OVDialog choose:done + " Briefe hat " + prov.model + " bereits bewertet." info:"Nur fehlende und fehlerhafte Briefe bewerten oder alle neu?"
+                 buttons:["Nur fehlende", "Alle neu bewerten", "Abbrechen"] then:function(index)
+        {
+            if (index < 0 || index > 1)
+                return;
+            payload.overwrite = index === 1 ? 1 : 0;
+            send();
+        }];
+    };
 
-    var payload = { provider: prov.id };
     if (prov.external)
-    {
-        var answer = prompt("Die Brieftexte dieses Datensatzes werden an die externe API gesendet (" + prov.label + ", " + prov.model + ").\n" +
-                            "Briefe mit Geburtsdatum oder Namen mit Anrede werden automatisch zurückgehalten.\n\n" +
-                            "Nur fortfahren, wenn der Datenschutz dem zugestimmt hat. Zum Bestätigen EXTERN eingeben:", "");
-        if (answer === null)
-            return;
-        if (answer !== "EXTERN")
+        [OVDialog prompt:"Brieftexte an die externe API senden?"
+                    info:"Die Briefe dieses Datensatzes gehen an " + prov.label + ". Briefe mit Geburtsdatum oder Namen mit Anrede werden zurückgehalten. " +
+                         "Nur fortfahren, wenn der Datenschutz zugestimmt hat. Zum Bestätigen EXTERN eingeben."
+                   value:"" ok:"Senden" then:function(answer)
         {
-            alert("Nicht bestätigt. Abgebrochen.");
-            return;
-        }
-        payload.confirm = "EXTERN";
-    }
-    else if (!confirm("Alle Briefe dieses Datensatzes vom lokalen Modell " + prov.model + " bewerten lassen?"))
+            if (answer === nil)
+                return;
+            if (answer !== "EXTERN")
+            {
+                OVAlert("Nicht bestätigt.", "Es wurde nichts gesendet.");
+                return;
+            }
+            payload.confirm = "EXTERN";
+            askOverwrite();
+        }];
+    else
+        [OVDialog confirm:"Briefe von " + prov.label + " bewerten lassen?" info:"Alle " + (st.n_items || "") + " Briefe dieses Datensatzes; die Briefe bleiben im Haus."
+                       ok:"Bewerten lassen" then:function(yes) { if (yes) askOverwrite(); }];
+}
+
+- (void)stopJudge:(id)sender
+{
+    if (!_currentSet)
         return;
-
-    var done = 0;
-    for (var m = 0; m < (st.models || []).length; m++)
-        if (st.models[m].model === prov.model)
-            done = st.models[m].n_ok;
-    payload.overwrite = (done > 0 && confirm(done + " Briefe hat " + prov.model + " bereits bewertet. Auch diese neu bewerten lassen?\n" +
-                                            "(Abbrechen = nur fehlende und fehlerhafte Briefe)")) ? 1 : 0;
-
-    OTPostJSON("/BBB/validation/sets/" + _currentSet.id + "/judge", payload, 60.0, function(res, error)
+    var running = (_judgeStatus && _judgeStatus.running) ? _judgeStatus.running : [];
+    if (!running.length)
     {
-        if (!res || res.error)
-        {
-            alert("KI-Judge nicht gestartet: " + (res && res.error ? res.error : "keine Antwort vom Server"));
+        OVAlert("Für diesen Datensatz läuft kein KI-Judge.");
+        return;
+    }
+    var setId = _currentSet.id, prov = [self _selectedJudge], payload = {}, question;
+    if (prov && running.indexOf(prov.id) >= 0)
+    {
+        payload.provider = prov.id;
+        question = "Lauf von " + prov.label + " beenden?";
+    }
+    else
+        question = "Alle laufenden KI-Judge-Läufe dieses Datensatzes beenden?";
+
+    [OVDialog confirm:question info:"Der Brief, der gerade bewertet wird, wird noch abgeschlossen." ok:"Beenden" then:function(yes)
+    {
+        if (!yes)
             return;
-        }
-        _judgeActive = YES;
-        [self loadJudgeStatus:nil];
-    });
+        OTPostJSON("/BBB/validation/sets/" + setId + "/judge/stop", payload, 60.0, function(res, error)
+        {
+            if (!res || res.error)
+            {
+                OVAlert("Nicht beendet.", res && res.error ? res.error : "Keine Antwort vom Server.");
+                return;
+            }
+            var parts = [];
+            if (res.stopping)
+                parts.push(res.stopping + " Lauf endet nach dem aktuellen Brief");
+            if (res.removed)
+                parts.push(res.removed + " wartender Lauf entfernt");
+            if (res.failed)
+                parts.push(res.failed + " hängender Lauf beendet");
+            OVAlert(parts.length ? parts.join(", ") + "." : "Es war kein Lauf mehr aktiv.");
+            [self loadJudgeStatus:nil];
+        });
+    }];
+}
+
+- (void)clearJudgeErrors:(id)sender
+{
+    if (!_currentSet)
+        return;
+    var setId = _currentSet.id;
+    [OVDialog confirm:"Fehlerprotokoll der KI-Judges löschen?"
+                 info:"Entfernt alle fehlgeschlagenen KI-Bewertungen dieses Datensatzes, etwa Verbindungsfehler oder zurückgehaltene Briefe. " +
+                      "Gültige Bewertungen bleiben erhalten; Modelle mit laufendem Lauf werden übersprungen."
+                   ok:"Löschen" then:function(yes)
+    {
+        if (!yes)
+            return;
+        OTPostJSON("/BBB/validation/sets/" + setId + "/judge/clear_errors", {}, 60.0, function(res, error)
+        {
+            if (!res || res.error)
+            {
+                OVAlert("Nicht gelöscht.", res && res.error ? res.error : "Keine Antwort vom Server.");
+                return;
+            }
+            OVAlert(res.deleted + " fehlerhafte KI-Bewertungen gelöscht.",
+                    res.skipped_models && res.skipped_models.length ? "Übersprungen, weil gerade ein Lauf aktiv ist: " + res.skipped_models.join(", ") : nil);
+            [self loadJudgeStatus:nil];
+        });
+    }];
 }
 
 - (void)freezeJudgeSet:(id)sender
 {
     if (!_currentSet)
         return;
-    var models = (_judgeStatus && _judgeStatus.models) ? _judgeStatus.models : [];
-    if (!models.length)
+    var prov = [self _selectedJudge], models = (_judgeStatus && _judgeStatus.models) ? _judgeStatus.models : [], info = nil;
+    for (var k = 0; k < models.length; k++)
+        if (prov && models[k].model === prov.model)
+            info = models[k];
+    if (!prov || !info || !info.n_ok)
     {
-        alert("Es gibt noch keine KI-Bewertungen für diesen Datensatz.");
+        OVAlert("Der ausgewählte Judge hat diesen Datensatz noch nicht bewertet.");
         return;
     }
-    var model = models[0].model;
-    if (models.length > 1)
+    if (info.n_ok < _judgeStatus.n_items)
     {
-        var q = "Aus welchem KI-Judge soll die Referenz entstehen?\n";
-        for (var k = 0; k < models.length; k++)
-            q += "\n" + (k + 1) + " = " + models[k].model + " (" + models[k].n_ok + " von " + _judgeStatus.n_items + " Briefen bewertet)";
-        var pick = prompt(q + "\n\nNummer eingeben:", "1");
-        if (pick === null)
-            return;
-        var chosen = models[parseInt(pick, 10) - 1];
-        if (!chosen)
-        {
-            alert("Ungültige Auswahl. Abgebrochen.");
-            return;
-        }
-        model = chosen.model;
-    }
-    if (![self _confirmSetName:"Referenz aus den Urteilen von " + model + " einfrieren? Sie dient dann als Basis für Regressionstests, bis eine ärztliche Referenz vorliegt."])
+        OVAlert(prov.model + " hat erst " + info.n_ok + " von " + _judgeStatus.n_items + " Briefen fehlerfrei bewertet. " +
+              "Fehlende oder fehlerhafte Briefe mit „Bewerten lassen …“ nachholen.");
         return;
-    [self _postSetAction:"freeze" payload:{ confirm: _currentSet.name, by: [self reviewer], source: "judge", model: model }
-                 message:"KI-Referenz aus " + model + " eingefroren."];
+    }
+    [self _confirmSetName:"KI-Referenz aus " + prov.model + " einfrieren?" then:function()
+    {
+        [self _postSetAction:"freeze" payload:{ confirm: _currentSet.name, by: [self reviewer], source: "judge", model: prov.model }
+                     message:"KI-Referenz aus " + prov.model + " eingefroren. Sie dient als Basis für Regressionstests, bis eine ärztliche Referenz vorliegt."];
+    }];
 }
 
 - (void)loadRuns:(id)sender
@@ -1565,8 +1858,18 @@ function OVTextArea(frame, monospace)
         [_runsTable reloadData];
         _runsActive = NO;
         for (var i = 0; i < _runs.length; i++)
-            if (_runs[i].status === "queued" || _runs[i].status === "running")
+        {
+            var r = _runs[i], hid = "validation_run_" + r.id;
+            if (r.status === "queued" || r.status === "running")
+            {
                 _runsActive = YES;
+                [self _hudTask:hid name:"Regressionslauf " + r.id state:"active"
+                       message:(r.status === "queued" ? "wartet auf den Minion-Worker" : "Brief für Brief") progress:r.progress || 0];
+            }
+            else if (_hudTasks[hid])
+                [self _hudTask:hid name:"" state:(r.status === "finished" ? "finished" : "failed")
+                       message:(r.status === "finished" ? "abgeschlossen" : (r.error || r.status)) progress:100];
+        }
         [self _updatePolling];
         [self _showRunDetail];
     });
@@ -1598,19 +1901,22 @@ function OVTextArea(frame, monospace)
     _pollTimer = nil;
 }
 
-- (BOOL)_confirmSetName:(CPString)aQuestion
+- (void)_confirmSetName:(CPString)aQuestion then:(Function)aCallback
 {
     if (!_currentSet)
-        return NO;
-    var answer = prompt(aQuestion + "\n\nZum Bestätigen den Namen des Datensatzes eingeben:\n" + _currentSet.name, "");
-    if (answer === null)
-        return NO;
-    if (answer !== _currentSet.name)
+        return;
+    var name = _currentSet.name;
+    [OVDialog prompt:aQuestion info:"Zum Bestätigen den Namen des Datensatzes eingeben: " + name value:"" ok:"Bestätigen" then:function(answer)
     {
-        alert("Der Name stimmt nicht überein. Abgebrochen.");
-        return NO;
-    }
-    return YES;
+        if (answer === nil)
+            return;
+        if (answer !== name)
+        {
+            OVAlert("Der Name stimmt nicht überein.", "Es wurde nichts geändert.");
+            return;
+        }
+        aCallback();
+    }];
 }
 
 - (void)_postSetAction:(CPString)aPath payload:(id)aPayload message:(CPString)aMessage
@@ -1627,11 +1933,11 @@ function OVTextArea(frame, monospace)
                     o.push("#" + res.open[i].position + " " + (res.open[i].status === "conflict" ? "Abweichung" : "unvollständig"));
                 msg += "\n" + o.join(", ");
             }
-            alert(msg);
+            OVAlert(msg);
             return;
         }
         if (aMessage)
-            alert(aMessage);
+            OVAlert(aMessage);
         [self loadSets:nil];
         [self refreshRegressionTab:nil];
     });
@@ -1639,21 +1945,23 @@ function OVTextArea(frame, monospace)
 
 - (void)freezeSet:(id)sender
 {
-    if (![self _confirmSetName:"Referenz einfrieren? Danach sind die Bewertungen nicht mehr änderbar."])
-        return;
-    [self _postSetAction:"freeze" payload:{ confirm: _currentSet.name, by: [self reviewer] } message:"Referenz eingefroren."];
+    [self _confirmSetName:"Referenz einfrieren? Danach sind die Bewertungen nicht mehr änderbar." then:function()
+    {
+        [self _postSetAction:"freeze" payload:{ confirm: _currentSet.name, by: [self reviewer] } message:"Referenz eingefroren."];
+    }];
 }
 
 - (void)unfreezeSet:(id)sender
 {
     if (_currentSet && _currentSet.locked)
     {
-        alert("Der Datensatz ist gesperrt. Zum Auftauen zuerst entsperren.");
+        OVAlert("Der Datensatz ist gesperrt. Zum Auftauen zuerst entsperren.");
         return;
     }
-    if (![self _confirmSetName:"Referenz auftauen? Bewertungen werden wieder änderbar; bestehende Regressionsläufe beziehen sich auf die alte Referenz."])
-        return;
-    [self _postSetAction:"unfreeze" payload:{ confirm: _currentSet.name } message:"Referenz aufgetaut."];
+    [self _confirmSetName:"Referenz auftauen? Bewertungen werden wieder änderbar; bestehende Regressionsläufe beziehen sich auf die alte Referenz." then:function()
+    {
+        [self _postSetAction:"unfreeze" payload:{ confirm: _currentSet.name } message:"Referenz aufgetaut."];
+    }];
 }
 
 - (void)toggleLock:(id)sender
@@ -1662,9 +1970,10 @@ function OVTextArea(frame, monospace)
         return;
     if (_currentSet.locked)
     {
-        if (![self _confirmSetName:"Datensatz entsperren? Danach kann er gelöscht werden."])
-            return;
-        [self _postSetAction:"lock" payload:{ locked: 0, confirm: _currentSet.name } message:"Datensatz entsperrt."];
+        [self _confirmSetName:"Datensatz entsperren? Danach kann er gelöscht werden." then:function()
+        {
+            [self _postSetAction:"lock" payload:{ locked: 0, confirm: _currentSet.name } message:"Datensatz entsperrt."];
+        }];
     }
     else
         [self _postSetAction:"lock" payload:{ locked: 1 } message:"Datensatz gesperrt."];
@@ -1676,21 +1985,22 @@ function OVTextArea(frame, monospace)
         return;
     if (_currentSet.locked)
     {
-        alert("Der Datensatz ist gesperrt und kann nicht gelöscht werden. Zuerst entsperren.");
+        OVAlert("Der Datensatz ist gesperrt und kann nicht gelöscht werden. Zuerst entsperren.");
         return;
     }
-    if (![self _confirmSetName:"Datensatz mit allen Bewertungen und Läufen endgültig löschen? Vorher am besten eine Sicherung laden."])
-        return;
-    OVSend("DELETE", "/BBB/validation/sets/" + _currentSet.id, { confirm: _currentSet.name }, 120.0, function(res, error)
+    [self _confirmSetName:"Datensatz mit allen Bewertungen und Läufen endgültig löschen? Vorher am besten eine Sicherung laden." then:function()
     {
-        if (!res || res.error)
+        OVSend("DELETE", "/BBB/validation/sets/" + _currentSet.id, { confirm: _currentSet.name }, 120.0, function(res, error)
         {
-            alert("Nicht gelöscht: " + (res && res.error ? res.error : "keine Antwort vom Server"));
-            return;
-        }
-        _currentSet = nil;
-        [self loadSets:nil];
-    });
+            if (!res || res.error)
+            {
+                OVAlert("Nicht gelöscht.", res && res.error ? res.error : "Keine Antwort vom Server.");
+                return;
+            }
+            _currentSet = nil;
+            [self loadSets:nil];
+        });
+    }];
 }
 
 - (void)_startRun:(CPString)aMode
@@ -1699,23 +2009,27 @@ function OVTextArea(frame, monospace)
         return;
     if (!_currentSet.frozen_at)
     {
-        alert("Erst die Referenz einfrieren.");
+        OVAlert("Erst die Referenz einfrieren.");
         return;
     }
-    var label = prompt(aMode === "stored" ?
-        "Bezeichnung des Laufs (z. B. „Bestand vor Neu-Extraktion“):" :
-        "Bezeichnung des Laufs (z. B. „nach Update Reranker“). Alle " + _currentSet.n_items + " Briefe werden neu extrahiert; das dauert.", "");
-    if (label === null)
-        return;
-    OTPostJSON("/BBB/validation/sets/" + _currentSet.id + "/runs", { mode: aMode, label: label }, 60.0, function(res, error)
+    var setId = _currentSet.id;
+    [OVDialog prompt:(aMode === "stored" ? "Gespeicherte Phenopackets gegen die Referenz prüfen" : "Alle " + _currentSet.n_items + " Briefe neu extrahieren und prüfen")
+                info:(aMode === "stored" ? "Bezeichnung des Laufs, z. B. „Bestand vor Neu-Extraktion“:" : "Bezeichnung des Laufs, z. B. „nach Update Reranker“. Die Neu-Extraktion dauert.")
+               value:"" ok:"Lauf starten" then:function(label)
     {
-        if (!res || res.error)
-        {
-            alert("Lauf nicht gestartet: " + (res && res.error ? res.error : "keine Antwort vom Server"));
+        if (label === nil)
             return;
-        }
-        [self loadRuns:nil];
-    });
+        OTPostJSON("/BBB/validation/sets/" + setId + "/runs", { mode: aMode, label: label }, 60.0, function(res, error)
+        {
+            if (!res || res.error)
+            {
+                OVAlert("Lauf nicht gestartet.", res && res.error ? res.error : "Keine Antwort vom Server.");
+                return;
+            }
+            [self _hudTask:"validation_run_" + res.run_id name:"Regressionslauf " + res.run_id state:"active" message:"gestartet" progress:0];
+            [self loadRuns:nil];
+        });
+    }];
 }
 
 - (void)startReextractRun:(id)sender { [self _startRun:"reextract"]; }
@@ -1732,7 +2046,7 @@ function OVTextArea(frame, monospace)
     var r = [self _selectedRun];
     if (!r || r.status !== "finished")
     {
-        alert("Bitte einen abgeschlossenen Lauf auswählen.");
+        OVAlert("Bitte einen abgeschlossenen Lauf auswählen.");
         return;
     }
     [self _postSetAction:"baseline" payload:{ run_id: r.id } message:"Lauf " + r.id + " ist jetzt die Basis für weitere Vergleiche."];
