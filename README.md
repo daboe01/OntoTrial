@@ -17,6 +17,7 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 - [Extraction and mapping pipeline](#extraction-and-mapping-pipeline)
 - [Ophthalmology engine](#ophthalmology-engine)
 - [Matching and patient similarity](#matching-and-patient-similarity)
+- [Validation](#validation)
 - [Feasibility chat assistant](#feasibility-chat-assistant)
 - [Anonymized export](#anonymized-export)
 - [Long-format export for statistics](#long-format-export-for-statistics)
@@ -48,7 +49,8 @@ Highlights added in recent versions:
 - **Deep mode** – optional two-stage extraction with an unconstrained reasoning trace (pre-extraction table) followed by schema-constrained JSON sampling.
 - **Anonymized export** – de-identified phenopackets for data sharing: no free text, ephemeral subject IDs, month truncation with patient-constant date shift, age top-coding and hierarchical generalization of rare codes (k ≥ 5).
 - **Long-format export** – one row per coded element as CSV or NDJSON, deduplicated across letters, streamed from a server-side cursor and directly readable from R (details [below](#long-format-export-for-statistics)).
-- **Patient similarity** – nearest-neighbour search and greedy 1:n case-control matching with caliper.
+- **Validation** – protected reference data sets drawn from the stock, physician review per extracted element, regression tests of the pipeline against the frozen reference, study metrics with bootstrap confidence intervals and optional LLM judges (Claude or a local model) (details [below](#validation)).
+- **Patient similarity** – laterality-agnostic distance (unilateral vs. bilateral), nearest-neighbour search and greedy 1:n case-control matching with caliper.
 - **Catalog maintenance** – `update_catalogs.pl` for inventory, versioned imports with backups and post-import checks.
 - **Server-side persistence and live sync** – extracted phenopackets are stored by the backend under the `candidate_id` of the request; all open browsers receive the update over the WebSocket.
 - **Real-time progress** – every extraction step reports progress over the WebSocket channel.
@@ -150,6 +152,8 @@ Trials often define criteria for the study eye and safety rules for the fellow e
 - **Hypothesis A:** right eye (OD) = study eye, left eye (OS) = fellow eye.
 - **Hypothesis B:** left eye = study eye, using an on-the-fly mirrored phenopacket.
 
+Mirroring is used only here, where study eye and fellow eye play different roles in the criteria. Patient similarity and case-control matching do not mirror (see [below](#phenopacket-distance-and-case-control-matching)).
+
 The result states whether the patient qualifies via OD, OS or both. Every criterion is written to a trace with status `inclusion_met`, `inclusion_missing`, `exclusion_clear` or `exclusion_violation`; explicitly negated findings count as evidence of absence. Temporal constraints (`relativeTime`) are evaluated against the procedure or medication date of the same group.
 
 ### Longitudinal time-to-eligibility
@@ -167,9 +171,11 @@ A weighted, interpretable distance between two phenopackets in the range 0–1:
 | Phenotypes | 0.20 | Best-match average with HPO ancestor-set (Jaccard) similarity. |
 | Procedures | 0.15 | Best-match average over the OPS hierarchy. |
 | Medications | 0.10 | Best-match average over the ATC levels. |
-| Measurements | 0.15 | Latest value per parameter and eye, scaled difference (visual acuity in logMAR). |
+| Measurements | 0.15 | Latest value per parameter and eye, scaled difference (visual acuity in logMAR); the two eyes are compared as an unordered pair. |
 
-Laterality mismatches are penalized, and the comparison is repeated with the second patient mirrored so that "right eye of A" can match "left eye of B". Missing blocks are ignored and reported as `coverage`. Weights, mirroring and exact matching on sex are configurable per request; `explain: true` returns the matched pairs.
+Laterality is reduced to one class per code: **unilateral** (right or left eye only), **bilateral** (coded as both eyes, or documented for the right and the left eye) or **unknown**. Right and left eye are treated as equivalent; only unilateral vs. bilateral is distinguished (similarity factor 0.8, unknown side 0.9). Phenopackets are not mirrored.
+
+Measurements stay eye-specific. Because right and left are equivalent, the two eyes of both patients are paired either straight (R–R, L–L) or crossed (R–L, L–R), consistently across all parameters: the pairing with more shared parameters wins, then the one with the smaller distance. The result reports the choice as `meas_eyes_crossed`. Missing blocks are ignored and reported as `coverage`. Weights and exact matching on sex are configurable per request; `explain: true` returns the matched pairs.
 
 On top of this, OntoTrial offers k-nearest-neighbour search and greedy 1:ratio case-control matching with optional caliper, with or without replacement.
 
@@ -307,6 +313,29 @@ The long-format export contains pseudonyms (PIZ) and exact dates and is therefor
 
 ---
 
+## Validation
+
+The validation window (actions menu of the candidate list → *Validation...*) serves two purposes with the same data: regression tests that protect the pipeline against unnoticed changes after updates, and a validation study of the extraction.
+
+**Reference data sets.** A data set is a stratified random sample of letters from the stock (by source and year, at most one letter per patient by default, reproducible via a seed). Letter text and extracted phenopacket are copied at sampling time, so later re-extractions or deletions in the stock do not change the set. Sets are locked on creation: a locked set cannot be deleted, and frozen reviews cannot be changed. Database triggers enforce this, and the generic table routes are blocked for the validation tables. *Download backup* exports a complete set as JSON.
+
+**Review.** Physicians rate every extracted element separately for concept (correct, too broad, too specific, wrong, not in the letter, wrong subject), status (negation, suspicion, planned), laterality, date and value, with the correct value where applicable, and add elements that are in the letter but were not extracted. For study sets, a blinded checklist of key variables is filled in first, before the extraction is shown, so that completeness is not biased by the extraction. A share of letters can be reviewed twice, and deliberately injected errors (swapped side, shifted date, removed element) measure reviewer vigilance. Disagreements are resolved by a reviewer named *Konsens*, who sees both reviews. *Freeze reference* turns the resolved reviews into the reference.
+
+**Regression tests.** A run either re-extracts all letters of the set with the current pipeline or checks the stored phenopackets, and compares them with the frozen reference: precision, recall and F1 per domain (strict, and tolerant for hierarchically related codes), plus accuracy of laterality, date, status and value. Each run records a fingerprint of the pipeline (backend, model, prompts, intercepts, filter rules, mapping switches). A run can be set as baseline; later runs are compared with it and flagged as regression when F1 drops by more than `ONTOTRIAL_REGRESSION_TOLERANCE` (default 0.02) in any domain. A CSV report lists every difference per letter.
+
+**Study metrics.** Precision per domain (strict and tolerant), attribute accuracy, recall from the blinded checklist, Cohen's κ between two reviewers and detection rate of injected errors, each with 95 % confidence intervals from a cluster bootstrap over letters. All reviews can be exported in long format as CSV.
+
+**LLM judges.** An LLM can rate the extractions with the same rules as the physicians. Its ratings are stored separately and never mixed with the physician reviews. They can serve as an interim reference for regression tests (*Freeze AI reference*) and are compared with the physicians in the study metrics (sensitivity for errors found by physicians, specificity, κ, missing elements, injected errors); with two judges, their agreement with each other is reported as well.
+
+| Judge | Variables | Notes |
+| :--- | :--- | :--- |
+| Claude (external API) | `ANTHROPIC_API_KEY`, `ONTOTRIAL_JUDGE_MODEL` (default `claude-opus-5-5`), `ONTOTRIAL_JUDGE_MAX_TOKENS`, `ONTOTRIAL_JUDGE_TEMPERATURE` | Letters leave the institution. Requires approval by data protection; every run must be confirmed with `EXTERN`. Letters with a date of birth or a name with salutation are withheld (`ONTOTRIAL_JUDGE_PII_GUARD`, `ONTOTRIAL_JUDGE_PII_REGEX`). |
+| Local model, e.g. GLM-5 | `ONTOTRIAL_JUDGE_LOCAL_MODEL`, `ONTOTRIAL_JUDGE_LOCAL_URL` (default `VLLM_ENDPOINT`), `ONTOTRIAL_JUDGE_LOCAL_KEY` (default `VLLM_API_KEY`), `ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS` (default 32000), `ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE` (default 0), `ONTOTRIAL_JUDGE_LOCAL_THINKING` | OpenAI-compatible endpoint (vLLM) or Ollama; letters stay in-house. |
+
+Judge runs and regression runs are Minion jobs: the variables must be set for the Minion worker, and the worker must be restarted after updating `backend.pl`.
+
+---
+
 ## Feasibility chat assistant
 
 A natural-language assistant for cohort queries such as *"Patients with Sjögren syndrome, superficial punctate keratitis and OSDI > 23"*.
@@ -339,8 +368,13 @@ cpanm Mojolicious Mojo::Pg Minion DateTime
 
 ```bash
 createdb hpo
-psql hpo -f ontotrial_schema.sql
 ```
+
+The schema is created automatically when `backend.pl` starts for the first time. It is maintained as a Mojo::Pg migration in `migrations/ontotrial.sql`: version 1 is the core schema (tables, views, functions, indexes and the extensions `pg_trgm` and `fuzzystrmatch`), version 2 adds the validation tables. The applied version is tracked in `mojo_migrations` under the name `ontotrial`; each version runs exactly once per database. The database user must be allowed to create the two extensions; since PostgreSQL 13 both are trusted, so owning the database is sufficient.
+
+A database that already contains the schema (installations from before the migration) is detected on the first start and registered as core schema version 1 without any change.
+
+To change the schema, append a new section (`-- 3 up`, `-- 3 down`, …) to `migrations/ontotrial.sql`. Never edit a version that has already been rolled out.
 
 Then load the terminologies (see [Keeping terminologies up to date](#keeping-terminologies-up-to-date)) and insert the active prompts into `llm_prompts`:
 
@@ -463,11 +497,18 @@ Recommended order:
 | GET | `/BBB/matches` | Match results with status |
 | POST | `/BBB/trials/:id/time_to_eligibility` | Time-to-eligibility as JSON; optional list of pseudonyms |
 | GET | `/BBB/trials/:id/time_to_eligibility.csv` | Same as CSV; optional `?piz=a,b,c` |
-| POST | `/BBB/phenopacket_distance` | Distance between two candidates or phenopackets (`a`, `b`, `weights`, `mirror`, `exact`, `explain`) |
+| POST | `/BBB/phenopacket_distance` | Distance between two candidates or phenopackets (`a`, `b`, `weights`, `exact`, `explain`) |
 | POST | `/BBB/phenopacket_distance/nearest` | k nearest neighbours of a candidate (`candidate_id`, `k`, `caliper`, `tag`) |
 | POST | `/BBB/export/anonymized_phenopackets` | De-identified phenopackets for a cohort (`tag` or `candidate_ids`, `k` ≥ 5) |
 | GET | `/BBB/export/long/events` | Coded elements in long format, CSV or NDJSON ([parameters](#parameters)) |
 | GET | `/BBB/export/long/patients` | One row per letter with sex and age, same filters |
+| GET, POST | `/BBB/validation/sets` | List validation data sets / draw a new one (`name`, `n`, `purpose`, `seed`, `tag`, `confirm: "ANLEGEN"`) |
+| GET | `/BBB/validation/sets/:id/items`, `/BBB/validation/items/:id` | Letters of a set; one letter with its elements and the reviewer's ratings (`reviewer`) |
+| POST | `/BBB/validation/items/:id/review` | Save ratings (`reviewer`, `reviews`) |
+| POST | `/BBB/validation/sets/:id/freeze`, `/unfreeze`, `/lock` | Freeze or unfreeze the reference (`source: "judge"`, `model` for an AI reference), lock or unlock; confirmation with the set name |
+| POST, GET | `/BBB/validation/sets/:id/runs`, `/BBB/validation/runs/:id` | Start a regression run (`mode`: `reextract` or `stored`), results; `/BBB/validation/runs/:id/report.csv` |
+| POST, GET | `/BBB/validation/sets/:id/judge` | Start an LLM judge (`provider`: `anthropic` or `local`), judge status |
+| GET | `/BBB/validation/sets/:id/study`, `/judgments.csv`, `/export` | Study metrics, reviews as CSV, complete backup as JSON |
 | POST | `/BBB/propensity_match` | Greedy case-control matching (`treated_ids`/`treated_tag`, `control_ids`/`control_tag`, `ratio`, `caliper`, `replace`) |
 
 ### Cohort chat and candidates
@@ -512,9 +553,10 @@ There is no conflict handling: if two users edit the same field at the same time
 | Clinical data | `candidates` (letters, phenopackets, tags), `trials` (FHIR groups), `matches` (results and traces) |
 | Configuration | `llm_prompts`, `ontology_intercepts`, `filter_rules` |
 | Caches | `translation_cache`, `mapping_rerank_cache` |
-| Queue | Minion tables |
+| Validation | `validation_sets`, `validation_items`, `validation_reviews`, `validation_runs`, `validation_run_items`, `validation_ai_reviews` |
+| Queue and migrations | Minion tables, `mojo_migrations` |
 
-The full schema is in `ontotrial_schema.sql`.
+The schema is in `migrations/ontotrial.sql`. Minion manages its own tables, and `update_catalogs.pl` creates `catalog_versions` on its first import. Backup tables created during maintenance (`*_backup_*`, `*_bak_*`) are not part of the schema.
 
 ---
 

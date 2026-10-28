@@ -89,6 +89,31 @@ helper pg => sub {
 
 
 plugin Minion => {Pg => $minion_dsn};
+
+# Kernschema als Mojo::Pg-Migration (migrations/ontotrial.sql). Eine leere
+# Datenbank bekommt das vollständige Schema; eine bestehende Datenbank, die
+# das Schema schon hat, wird beim ersten Start nur als Version 1 markiert.
+# Spätere Schemaänderungen kommen als "-- 2 up" usw. in die Datei.
+{
+    my $file = app->home->child('migrations', 'ontotrial.sql');
+    if (-e $file) {
+        eval {
+            my $db  = app->pg->db;
+            my $mig = app->pg->migrations->name('ontotrial')->from_file("$file");
+            $db->query(q{CREATE TABLE IF NOT EXISTS mojo_migrations (name text PRIMARY KEY, version bigint NOT NULL CHECK (version >= 0))});
+            if ($mig->active == 0 && $db->query(q{SELECT to_regclass('public.candidates') IS NOT NULL AS x})->hash->{x}) {
+                $db->query(q{INSERT INTO mojo_migrations (name, version) VALUES ('ontotrial', 1) ON CONFLICT (name) DO NOTHING});
+                app->log->info('[SCHEMA] Bestehende Datenbank als Kernschema Version 1 übernommen.');
+            }
+            my $before = $mig->active;
+            $mig->migrate;
+            app->log->info('[SCHEMA] Kernschema von Version ' . $before . ' auf ' . $mig->active . ' gebracht.') if $mig->active != $before;
+            1;
+        } or app->log->error("[SCHEMA] Migration des Kernschemas fehlgeschlagen: $@");
+    } else {
+        app->log->warn("[SCHEMA] $file fehlt; das Kernschema wird nicht automatisch angelegt.");
+    }
+}
 # to_string lässt Benutzer und Passwort weg
 app->log->info(sprintf('[CONFIG] Hauptdatenbank: %s | Minion: %s',
     Mojo::URL->new($pg_dsn)->to_string, Mojo::URL->new($minion_dsn)->to_string));
@@ -761,6 +786,13 @@ our %LOINC_PLAUSIBLE = (
     'LOINC:100077-7' => { unit => '{cells}/mm2', min => 200, max => 4500, require => 1 },  # Endothel links
     'LOINC:79887-6'  => { unit => 'um',          min => 250, max => 900,  require => 1 },  # Pachymetrie links
     'LOINC:79888-4'  => { unit => 'um',          min => 250, max => 900,  require => 1 },  # Pachymetrie rechts
+    # PATCH 2026-10-22: lokale Analogcodes Katarakt-OP
+    'LOINC:95327-A'  => { unit => 'diopter',     min => -15, max => 10,   require => 1 },  # Zielrefraktion rechts
+    'LOINC:95328-A'  => { unit => 'diopter',     min => -15, max => 10,   require => 1 },  # Zielrefraktion links
+    'LOINC:64817-A'  => { unit => '%.s',         min => 0,   max => 300,  require => 1 },  # Phako-Zeitleistungswert rechts
+    'LOINC:64818-A'  => { unit => '%.s',         min => 0,   max => 300,  require => 1 },  # Phako-Zeitleistungswert links
+    'LOINC:64819-A'  => { unit => 'diopter',     min => -10, max => 40,   require => 1 },  # IOL-Stärke rechts
+    'LOINC:64820-A'  => { unit => 'diopter',     min => -10, max => 40,   require => 1 },  # IOL-Stärke links
 );
 
 sub loinc_value_plausible {
@@ -868,6 +900,431 @@ helper ophthalmic_loinc_resolver => sub {
         return $r ? { id => $r->{code}, label => $r->{label} } : undef;
     };
 };
+
+# =========================================================================
+# PATCH 2026-10-22: KATARAKT-OP-PARAMETER AUS OPERATIONSBERICHTEN
+# Zielrefraktion und Phako-Zeitleistungswert (CDE, Einheit %·s). LOINC hat
+# für beide keine Codes, daher lokale Analogcodes je Auge, analog zum
+# sphärischen Äquivalent (95327-3 rechts / 95328-1 links):
+#   LOINC:95327-A / LOINC:95328-A  Zielrefraktion rechts / links  (diopter)
+#   LOINC:64817-A / LOINC:64818-A  Phako-Zeitleistungswert r / l  (%.s)
+#   LOINC:64819-A / LOINC:64820-A  IOL-Stärke rechts / links      (diopter),
+#                                  Modell als Modifier "IOL model: …"
+# LOINC kennt keine Codes für Zielrefraktion, CDE oder implantierte IOL-Stärke
+# (nur DICOM: Target Refraction (0022,1037), IOL Power (0022,1090)).
+# Die Werte werden deterministisch aus dem ganzen Dokument gelesen. Aus den
+# LLM-Items wird die Angabe herausgeschnitten, sonst landet die Zielrefraktion
+# über extract_visus_and_refraction als Sphäre/SÄ der gemessenen Refraktion.
+# Labels bewusst ohne "spherical equivalent" (_ppd_refraction_group).
+# =========================================================================
+our %CATARACT_OP_LOINC = (
+    target_refraction => {
+        R        => ['LOINC:95327-A', 'Right eye Target refraction, planned postoperative (local code)'],
+        L        => ['LOINC:95328-A', 'Left eye Target refraction, planned postoperative (local code)'],
+        unit     => 'diopter',
+        mod_unit => '[diop]',
+    },
+    phaco_cde => {
+        R        => ['LOINC:64817-A', 'Right eye Phacoemulsification cumulative dissipated energy (local code)'],
+        L        => ['LOINC:64818-A', 'Left eye Phacoemulsification cumulative dissipated energy (local code)'],
+        unit     => '%.s',
+        mod_unit => '%.s',
+    },
+    iol_power => {
+        R        => ['LOINC:64819-A', 'Right eye Intraocular lens power, implanted (local code)'],
+        L        => ['LOINC:64820-A', 'Left eye Intraocular lens power, implanted (local code)'],
+        unit     => 'diopter',
+        mod_unit => '[diop]',
+    },
+);
+
+our $CAT_SIDE_TOK = qr/RA|LA|OD|OS|rechts|links/i;
+
+# Zielrefraktion: Schlüsselwort, optional (Formel), optional Seite, dann Wert.
+# Zwischen Schlüssel und Wert sind nur wenige feste Füllwörter erlaubt, damit
+# "Zielrefraktion erreicht, Refraktion -0,5" NICHT als Ziel -0,5 gelesen wird.
+our $TR_VAL = qr{
+    (?: [+\-]?\s?\d{1,2}(?:[.,]\d{1,3})?(?![\d.,]*\s*(?:mm|µm|um|%))
+      | emmetrop\w* | plan[ou]?\b
+      | (?:±|\+\s*/?\s*-|\$?\\pm\$?)\s*\$?0(?:[.,]0+)?\$?(?!\s*[.,]?\d) )
+    (?:\s*(?:dptr?\.?|dioptrien|diopters?|D\b|sph\b\.?))?
+}xi;
+
+our $TARGET_REFR_RE = qr{
+    \b(?:ziel[- ]?refr(?:aktion)?\.?|angestrebte\s+(?:post(?:operative)?\s+)?refraktion|refraktionsziel
+       |target\s+refraction|target\s*(?=[:=])
+       |ziel\b(?=\s*(?:[:=]|±|\+\s*/?\s*-|\$?\\pm|[+\-]?\s?\d)))
+    \s*(?:\([^()\n]{0,40}\)\s*)?
+    (?:($CAT_SIDE_TOK)\b\.?\s*)?
+    (?:[:=]\s*)?
+    (?:(?:von|ca\.?|etwa|geplant|angestrebt|bei)\s*)?
+    (?:[:=]\s*)?
+    ($TR_VAL)
+}xi;
+
+# Zweiter Wert in derselben Angabe: "Zielrefraktion RA -0,5 / LA -2,5"
+our $TARGET_REFR_NEXT_RE = qr{\G\s*[/;,]\s*($CAT_SIDE_TOK)\b\.?\s*(?:[:=]\s*)?($TR_VAL)}xi;
+
+# Phako-Zeitleistungswert / CDE: Zahl ohne Doppelpunkt (0:42 ist eine Zeit)
+our $PHACO_CDE_RE = qr{
+    \b(?:(?:phako|phaco)[- ]?)?(?:zeit[- ]?leistungs[- ]?wert|cde|cumulative\s+dissipated\s+energy)\b
+    \s*(?:\([^()\n]{0,30}\)\s*)?
+    (?:($CAT_SIDE_TOK)\b\s*)?
+    (?:[:=]\s*)?
+    (?:ca\.?\s*)?
+    (\d{1,3}(?:[.,]\d{1,3})?)(?![\d.,]*\s*(?::\d|mm|µm|um|dpt|ml\b|min\b))
+    (?:\s*(?:%\s*[x*·.\-]?\s*s(?:ek|ec)?\b\.?|%s\b))?
+}xi;
+
+# IOL-Stärke. Ein Wert zählt nur mit Einheit D/dpt ODER mit Vorzeichen und
+# Nachkommastelle ("+21,0" wie in "CT Asphina 409M. +21,0"), damit "409M"
+# (Modell) oder "IOL mit Injektor" nicht als Stärke gelesen werden.
+our $IOL_POWER_VAL = qr{
+    ( [+\-]?\s?\d{1,2}(?:[.,]\d{1,2})?(?=\s*(?:dptr?\.?|D)\b)
+    | [+\-]\s?\d{1,2}[.,]\d{1,2}(?![\d.,]|\s*(?:mm|µm|um|%|cyl|zyl)) )
+    (?:\s*(?:dptr?\.?|D)\b)?
+}xi;
+# (a) mit Schlüsselwort: "Implantierte IOL: CT Asphina 409M +19,5D", "HKL-Stärke 21,0 dpt"
+our $IOL_LABELED_RE = qr{
+    \b(?:implantierte?n?\s+)?(?:IOL|HKL|hinterkammerlinse|intraokularlinse|kunstlinse)
+    (?:[- ]?st[äa]rke)?\b
+    \s*(?:($CAT_SIDE_TOK)\b\s*)?
+    (?:[:=]\s*)?
+    ([A-Za-z][^\n:;,()]{0,40}?)??\s*
+    (?<![\w.,])$IOL_POWER_VAL
+}xi;
+# (b) ohne Schlüsselwort, nur bekannte Modellnamen: "CT Asphina 409M +21,5D"
+our $IOL_MODEL_RE = qr{
+    \b((?:(?:CT\s*)?Asphina|CT\s*Lucia|AT\s*(?:LISA|Torbi|Elana)|Tecnis|Eyhance|Synergy|Symfony|AcrySof|SN60WF|SA60AT
+       |Clareon|Vivity|PanOptix|enVista|Envista|Vivinex|iSert|Hoya|RayOne|Akreos|Lentis|Precizon|ZCB00|MX60|Bi[- ]?Flex
+       |Artis|Podeye|Podfa|LuxSmart|LuxGood|Isopure|Sensar)\b
+    [^\n:;,()]{0,30}?)\s*
+    (?<![\w.,])$IOL_POWER_VAL
+}xi;
+
+our $PHACO_CONTEXT_RE = qr/\b(?:phako|phaco|katarakt|kataract|cataract|hkl|iol|hinterkammerlinse|kunstlinse|linsenkern)\w*/i;
+
+sub _cat_side {
+    my $s = shift // '';
+    return 'R' if $s =~ /^(?:R|RA|OD|rechts?|rechte[ns]?|right)$/i;
+    return 'L' if $s =~ /^(?:L|LA|OS|links?|linke[ns]?|left)$/i;
+    return undef;
+}
+
+sub _cat_line_side {
+    my $l = shift // '';
+    my $r = $l =~ /\b(?:RA|OD|rechts|rechte[ns]?\s+auge)\b/i ? 1 : 0;
+    my $s = $l =~ /\b(?:LA|OS|links|linke[ns]?\s+auge)\b/i   ? 1 : 0;
+    return $r && !$s ? 'R' : $s && !$r ? 'L' : undef;
+}
+
+# Operiertes Auge aus dem Dokument; bei widersprüchlichen Angaben undef
+sub _cat_doc_side {
+    my $t = shift // '';
+    if ($t =~ /\b(?:operierte[ns]?\s+auge|op[- ]?auge|op[- ]?seite|seite|auge|lokalisation)\s*[:=]\s*($CAT_SIDE_TOK)\b/i) {
+        return _cat_side($1);
+    }
+    my %sides;
+    while ($t =~ /$PHACO_CONTEXT_RE[^\n]{0,60}?\b($CAT_SIDE_TOK)\b/g) { my $s = _cat_side($1); $sides{$s}++ if $s; }
+    while ($t =~ /\b(RA|LA|OD|OS)\b[^\n]{0,40}?$PHACO_CONTEXT_RE/g)  { my $s = _cat_side($1); $sides{$s}++ if $s; }
+    while ($t =~ /\b(?:am|des|das)\s+(rechte|linke)n?\s+auge/gi)      { my $s = _cat_side($1); $sides{$s}++ if $s; }
+    my @s = keys %sides;
+    return @s == 1 ? $s[0] : undef;
+}
+
+# Datum der Operation ("OP-Datum: 1.7.2026"), sonst Briefdatum, sonst undef
+sub _cat_doc_date {
+    my ($t, $ref) = @_;
+    return undef unless defined $t;
+    my $iso = sub {
+        my ($d, $m, $y) = @_;
+        $y += ($y < 70 ? 2000 : 1900) if $y < 100;
+        return undef unless $d >= 1 && $d <= 31 && $m >= 1 && $m <= 12;
+        return sprintf('%04d-%02d-%02d', $y, $m, $d);
+    };
+    # (eigener Parser: extract_event_date maskiert Datumsangaben wie "1.7.2026")
+    if ($t =~ /\b(?:OP[- ]?Datum|Operationsdatum|Datum\s+der\s+Operation|operiert\s+am)\s*:?\s*([0-3]?\d)\.\s?([01]?\d)\.\s?(\d{4}|\d{2})\b/i) {
+        return $iso->($1, $2, $3);
+    }
+    # Briefdatum im Kopf: "Freiburg, den 1.7.2026"
+    if (substr($t, 0, 3000) =~ /,\s*den\s+([0-3]?\d)\.\s?([01]?\d)\.\s?(\d{4})\b/) {
+        return $iso->($1, $2, $3);
+    }
+    return undef;
+}
+
+sub _cat_value {
+    my ($kind, $raw) = @_;
+    return undef unless defined $raw;
+    return 0 if $kind eq 'target_refraction' && $raw =~ /^\s*(?:emmetrop|plan|±|\+\s*\/?\s*-|\$?\\pm)/i;
+    return undef unless $raw =~ /^\s*([+\-]?)\s?(\d+(?:[.,]\d+)?)/;
+    (my $v = "$1$2") =~ s/,/./;
+    return $v + 0;
+}
+
+sub _cat_normalize {
+    my $t = shift // '';
+    $t =~ s/[\x{2212}\x{2013}\x{2011}]/-/g;
+    $t =~ s/[\x{a0}\x{202f}]/ /g;
+    return $t;
+}
+
+# Liefert ({ kind, value, side ('R'/'L'/undef), raw }, ...)
+# %o: fallback_side ('R'/'L'), doc_text (für die Seitenbestimmung), ctx (Phako-Kontext erzwingen)
+sub extract_cataract_op_parameters {
+    my ($text, %o) = @_;
+    return () unless defined $text && length $text;
+    my $t = _cat_normalize($text);
+    my $ctx = $o{ctx} || $t =~ $PHACO_CONTEXT_RE;
+
+    my ($doc_side, $doc_done);
+    my (@out, %first);
+    for my $line (split /\r?\n/, $t) {
+        my @hits;
+        while ($line =~ /$TARGET_REFR_RE/g) {
+            push @hits, ['target_refraction', $1, $2, $&];
+            while ($line =~ /$TARGET_REFR_NEXT_RE/gc) { push @hits, ['target_refraction', $1, $2, $&]; }
+        }
+        if ($ctx) {
+            while ($line =~ /$PHACO_CDE_RE/g) { push @hits, ['phaco_cde', $1, $2, $&]; }
+        }
+        my $iol_n = 0;
+        while ($line =~ /$IOL_LABELED_RE/g) { $iol_n++; push @hits, ['iol_power', $1, $3, $&, $2]; }
+        if (!$iol_n && $ctx) {
+            while ($line =~ /$IOL_MODEL_RE/g) { push @hits, ['iol_power', undef, $2, $&, $1]; }
+        }
+        for my $h (@hits) {
+            my ($kind, $stok, $raw, $match, $model) = @$h;
+            my $val = _cat_value($kind, $raw);
+            next unless defined $val;
+            my $side = _cat_side($stok) // _cat_line_side($line);
+            unless ($side) {
+                unless ($doc_done++) { $doc_side = _cat_doc_side(defined $o{doc_text} ? _cat_normalize($o{doc_text}) : $t); }
+                $side = $doc_side // $o{fallback_side};
+            }
+            my $key = $kind . '|' . ($side // '-');
+            if (exists $first{$key}) {
+                warn "[CATARACT OP] Weiterer Wert für $key ignoriert: '$match'\n";
+                next;
+            }
+            $first{$key} = 1;
+            $model = undef if defined $model && $model !~ /\p{L}/;
+            $model =~ s/^\s+|[\s.]+$//g if defined $model;
+            push @out, { kind => $kind, value => $val, side => $side, raw => $match,
+                         (defined $model && length $model ? (model => $model) : ()) };
+        }
+    }
+    return @out;
+}
+
+# Schneidet Zielrefraktion/CDE/IOL-Stärke aus einem Text heraus (für LLM-Items)
+sub strip_cataract_op_parameters {
+    my ($text, $ctx) = @_;
+    my $t = _cat_normalize($text // '');
+    $t =~ s/$TARGET_REFR_RE(?:\s*[\/;,]\s*$CAT_SIDE_TOK\b\.?\s*(?:[:=]\s*)?$TR_VAL)*/ /g;
+    my $c = $ctx || $t =~ $PHACO_CONTEXT_RE;
+    $t =~ s/$PHACO_CDE_RE/ /g if $c;
+    my $n = ($t =~ s/$IOL_LABELED_RE/ /g);
+    $t =~ s/$IOL_MODEL_RE/ /g if !$n && $c;
+    return $t;
+}
+
+sub build_cataract_op_measurements {
+    my ($params, $ref_date) = @_;
+    my @m;
+    for my $p (@{ $params // [] }) {
+        my $def = $CATARACT_OP_LOINC{ $p->{kind} } or next;
+        unless ($p->{side} && $def->{ $p->{side} }) {
+            warn "[CATARACT OP] Keine Seitenangabe für '$p->{raw}' – Messung entfällt.\n";
+            next;
+        }
+        my ($id, $label) = @{ $def->{ $p->{side} } };
+        my $q = { comparator => '=', value => $p->{value}, unit => $def->{unit} };
+        unless (loinc_value_plausible($id, $q)) {
+            warn "[CATARACT OP] Unplausibler Wert '$p->{raw}' -> $id verworfen.\n";
+            next;
+        }
+        push @m, {
+            assay     => { id => $id, label => $label },
+            value     => { quantity => { comparator => '=', value => $p->{value}, unit => { label => $def->{unit} } } },
+            modifiers => [
+                { id => 'LP7753-9', label => "Measurement: = $p->{value} $def->{mod_unit}" },
+                ($p->{model} ? { id => 'LP7753-9', label => "IOL model: $p->{model}" } : ()),
+                ($p->{side} eq 'L' ? { id => 'HP:0012835', label => 'Left' } : { id => 'HP:0012834', label => 'Right' }),
+            ],
+            ($ref_date ? (timeOfCollection => { timestamp => $ref_date }) : ()),
+        };
+    }
+    return @m;
+}
+
+# =========================================================================
+# PATCH 2026-10-23: ENDOTAMPONADE (Silikonöl / Gas / Luft)
+# LOINC kennt keine Tamponade-Codes; OPS 5-158.x1..x5 unterscheidet nur
+# Luft / andere Gase / Silikonöl, ohne Gasart, Konzentration und Viskosität,
+# und deckt DMEK nicht ab. Daher lokale Analogcodes je Auge und Ort:
+#   LOINC:64821-A / 64822-A  Glaskörperraum (Vitrektomie)     rechts / links
+#   LOINC:64823-A / 64824-A  Vorderkammer (DMEK, DSAEK, Rebubbling) r / l
+# Wert: value.ontologyClass NCIT:C25250 mit normiertem Label, z. B.
+#   "Silicone oil 5000 cSt", "Heavy silicone oil", "SF6 20%", "C3F8 14%", "Air".
+# Bei mehreren Angaben ("gegen Luft und dann gegen 5000er Silikonöl") gilt die
+# letzte im Text; Silikonölentfernung zählt nicht als Tamponade.
+# =========================================================================
+our %TAMPONADE_LOINC = (
+    vitreous => {
+        R => ['LOINC:64821-A', 'Right eye Vitreous cavity endotamponade (local code)'],
+        L => ['LOINC:64822-A', 'Left eye Vitreous cavity endotamponade (local code)'],
+    },
+    anterior => {
+        R => ['LOINC:64823-A', 'Right eye Anterior chamber tamponade (local code)'],
+        L => ['LOINC:64824-A', 'Left eye Anterior chamber tamponade (local code)'],
+    },
+);
+
+# Normierte Werte; auch Whitelist für die Anonymisierung
+our $TAMPONADE_LABEL_RE = qr/^(?:Air|Heavy silicone oil|Silicone oil(?: \d{3,4} cSt)?|(?:SF6|C2F6|C3F8)(?: \d{1,2}(?:\.\d)?%)?)$/;
+
+# Fundstellen (Reihenfolge im Text zählt)
+our $TAMP_OIL_RE = qr{
+    (?<heavy> densiron\w* (?:\s*68)? | oxane\s*hd | schwere[sn]?\s+silikon[- ]?öl\w* | heavy\s+silicone\s+oil )
+  | (?: (?<visc1>\d{3,4}) \s* (?:er|cs|cst|mpas)? \s* [- ]? (?:silikon[- ]?|silicon[- ]?)?öl\w* )
+  | (?: (?:siluron|oxane)\s*(?<visc2>\d{3,4}) )
+  | (?: (?<oilw> (?:silikon|silicon)[- ]?(?:öl|oil)\w* ) (?: \s*\(?\s*(?<visc3>\d{3,4}) \s* (?:er|cs|cst|mpas)? \)? )? )
+}xi;
+our $TAMP_GAS_RE = qr{
+    (?: (?<pct1>\d{1,2}(?:[.,]\d)?) \s* (?:%|prozent) \s* (?:-?ige[sn]?\s+)? )?
+    \b(?<gas> SF\s?6 | C\s?2\s?F\s?6 | C\s?3\s?F\s?8 | schwefelhexafluorid | hexafluorethan | perfluorethan | perfluorpropan | octafluorpropan )
+    (?: [- ]?gas\w* )?
+    (?: \s*\(?\s* (?:in\s+)? (?<pct2>\d{1,2}(?:[.,]\d)?) \s* (?:%|prozent) )?
+}xi;
+our $TAMP_AIR_RE = qr{
+    \b(?: luft(?:tamponade|endotamponade|füllung|blase|eingabe)?\b | luft-?\w*(?:füllung|tamponade|austausch) | fluid[- ]air )
+}xi;
+# "Luft" zählt nur mit Tamponade-Kontext im selben Satz
+our $TAMP_AIR_CTX_RE = qr/\b(?:gegen|austausch\w*|exchange|f[üu]ll\w*|gef[üu]llt|tamponade|endotamponade|blase|eingabe|eingegeben|injiz\w*|vorderkammer|VK)\b|tamponade|füllung/i;
+# Silikonöl wird entfernt, nicht eingebracht
+our $TAMP_REMOVAL_RE = qr/(?:entfern|ablass|abgelassen|abgesaugt|ausgelassen|ausgewaschen|herausgespült|removal|removed)\w*/i;
+our $TAMP_NEG_RE     = qr/\b(?:keine|ohne)\s+(?:\w+\s+)?(?:endo)?tamponade|\bBSS[- ]?(?:tamponade|füllung)/i;
+our $TAMP_AC_RE      = qr/\b(?:vorderkammer\w*|VK|DMEK|DSAEK|DSEK|PDEK|rebubbling|re-bubbling|transplantat\w*|descemet\w*|lamelle)\b/i;
+our $TAMP_VIT_RE     = qr/\b(?:vitrektomie\w*|PPV|pars[- ]plana|glask[öo]rper\w*|netzhaut\w*|retina\w*|intraokular\w*)\b/i;
+our $TAMP_TOKEN_RE   = qr/silikon[- ]?öl|silicone?\s+oil|\b\d{3,4}\s*er\s+öl\b|densiron|oxane|siluron|\bSF\s?6\b|\bC\s?[23]\s?F\s?[68]\b|schwefelhexafluorid|perfluorpropan|perfluorethan|hexafluorethan/i;
+
+# Operiertes Auge: wie bei der Katarakt-OP, zusätzlich Diagnose-/Eingriffszeilen
+# ("Diagnose: Endophthalmitis RA", "PPV LA", "DMEK rechts"); widersprüchlich -> undef
+sub _tamp_doc_side {
+    my $t = shift // '';
+    my $s = _cat_doc_side($t);
+    return $s if $s;
+    my %sides;
+    while ($t =~ /\b(?:diagnose\w*|eingriff\w*|operation\w*|PPV|vitrektomie\w*|DMEK|DSAEK|DSEK|keratoplastik\w*|rebubbling|re-bubbling)\b[^\n]{0,80}?\b($CAT_SIDE_TOK)\b/gi) {
+        my $x = _cat_side($1); $sides{$x}++ if $x;
+    }
+    my @s = keys %sides;
+    return @s == 1 ? $s[0] : undef;
+}
+
+sub _tamp_label {
+    my ($kind, $x) = @_;
+    if ($kind eq 'oil') {
+        return 'Heavy silicone oil' if $x->{heavy};
+        my $v = $x->{visc};
+        return (defined $v && $v >= 500 && $v <= 6000) ? "Silicone oil $v cSt" : 'Silicone oil';
+    }
+    if ($kind eq 'gas') {
+        (my $g = uc($x->{gas} // '')) =~ s/\s+//g;
+        $g = 'SF6'  if $g =~ /SCHWEFEL/;
+        $g = 'C2F6' if $g =~ /HEXAFLUORETHAN|PERFLUORETHAN/;
+        $g = 'C3F8' if $g =~ /PERFLUORPROPAN|OCTAFLUORPROPAN/;
+        return undef unless $g =~ /^(?:SF6|C2F6|C3F8)$/;
+        my $p = $x->{pct};
+        if (defined $p) { $p =~ s/,/./; $p += 0; }
+        return (defined $p && $p > 0 && $p <= 100) ? "$g $p%" : $g;
+    }
+    return 'Air';
+}
+
+# Liefert ({ site => 'vitreous'|'anterior', side, label, raw }, ...) – je Ort und Seite die letzte Angabe
+sub extract_endotamponade {
+    my ($text, %o) = @_;
+    return () unless defined $text && length $text;
+    my $t = _cat_normalize($text);
+    my $t_lines = $t;
+    $t =~ s/(\p{L})-\r?\n(\p{Ll})/$1$2/g;        # Silbentrennung am Zeilenende (OCR)
+    $t =~ s/\s*\r?\n\s*/ /g;
+    my $doc_ac  = $t =~ /\b(?:DMEK|DSAEK|DSEK|PDEK|keratoplastik\w*|rebubbling|re-bubbling)\b/i ? 1 : 0;
+    my $doc_vit = $t =~ /\b(?:vitrektomie\w*|PPV|pars[- ]plana)\b/i ? 1 : 0;
+    return () unless $doc_ac || $doc_vit || $o{ctx};
+
+    my ($doc_side, $doc_done);
+    my (%last, @order);
+    for my $s (split /(?<=[.;!])\s+(?=[\p{Lu}\d(])/, $t) {
+        next if $s =~ $TAMP_NEG_RE;
+        my @hits;
+        while ($s =~ /$TAMP_OIL_RE/g) {
+            my %x = (heavy => $+{heavy}, visc => $+{visc1} // $+{visc2} // $+{visc3}, word => $+{oilw} // '');
+            my ($pre, $m, $post) = ($`, $&, $');
+            next if $x{word} =~ $TAMP_REMOVAL_RE || $m =~ $TAMP_REMOVAL_RE
+                 || substr($post, 0, 25) =~ /^\W{0,3}(?:\w+\s+){0,2}$TAMP_REMOVAL_RE/
+                 || substr($pre, -40) =~ /$TAMP_REMOVAL_RE\w*\s+(?:\w+\s+){0,3}$/;
+            # "1000er Öl" ohne "Silikon" nur mit Tamponade-/Austausch-Kontext
+            next if !$x{heavy} && !length $x{word} && $m !~ /silikon|silicon/i && $s !~ /gegen|austausch|tamponade|füllung|entscheidung|eingabe/i;
+            push @hits, [pos($s), 'oil', \%x, $m];
+        }
+        while ($s =~ /$TAMP_GAS_RE/g) {
+            my %x = (gas => $+{gas}, pct => $+{pct2} // $+{pct1});
+            push @hits, [pos($s), 'gas', \%x, $&];
+        }
+        if ($s =~ $TAMP_AIR_CTX_RE) {
+            while ($s =~ /$TAMP_AIR_RE/g) { push @hits, [pos($s), 'air', {}, $&]; }
+        }
+        next unless @hits;
+        my $site = $s =~ $TAMP_AC_RE ? 'anterior'
+                 : $s =~ $TAMP_VIT_RE ? 'vitreous'
+                 : ($doc_ac && !$doc_vit) ? 'anterior'
+                 : ($doc_vit && !$doc_ac) ? 'vitreous'
+                 : ($o{site} // undef);
+        unless ($site) {
+            warn "[TAMPONADE] Ort unklar (Vorderkammer/Glaskörper) in '$s' – übersprungen.\n";
+            next;
+        }
+        my $side = _cat_line_side($s);
+        unless ($side) {
+            unless ($doc_done++) { $doc_side = _tamp_doc_side(defined $o{doc_text} ? _cat_normalize($o{doc_text}) : $t_lines); }
+            $side = $doc_side // $o{fallback_side};
+        }
+        for my $h (sort { $a->[0] <=> $b->[0] } @hits) {
+            my $label = _tamp_label($h->[1], $h->[2]) // next;
+            my $key = $site . '|' . ($side // '-');
+            push @order, $key unless exists $last{$key};
+            $last{$key} = { site => $site, side => $side, label => $label, raw => $h->[3] };
+        }
+    }
+    return map { $last{$_} } @order;
+}
+
+sub build_endotamponade_measurements {
+    my ($items, $ref_date) = @_;
+    my @m;
+    for my $p (@{ $items // [] }) {
+        my $def = $TAMPONADE_LOINC{ $p->{site} } or next;
+        unless ($p->{side} && $def->{ $p->{side} }) {
+            warn "[TAMPONADE] Keine Seitenangabe für '$p->{raw}' – Messung entfällt.\n";
+            next;
+        }
+        next unless $p->{label} =~ $TAMPONADE_LABEL_RE;
+        my ($id, $label) = @{ $def->{ $p->{side} } };
+        push @m, {
+            assay     => { id => $id, label => $label },
+            value     => { ontologyClass => { id => 'NCIT:C25250', label => $p->{label} } },
+            modifiers => [
+                { id => 'LP7753-9', label => "Endotamponade: $p->{label}" },
+                ($p->{side} eq 'L' ? { id => 'HP:0012835', label => 'Left' } : { id => 'HP:0012834', label => 'Right' }),
+            ],
+            ($ref_date ? (timeOfCollection => { timestamp => $ref_date }) : ()),
+        };
+    }
+    return @m;
+}
 
 # =========================================================================
 # MESSWERT-MASKIERUNG: Zahlen mit Vergleichsoperator oder Einheit sind keine Jahre
@@ -2601,7 +3058,8 @@ sub is_plausible_code {
     return ($c =~ /^[A-Z]\d{2}(?:\.[0-9A-Z\-]{1,4})?$/i)                  ? 1 : 0 if $domain eq 'icd10';
     return ($c =~ /^\d-[0-9a-z]{2,3}(?:\.[0-9a-z]{1,3})?$/i)              ? 1 : 0 if $domain eq 'ops';
     return ($c =~ /^[A-Z]{1,2}\d{2}(?:[A-Z]{1,2}(?:\d{2})?)?$/i)          ? 1 : 0 if $domain eq 'atc';
-    return ($c =~ /^(?:\d{1,7}-\d[a-z]?|LP\d+-\d|CLASS-.+)$/i)            ? 1 : 0 if $domain eq 'loinc';
+    # PATCH 2026-10-22: lokale Analogcodes mit Buchstabe statt Prüfziffer (95327-A)
+    return ($c =~ /^(?:\d{1,7}-(?:\d[a-z]?|[A-Z])|LP\d+-\d|CLASS-.+)$/i)  ? 1 : 0 if $domain eq 'loinc';
     return 1;
 }
 
@@ -3449,7 +3907,7 @@ sub build_loinc_payload_query {
     # Die feste Zuordnungslogik greift jetzt auch auf den englischen Analytnamen,
     # aber ohne Rohtext, Werte oder Einheiten.
     my $p = prepare_loinc_search_term($with_eye, $core);
-    return $p if $p =~ /^(?:LOINC:)?\d+-\d/i;
+    return $p if $p =~ /^(?:LOINC:)?\d+-[\dA-Z]/i;   # PATCH 2026-10-22: auch 95327-A
     return strip_lab_values($p);
 }
 
@@ -5361,6 +5819,9 @@ helper generate_phenopacket_impl => sub {
         };
     }
     $reference_date //= POSIX::strftime("%Y-%m-%d", localtime);
+    # PATCH 2026-10-23: TT.MM.JJ normalisieren und als JJ.MM.TT vertauschte Briefdaten korrigieren
+    $reference_date = normalize_reference_day($reference_date) // $reference_date;
+    $reference_date = fix_swapped_reference_day($reference_date, $text_content);
 
     print STDERR "\n=======================================================\n";
     print STDERR ">>> [PHENOPACKET PIPELINE START] Candidate ID: " . ($candidate_id // 'none') . " | RefDate: $reference_date | Deep Mode: " . ($deep_mode ? "ON" : "OFF") . "\n";
@@ -5447,6 +5908,7 @@ helper generate_phenopacket_impl => sub {
             }
         } @$atomic_items;
         
+        my $cat_ctx = ($text_content =~ $PHACO_CONTEXT_RE) ? 1 : 0;   # PATCH 2026-10-22
         # -------------------------------------------------------------
         # Anatomie-Schutz & Syntaktische Fehlinterpretationen korrigieren
         # -------------------------------------------------------------
@@ -5587,6 +6049,23 @@ helper generate_phenopacket_impl => sub {
                 $item->{domain} = 'icd10';
             }
 
+            # PATCH 2026-10-23: Silikonöl/SF6/C2F6/C3F8 sind Tamponaden, keine Medikamente
+            # (sonst z. B. Dimeticon oder Ultraschall-Kontrastmittel); übernimmt der Dokumentscan.
+            if (($item->{domain} // '') eq 'atc' && ($item->{verbatim_text} // '') =~ $TAMP_TOKEN_RE) {
+                $self->app->log->info("[TAMPONADE] ATC-Item '$item->{verbatim_text}' übernimmt der Dokumentscan.");
+                $item->{domain} = 'skip';
+            }
+
+            # PATCH 2026-10-22: Items, die nur aus Zielrefraktion/CDE/IOL-Stärke bestehen, übernimmt
+            # der Dokumentscan (build_cataract_op_measurements); keine HPO/OPS-Fehlkodierung.
+            if (($item->{domain} // '') ne 'loinc') {
+                my $rest = strip_cataract_op_parameters($item->{verbatim_text}, $cat_ctx);
+                if ($rest ne _cat_normalize($item->{verbatim_text} // '') && $rest !~ /\p{L}{4,}/) {
+                    $self->app->log->info("[CATARACT OP] Item '$item->{verbatim_text}' ($item->{domain}) übernimmt der Dokumentscan.");
+                    $item->{domain} = 'skip';
+                }
+            }
+
         }
 
         # Benannte Entzündungen (…itis) zusätzlich als Diagnose kodieren.
@@ -5609,6 +6088,28 @@ helper generate_phenopacket_impl => sub {
         my @disease_promises;
         my @procedure_promises;
         my @medication_promises;
+
+        # PATCH 2026-10-22: Zielrefraktion, Phako-Zeitleistungswert und IOL-Stärke aus dem ganzen Dokument
+        my %cat_done;
+        my $cat_date;
+        {
+            # Messdatum = OP-Datum aus dem Bericht, nicht das Verarbeitungsdatum
+            $cat_date = _cat_doc_date($text_content, $reference_date);
+            my @cat_params = extract_cataract_op_parameters($text_content);
+            if (my @cat_meas = build_cataract_op_measurements(\@cat_params, $cat_date // $reference_date)) {
+                $cat_done{ $_->{kind} } = 1 for grep { $_->{side} } @cat_params;
+                $self->app->log->info('[CATARACT OP] Dokumentscan: ' . join(', ',
+                    map { "$_->{assay}{id} = $_->{value}{quantity}{value}" } @cat_meas));
+                push @measurement_promises, Mojo::Promise->resolve(\@cat_meas);
+            }
+            # PATCH 2026-10-23: Endotamponade (Silikonöl / Gas / Luft)
+            if (my @tamp_meas = build_endotamponade_measurements([ extract_endotamponade($text_content) ],
+                                                                 $cat_date // $reference_date)) {
+                $self->app->log->info('[TAMPONADE] Dokumentscan: ' . join(', ',
+                    map { "$_->{assay}{id} = $_->{value}{ontologyClass}{label}" } @tamp_meas));
+                push @measurement_promises, Mojo::Promise->resolve(\@tamp_meas);
+            }
+        }
 
         my $detected_sex = 'UNKNOWN';
         my $detected_age_iso = undef;
@@ -5690,6 +6191,29 @@ helper generate_phenopacket_impl => sub {
             if ($domain eq 'loinc'
                 || $canon_term =~ /\b(?:visus|visual\s*acuity|refraction|refraktion|skiaskop\w*|skia|tensio|iop|tonometrie|augendruck|blutdruck|bp|rr)\b/i
                 || $v_text =~ /\b(?:refraktion|skiaskop\w*|c[- ]?skia\w*)\b/i) {
+
+                # PATCH 2026-10-22: Zielrefraktion/CDE/IOL-Stärke nicht als gemessene Refraktion werten.
+                # Fand der Dokumentscan keine Seite, Item-Lateralität als Fallback nutzen.
+                # PATCH 2026-10-23: Tamponade-Angaben ("SF6 20%") nicht als Messwert parsen
+                next if $v_text =~ $TAMP_TOKEN_RE
+                     && $v_text !~ /\b(?:visus|tensio|iod|iop|refrakt\w*|sph|cyl|endothel\w*|pachy\w*)\b/i;
+
+                # (kein Bare-Block: "next" muss die Item-Schleife treffen)
+                my $cat_rest = strip_cataract_op_parameters($v_text, $cat_ctx);
+                if ($cat_rest ne _cat_normalize($v_text)) {
+                    my @cat_p = grep { !$cat_done{ $_->{kind} } }
+                                extract_cataract_op_parameters($v_text, ctx => $cat_ctx,
+                                    fallback_side => _cat_side($item_lat), doc_text => $text_content);
+                    if (my @cat_m = build_cataract_op_measurements(\@cat_p,
+                            $cat_date // ((($item_timestamp // '') =~ /^\d{4}-\d{2}-\d{2}$/) ? $item_timestamp : $reference_date))) {
+                        $cat_done{ $_->{kind} } = 1 for grep { $_->{side} } @cat_p;
+                        push @measurement_promises, Mojo::Promise->resolve(\@cat_m);
+                    }
+                    next unless $cat_rest =~ /\d/
+                        && $cat_rest =~ /\b(?:visus|refraktion|refraction|tensio|iop|sph|cyl|skia\w*|endothel\w*|pachy\w*)/i;
+                    $v_text = $cat_rest;
+                    $canon_term = '' if $canon_term =~ /\b(?:target|ziel|cde|cumulative|zeitleistung|iol|intraocular\s+lens|linse|lens\s+power)/i;
+                }
 
                 my $is_visus_candidate = (
                     $canon_term =~ /\b(?:visual\s*acuity|visus|refraction|refraktion|skiaskop\w*|c[- ]?skia\w*|sphere|sphäre|cylinder|zylinder)\b/i
@@ -5929,6 +6453,7 @@ helper generate_phenopacket_impl => sub {
 
                         my $med_obj = { agent => { id => $mapped_atc->{id}, label => $chosen_med_label } };
                         $med_obj->{performedTime} = $item_timestamp if defined $item_timestamp;
+                        $med_obj->{bodySite}      = $lat_code if defined $lat_code;
                         return $med_obj;
                     });
                     push @medication_promises, $p_atc_auto;
@@ -6117,7 +6642,10 @@ helper generate_phenopacket_impl => sub {
                 my $mv  = ref $m->{value} eq 'HASH' ? $m->{value} : {};
                 my $val = (ref $mv->{quantity} eq 'HASH' && defined $mv->{quantity}{value})
                         ? $mv->{quantity}{value}
-                        : (ref $mv->{ontologyClass} eq 'HASH' ? ($mv->{ontologyClass}{id} // '') : '');
+                        : (ref $mv->{ontologyClass} eq 'HASH'
+                            # PATCH 2026-10-23: Label mitzählen, sonst fallen z. B. "Air" und "SF6 20%"
+                            # (beide NCIT:C25250) zu einer Messung zusammen
+                            ? (($mv->{ontologyClass}{id} // '') . '#' . ($mv->{ontologyClass}{label} // '')) : '');
                 my $lat = 'none';
                 foreach my $mod (@{$m->{modifiers} // []}) {
                     if ($mod->{id} =~ /^HP:001283[245]$/) {
@@ -6279,19 +6807,26 @@ helper generate_phenopacket_impl => sub {
             foreach my $m (@raw_medications) {
                 next unless $m && $m->{agent}{id};
                 my $m_time = $m->{performedTime};
+                my $m_site = $m->{bodySite} ? ($m->{bodySite}{id} // '') : '';
 
                 my $is_duplicate = 0;
                 for my $existing (@final_medications) {
                     if ($existing->{agent}{id} eq $m->{agent}{id}) {
                         my $e_time = $existing->{performedTime};
+                        my $e_site = $existing->{bodySite} ? ($existing->{bodySite}{id} // '') : '';
+
+                        # Verschiedene Augen sind keine Dubletten; eine fehlende Seite wird nachgetragen
+                        next if $m_site ne '' && $e_site ne '' && $m_site ne $e_site;
 
                         if (!defined $m_time || !defined $e_time || $m_time eq $e_time) {
                             $existing->{performedTime} //= $m_time;
+                            $existing->{bodySite}      //= $m->{bodySite} if $m->{bodySite};
                             $is_duplicate = 1;
                             last;
                         }
 
                         if (abs(date_diff_in_days($e_time, $m_time)) <= 14) {
+                            $existing->{bodySite} //= $m->{bodySite} if $m->{bodySite};
                             $is_duplicate = 1;
                             last;
                         }
@@ -6461,7 +6996,9 @@ post '/BBB/extract_phenopacket_from_letter' => sub {
 # A) ENDPUNKT: ARZTBRIEF IMPORTIEREN & ASYNCHRON EXTRAHIEREN
 #
 # Payload (zusätzlich zu den bisherigen Feldern):
-#   source              'argos' (Default) | 'dwh' | ...  – Herkunft, Namensraum für doc_id
+#   source              'argos' (Default) | 'dwh' | 'op' | ...  – Herkunft, Namensraum für doc_id
+#                       ('op' u. a. aus ONTOTRIAL_SEPARATE_SOURCES: eigenständige
+#                       Dokumente, kein Tagesabgleich mit Arztbriefen)
 #   mode                'hard' | 'soft'                  – Default: hard für argos, soft sonst
 #   date_tolerance_days 0..99 (Default ENV ONTOTRIAL_IMPORT_DATE_TOLERANCE_DAYS // 0)
 #   force               true: Text immer übernehmen und neu extrahieren
@@ -6484,12 +7021,58 @@ post '/BBB/extract_phenopacket_from_letter' => sub {
 # =========================================================================
 my $import_date_tolerance = $ENV{ONTOTRIAL_IMPORT_DATE_TOLERANCE_DAYS} // 0;
 
+# PATCH 2026-10-22: Quellen mit eigenständigen Dokumenten (z. B. OP-Berichte).
+# Sie sind keine Kopien eines Arztbriefs: kein Abgleich über PIZ + Tag mit
+# anderen Quellen (in beide Richtungen), keine Übernahme ("adopted"). Dubletten
+# werden nur über source + doc_id und identischen Text erkannt.
+our %SEPARATE_DOC_SOURCES = map { $_ => 1 } grep { length }
+    split /\s*,\s*/, lc($ENV{ONTOTRIAL_SEPARATE_SOURCES} // 'op');
+
 sub normalize_reference_day {
     my ($d) = @_;
     return undef unless defined $d && !ref $d && length $d;
     return $1 if $d =~ /^\s*(\d{4}-\d{2}-\d{2})/;
     return sprintf('%04d-%02d-%02d', $3, $2, $1) if $d =~ /^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\b/;
+    # PATCH 2026-10-23: TT.MM.JJ ("25.8.11" = 25.08.2011), nie JJ.MM.TT
+    return _ymd_from_dmy2($1, $2, $3) if $d =~ /^\s*(\d{1,2})\.(\d{1,2})\.(\d{2})(?!\d)/;
     return undef;
+}
+
+# =========================================================================
+# PATCH 2026-10-23: ZWEISTELLIGE JAHRESZAHLEN IM BRIEFDATUM
+# Deutsche Briefe schreiben TT.MM.JJ ("25.8.11"). Wird das vorgelagert als
+# JJ.MM.TT gelesen, entsteht 2025-08-11 statt 2011-08-25 (bis hin zu Daten in
+# der Zukunft). fix_swapped_reference_day erkennt genau dieses Muster anhand der
+# Datumsangaben im Briefkopf und korrigiert es; alles andere bleibt unverändert.
+# =========================================================================
+sub _ymd_from_dmy2 {
+    my ($d, $m, $yy) = @_;
+    my $cur = (localtime)[5] % 100;
+    my $y   = $yy <= $cur ? 2000 + $yy : 1900 + $yy;
+    return undef unless $m >= 1 && $m <= 12 && $d >= 1 && $d <= 31;
+    return sprintf('%04d-%02d-%02d', $y, $m, $d);
+}
+
+sub fix_swapped_reference_day {
+    my ($ref, $text) = @_;
+    return $ref unless defined $ref && $ref =~ /^(\d{4})-(\d{2})-(\d{2})/ && defined $text;
+    my ($ry, $rm, $rd) = ($1 + 0, $2 + 0, $3 + 0);
+    my $head = substr($text, 0, 2000);
+    # Steht das Referenzdatum selbst im Kopf (TT.MM.JJ oder TT.MM.JJJJ), ist es bestätigt
+    while ($head =~ /(?<![\d.])([0-3]?\d)\.([01]?\d)\.(\d{4}|\d{2})(?![\d.])/g) {
+        my $iso = length($3) == 4 ? sprintf('%04d-%02d-%02d', $3, $2, $1) : _ymd_from_dmy2($1 + 0, $2 + 0, $3 + 0);
+        return $ref if defined $iso && $iso eq substr($ref, 0, 10);
+    }
+    while ($head =~ /(?<![\d.])([0-3]?\d)\.([01]?\d)\.(\d{2})(?![\d.])/g) {
+        my ($d, $m, $yy) = ($1 + 0, $2 + 0, $3 + 0);
+        # Referenz = JJ.MM.TT-Lesart dieses TT.MM.JJ-Datums?
+        next unless $ry == 2000 + $d && $rm == $m && $rd == $yy;
+        my $fixed = _ymd_from_dmy2($d, $m, $yy) // next;
+        next if $fixed eq substr($ref, 0, 10);
+        warn "[REFERENCE DATE] $ref ist '$d.$m." . sprintf('%02d', $yy) . "' als JJ.MM.TT gelesen -> korrigiert auf $fixed\n";
+        return $fixed;
+    }
+    return $ref;
 }
 
 helper extraction_pending => sub {
@@ -6526,6 +7109,7 @@ post '/BBB/import_and_extract_letter' => sub {
     my $source    = lc($p->{source} // 'argos');
     my $mode      = lc($p->{mode}   // ($source eq 'argos' ? 'hard' : 'soft'));
     my $ref_day   = normalize_reference_day($p->{reference_date});
+    $ref_day      = fix_swapped_reference_day($ref_day, $text) if defined $ref_day;   # PATCH 2026-10-23
     my $tol       = $p->{date_tolerance_days} // $import_date_tolerance;
     my $force     = to_bool($p->{force});
     my $dry_run   = to_bool($p->{dry_run});
@@ -6558,6 +7142,8 @@ post '/BBB/import_and_extract_letter' => sub {
     $pseudonym = "$pseudonym";
     $doc_id    = (defined $doc_id && length $doc_id) ? "$doc_id" : undef;
     my $hash   = md5_hex(encode('UTF-8', $text));
+    my $separate = $SEPARATE_DOC_SOURCES{$source} ? 1 : 0;
+    my $sep_list = [ sort keys %SEPARATE_DOC_SOURCES ];
 
     my $db = $c->pg->db;
     my (%r, $enqueue_id, $bump_job);
@@ -6578,18 +7164,21 @@ post '/BBB/import_and_extract_letter' => sub {
         }, $source, $doc_id)->hash : undef;
         my $self_id = $same ? $same->{id} : 0;
 
-        # 2. Irgendein anderer Brief desselben Patienten am selben Tag (± Toleranz)
-        my $same_day = $db->query(q{
+        # 2. Irgendein anderer Brief desselben Patienten am selben Tag (± Toleranz).
+        #    Eigenständige Quellen (OP-Berichte) zählen hier nicht mit und werden
+        #    selbst nicht über den Tag abgeglichen.
+        my $same_day = $separate ? undef : $db->query(q{
             SELECT id, doc_source, doc_id::text AS doc_id,
                    to_char(reference_date::date, 'YYYY-MM-DD') AS day
               FROM candidates
              WHERE pseudonym = ?
                AND id <> ?
                AND reference_date >= ?::date - ?::int AND reference_date < ?::date + ?::int + 1
+               AND lower(COALESCE(doc_source, '')) <> ALL(?)
              ORDER BY (doc_source = 'argos') DESC,
                       abs(reference_date::date - ?::date), id
              LIMIT 1
-        }, $pseudonym, $self_id, $ref_day, $tol, $ref_day, $tol, $ref_day)->hash;
+        }, $pseudonym, $self_id, $ref_day, $tol, $ref_day, $tol, $sep_list, $ref_day)->hash;
 
         # 3. Identischer Text beim selben Patienten (anderes Datum, andere ID)
         my $same_text = $db->query(q{
@@ -6637,15 +7226,16 @@ post '/BBB/import_and_extract_letter' => sub {
         }
         else {
             # hard: eine Kopie aus einer anderen (nicht manuellen) Quelle am selben Tag übernehmen
-            my $adopt = $mode eq 'hard' ? $db->query(q{
+            my $adopt = ($mode eq 'hard' && !$separate) ? $db->query(q{
                 SELECT id, doc_source, doc_id::text AS doc_id
                   FROM candidates
                  WHERE pseudonym = ?
                    AND doc_source NOT IN (?, 'manual')
+                   AND lower(COALESCE(doc_source, '')) <> ALL(?)
                    AND reference_date >= ?::date - ?::int AND reference_date < ?::date + ?::int + 1
                  ORDER BY abs(reference_date::date - ?::date), id
                  LIMIT 1
-            }, $pseudonym, $source, $ref_day, $tol, $ref_day, $tol, $ref_day)->hash : undef;
+            }, $pseudonym, $source, $sep_list, $ref_day, $tol, $ref_day, $tol, $ref_day)->hash : undef;
 
             if ($adopt) {
                 $db->update('candidates',
@@ -7062,14 +7652,14 @@ sub evaluate_and_trace_node {
                 if ($c_code =~ /^OPS:/i) {
                     foreach my $proc (@{$phenopacket->{procedures} // []}) {
                         if ($c->is_ops_subclass_of($proc->{code}{id}, $c_code)) {
-                            $shared_perf_time = $proc->{performedTime} // $proc->{performed}{timestamp};
+                            $shared_perf_time = $proc->{performedTime} // (ref $proc->{performed} eq 'HASH' ? $proc->{performed}{timestamp} : undef);
                             last;
                         }
                     }
                 } elsif ($c_code =~ /^ATC:/i) {
                     foreach my $act (@{$phenopacket->{medicalActions} // []}) {
                         if ($act->{treatment} && $c->is_atc_subclass_of($act->{treatment}{agent}{id}, $c_code)) {
-                            $shared_perf_time = $act->{treatment}{performedTime} // $act->{treatment}{performed}{timestamp};
+                            $shared_perf_time = $act->{treatment}{performedTime} // (ref $act->{treatment}{performed} eq 'HASH' ? $act->{treatment}{performed}{timestamp} : undef);
                             last;
                         }
                     }
@@ -7175,6 +7765,17 @@ sub evaluate_and_trace_node {
             unless ($lat_found) {
                 foreach my $proc (@{$phenopacket->{procedures} // []}) {
                     if ($proc->{bodySite} && is_laterality_match($proc->{bodySite}{id}, $crit_code)) {
+                        $lat_found = 1; last;
+                    }
+                }
+            }
+
+            # 3b. In Medikamenten suchen (ausgeschlossene ignorieren)
+            unless ($lat_found) {
+                foreach my $act (@{$phenopacket->{medicalActions} // []}) {
+                    my $tr = $act->{treatment};
+                    next unless ref $tr eq 'HASH' && !to_bool($tr->{excluded});
+                    if ($tr->{bodySite} && is_laterality_match($tr->{bodySite}{id}, $crit_code)) {
                         $lat_found = 1; last;
                     }
                 }
@@ -8272,6 +8873,9 @@ sub swap_phenopacket_laterality {
         if ($act->{procedure} && $act->{procedure}{bodySite}) {
             $swap_lat_obj->($act->{procedure}{bodySite});
         }
+        if (ref $act->{treatment} eq 'HASH' && $act->{treatment}{bodySite}) {
+            $swap_lat_obj->($act->{treatment}{bodySite});
+        }
     }
 
     return $clone;
@@ -8715,6 +9319,9 @@ our %PPD_LOINC_PAIRS = (
     bmo    => ['86301-9b', '86290-4b'],
     gcl    => ['86301-9a', '86290-4a'],
     vf_md  => ['79803-3',  '79802-5'],
+    trg    => ['95327-a',  '95328-a'],            # PATCH 2026-10-22: Zielrefraktion (lokal)
+    cde    => ['64817-a',  '64818-a'],            # PATCH 2026-10-22: Phako-Zeitleistungswert (lokal)
+    iol    => ['64819-a',  '64820-a'],            # PATCH 2026-10-22: IOL-Stärke (lokal)
 );
 our %PPD_LOINC_LOOKUP;
 for my $g (keys %PPD_LOINC_PAIRS) {
@@ -8727,6 +9334,7 @@ our %PPD_MEAS_SCALE = (
     iop => 10, cct => 50, va_bc => 0.5, va_uc => 0.5,
     sphere => 3, cyl => 2, se => 3, hertel => 4, rnfl => 20, cdr => 0.3,
     lid => 3, ecd => 500, bmo => 0.5, gcl => 0.3, vf_md => 5,
+    trg => 1, cde => 20, iol => 3,                        # PATCH 2026-10-22
     '4548-4' => 1.5,                              # HbA1c in %
 );
 our %PPD_SKIP_GROUPS = (axis => 1);               # Achse allein nicht sinnvoll vergleichbar
@@ -8757,12 +9365,22 @@ sub _ppd_flip {
     return $s eq 'R' ? 'L' : $s eq 'L' ? 'R' : $s;
 }
 
+# Seiten sind in den Codeblöcken nur noch 'U' (einseitig, RA oder LA), 'B' (beidseitig)
+# oder '' (unbekannt); RA und LA gelten als gleichwertig.
 sub _ppd_side_factor {
     my ($x, $y) = @_;
     return 1   if $x eq $y;
     return 0.9 if $x eq '' || $y eq '';
-    return 0.8 if $x eq 'B' || $y eq 'B';
-    return 0.4;
+    return 0.8;                                   # einseitig vs. beidseitig
+}
+
+# Mehrere Nennungen eines Codes zu einer Seitenangabe zusammenfassen:
+# R und L (oder B) -> 'B', nur R oder nur L -> 'U', sonst ''
+sub _ppd_side_class {
+    my ($sides) = @_;
+    return 'B' if $sides->{B} || ($sides->{R} && $sides->{L});
+    return 'U' if $sides->{R} || $sides->{L};
+    return '';
 }
 
 # ---------------------------------------------------------
@@ -8846,11 +9464,14 @@ sub extract_ppd_features {
     my $sex  = uc($subj->{sex} // '');
     $f{sex}  = $sex if $sex eq 'MALE' || $sex eq 'FEMALE';
 
-    my %seen;
+    # Seiten je Code sammeln und erst danach zu einseitig/beidseitig verdichten
+    my (%sides, @order);
     my $add = sub {
         my ($block, $id, $side) = @_;
         return unless defined $id && length $id;
-        push @{ $f{$block} }, { id => $id, side => $side } unless $seen{"$block|$id|$side"}++;
+        my $k = "$block|$id";
+        push @order, [ $block, $id ] unless $sides{$k};
+        $sides{$k}{ $side // '' } = 1;
     };
 
     for my $d (@{ $pp->{diseases} // [] }) {
@@ -8873,6 +9494,10 @@ sub extract_ppd_features {
         if (ref $act->{treatment} eq 'HASH' && !to_bool($act->{treatment}{excluded})) {
             $add->('medications', $act->{treatment}{agent}{id}, _ppd_side($act->{treatment}{bodySite}));
         }
+    }
+    for my $o (@order) {
+        my ($block, $id) = @$o;
+        push @{ $f{$block} }, { id => $id, side => _ppd_side_class($sides{"$block|$id"}) };
     }
 
     # Messungen: jüngster Wert je Messgröße und Auge
@@ -8897,19 +9522,27 @@ sub extract_ppd_features {
     return \%f;
 }
 
-sub _ppd_mirror_features {
-    my ($f) = @_;
-    my %m = %$f;
-    for my $b (qw(diseases phenotypes procedures medications)) {
-        $m{$b} = [ map { +{ %$_, side => _ppd_flip($_->{side}) } } @{ $f->{$b} } ];
-    }
-    my %meas;
-    for my $x (values %{ $f->{measurements} }) {
+# Messwerte bleiben je Auge getrennt. Da RA und LA gleichwertig sind, werden die
+# beiden Augen als ungeordnetes Paar verglichen: Zuordnung R-R/L-L oder R-L/L-R,
+# einheitlich über alle Messgrößen (keine Mischzuordnung je Messgröße).
+sub _ppd_swap_eyes_meas {
+    my ($M) = @_;
+    my %out;
+    for my $x (values %$M) {
         my $s = _ppd_flip($x->{side});
-        $meas{"$x->{group}|$s"} = { %$x, side => $s };
+        $out{"$x->{group}|$s"} = { %$x, side => $s };
     }
-    $m{measurements} = \%meas;
-    return \%m;
+    return \%out;
+}
+
+sub _ppd_meas_dist_eye_agnostic {
+    my ($MA, $MB) = @_;
+    my ($d1, $det1) = _ppd_meas_dist($MA, $MB);
+    my ($d2, $det2) = _ppd_meas_dist($MA, _ppd_swap_eyes_meas($MB));
+    my ($n1, $n2) = (scalar @$det1, scalar @$det2);
+    # mehr gemeinsam gemessene Größen zuerst, dann kleinere Distanz
+    my $cross = $n2 > $n1 || ($n2 == $n1 && defined $d2 && defined $d1 && $d2 < $d1);
+    return $cross ? ($d2, $det2, 1) : ($d1, $det1, 0);
 }
 
 # ---------------------------------------------------------
@@ -8980,7 +9613,8 @@ sub _ppd_demo_dist {
 
 # ---------------------------------------------------------
 # Kern: Distanz zweier Merkmalsvektoren
-# $opts: weights {}, mirror (1), exact ['sex'], explain (0), hpo_sim sub
+# $opts: weights {}, exact ['sex'], explain (0), hpo_sim sub
+# Lateralität: RA = LA, unterschieden wird nur einseitig vs. beidseitig
 # ---------------------------------------------------------
 sub phenopacket_distance_features {
     my ($fa, $fb, $opts) = @_;
@@ -8995,44 +9629,37 @@ sub phenopacket_distance_features {
         }
     }
 
-    my $best;
-    for my $mir ((($opts->{mirror} // 1) ? (0, 1) : (0))) {
-        my $gb = $mir ? _ppd_mirror_features($fb) : $fb;
-        my $sf = sub { _ppd_side_factor($_[0]{side}, $_[1]{side}) };
-        my (%blk, %det);
+    my $sf = sub { _ppd_side_factor($_[0]{side}, $_[1]{side}) };
+    my (%blk, %det, $crossed);
 
-        ($blk{diseases}, $det{diseases}) = _ppd_bma($fa->{diseases}, $gb->{diseases},
-            sub { _ppd_chain_sim('icd10', $_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
-        ($blk{procedures}, $det{procedures}) = _ppd_bma($fa->{procedures}, $gb->{procedures},
-            sub { _ppd_chain_sim('ops', $_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
-        ($blk{medications}, $det{medications}) = _ppd_bma($fa->{medications}, $gb->{medications},
-            sub { _ppd_chain_sim('atc', $_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
-        ($blk{phenotypes}, $det{phenotypes}) = _ppd_bma($fa->{phenotypes}, $gb->{phenotypes},
-            sub { $hpo_sim->($_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
-        ($blk{measurements}, $det{measurements}) = _ppd_meas_dist($fa->{measurements}, $gb->{measurements});
-        $blk{demographics} = _ppd_demo_dist($fa, $gb);
+    ($blk{diseases}, $det{diseases}) = _ppd_bma($fa->{diseases}, $fb->{diseases},
+        sub { _ppd_chain_sim('icd10', $_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
+    ($blk{procedures}, $det{procedures}) = _ppd_bma($fa->{procedures}, $fb->{procedures},
+        sub { _ppd_chain_sim('ops', $_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
+    ($blk{medications}, $det{medications}) = _ppd_bma($fa->{medications}, $fb->{medications},
+        sub { _ppd_chain_sim('atc', $_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
+    ($blk{phenotypes}, $det{phenotypes}) = _ppd_bma($fa->{phenotypes}, $fb->{phenotypes},
+        sub { $hpo_sim->($_[0]{id}, $_[1]{id}) * $sf->(@_) }, $explain);
+    ($blk{measurements}, $det{measurements}, $crossed) = _ppd_meas_dist_eye_agnostic($fa->{measurements}, $fb->{measurements});
+    $blk{demographics} = _ppd_demo_dist($fa, $fb);
 
-        my ($num, $den, $wall) = (0, 0, 0);
-        for my $b (keys %blk) {
-            my $wb = $w{$b} // 0;
-            next unless $wb > 0;
-            $wall += $wb;
-            next unless defined $blk{$b};
-            $num += $wb * $blk{$b};
-            $den += $wb;
-        }
-        my $r = {
-            distance => $den ? $num / $den : undef,
-            mirrored => $mir ? \1 : \0,
-            coverage => $wall ? sprintf('%.3f', $den / $wall) + 0 : 0,
-            blocks   => { map { $_ => (defined $blk{$_} ? sprintf('%.4f', $blk{$_}) + 0 : undef) } keys %blk },
-        };
-        $r->{details} = \%det if $explain;
-        $best = $r if !$best
-            || (defined $r->{distance} && (!defined $best->{distance} || $r->{distance} < $best->{distance}));
+    my ($num, $den, $wall) = (0, 0, 0);
+    for my $b (keys %blk) {
+        my $wb = $w{$b} // 0;
+        next unless $wb > 0;
+        $wall += $wb;
+        next unless defined $blk{$b};
+        $num += $wb * $blk{$b};
+        $den += $wb;
     }
-    $best->{distance} = sprintf('%.4f', $best->{distance}) + 0 if defined $best->{distance};
-    return $best;
+    my $r = {
+        distance          => $den ? sprintf('%.4f', $num / $den) + 0 : undef,
+        meas_eyes_crossed => $crossed ? \1 : \0,
+        coverage          => $wall ? sprintf('%.3f', $den / $wall) + 0 : 0,
+        blocks            => { map { $_ => (defined $blk{$_} ? sprintf('%.4f', $blk{$_}) + 0 : undef) } keys %blk },
+    };
+    $r->{details} = \%det if $explain;
+    return $r;
 }
 
 sub _ppd_parse_json {
@@ -9047,7 +9674,6 @@ sub _ppd_opts {
     my ($p) = @_;
     return {
         weights => (ref $p->{weights} eq 'HASH' ? $p->{weights} : {}),
-        mirror  => (exists $p->{mirror} ? to_bool($p->{mirror}) : 1),
         exact   => (ref $p->{exact} eq 'ARRAY' ? $p->{exact} : []),
         explain => to_bool($p->{explain}),
     };
@@ -9136,7 +9762,7 @@ helper ppd_load_candidates => sub {
 # =========================================================
 # ENDPUNKT: Distanz zweier Phenopackets
 # Body: { a: <candidate_id | phenopacket>, b: <...>,
-#         weights: {...}, mirror: true, exact: ["sex"], explain: true }
+#         weights: {...}, exact: ["sex"], explain: true }
 # =========================================================
 post '/BBB/phenopacket_distance' => sub {
     my $c = shift;
@@ -9162,7 +9788,7 @@ post '/BBB/phenopacket_distance' => sub {
 # =========================================================
 # ENDPUNKT: k nächste Nachbarn eines Kandidaten
 # Body: { candidate_id, tag?, candidate_ids?, k: 10, caliper?, max_pool: 5000,
-#         exclude_same_pseudonym: true, weights, mirror, exact }
+#         exclude_same_pseudonym: true, weights, exact }
 # =========================================================
 post '/BBB/phenopacket_distance/nearest' => sub {
     my $c = shift;
@@ -9205,7 +9831,7 @@ post '/BBB/phenopacket_distance/nearest' => sub {
 # ENDPUNKT: Greedy-Matching Fälle -> Kontrollen (1:ratio, Caliper)
 # Body: { treated_ids | treated_tag, control_ids | control_tag,
 #         ratio: 1, caliper: 0.35, replace: false, max_pool: 5000,
-#         weights, mirror, exact: ["sex"] }
+#         weights, exact: ["sex"] }
 # Aufwand O(Fälle x Kontrollen); große Kohorten besser als Minion-Task.
 # =========================================================
 post '/BBB/propensity_match' => sub {
@@ -9237,20 +9863,20 @@ post '/BBB/propensity_match' => sub {
             my $r = $c->phenopacket_distance($t->{f}, $k->{f}, $opts);
             next unless defined $r->{distance};
             next if defined $caliper && $r->{distance} > $caliper;
-            push @pairs, [ $r->{distance}, $t, $k, $r->{mirrored} ];
+            push @pairs, [ $r->{distance}, $t, $k ];
         }
     }
     @pairs = sort { $a->[0] <=> $b->[0] } @pairs;
 
     my (%n_t, %used_c, %matches);
     for my $pr (@pairs) {
-        my ($d, $t, $k, $mir) = @$pr;
+        my ($d, $t, $k) = @$pr;
         next if ($n_t{ $t->{id} } // 0) >= $ratio;
         next if !$replace && $used_c{ $k->{id} };
         $n_t{ $t->{id} }++;
         $used_c{ $k->{id} }++;
         push @{ $matches{ $t->{id} } }, { candidate_id => $k->{id}, pseudonym => $k->{pseudonym},
-                                          distance => $d, mirrored => $mir };
+                                          distance => $d };
     }
 
     my @out = map { +{ treated_id => $_->{id}, treated_pseudonym => $_->{pseudonym},
@@ -9379,6 +10005,18 @@ our %ANON_STATIC_LABELS = (
     'LOINC:86301-9a' => 'Right eye Retinal ganglion cell and inner plexiform layer volume by OCT',
     'LOINC:86290-4b' => 'Left eye Bruch membrane opening area by OCT',
     'LOINC:86301-9b' => 'Right eye Bruch membrane opening area by OCT',
+    # PATCH 2026-10-22: Katarakt-OP
+    'LOINC:95327-A'  => 'Right eye Target refraction, planned postoperative (local code)',
+    'LOINC:95328-A'  => 'Left eye Target refraction, planned postoperative (local code)',
+    'LOINC:64817-A'  => 'Right eye Phacoemulsification cumulative dissipated energy (local code)',
+    'LOINC:64818-A'  => 'Left eye Phacoemulsification cumulative dissipated energy (local code)',
+    'LOINC:64819-A'  => 'Right eye Intraocular lens power, implanted (local code)',
+    'LOINC:64820-A'  => 'Left eye Intraocular lens power, implanted (local code)',
+    # PATCH 2026-10-23: Endotamponade
+    'LOINC:64821-A'  => 'Right eye Vitreous cavity endotamponade (local code)',
+    'LOINC:64822-A'  => 'Left eye Vitreous cavity endotamponade (local code)',
+    'LOINC:64823-A'  => 'Right eye Anterior chamber tamponade (local code)',
+    'LOINC:64824-A'  => 'Left eye Anterior chamber tamponade (local code)',
 );
 
 our %ANON_QUALITATIVE = map { $_ => 1 } ('Positive / Detected', 'Examined');
@@ -9657,7 +10295,8 @@ helper anon_phenopacket => sub {
             }
             $value = { quantity => { comparator => $cmp, value => $v + 0, unit => { label => $u } } };
             $vsig  = "$cmp$v$u";
-        } elsif (ref $oc eq 'HASH' && ($oc->{id} // '') eq 'NCIT:C25250' && $ANON_QUALITATIVE{ $oc->{label} // '' }) {
+        } elsif (ref $oc eq 'HASH' && ($oc->{id} // '') eq 'NCIT:C25250'
+                 && ($ANON_QUALITATIVE{ $oc->{label} // '' } || ($oc->{label} // '') =~ $TAMPONADE_LABEL_RE)) {   # PATCH 2026-10-23
             $value = { ontologyClass => { id => 'NCIT:C25250', label => $oc->{label} } };
             $vsig  = $oc->{label};
         } else {
@@ -9721,7 +10360,7 @@ helper anon_phenopacket => sub {
             my $tr   = $act->{treatment};
             my $ag   = $code->($get->($tr, qw(agent id)), 0) or next;
             my $site = $lat->($tr->{bodySite});
-            my $pt   = $ts->($tr->{performedTime});
+            my $pt   = $ts->($tr->{performedTime} // $get->($tr, qw(performed timestamp)));
             next if $seen_a{ join '|', 'T', $ag->{id}, ($site ? $site->{id} : ''), $pt // '' }++;
             my $node = { agent => $ag };
             $node->{bodySite}      = $site if $site;
@@ -10295,6 +10934,1648 @@ get '/BBB/export/long/:what' => [what => [qw(events patients)]] => sub {
     $c->app->log->info("[LONG EXPORT] $q->{label}: " . $c->req->url->query->to_string =~ s/token=[^&]*/token=***/r);
     $c->long_export_stream($q, $format);
 };
+
+# =========================================================
+# VALIDIERUNG: Referenzdatensatz, Regressionstest, Validierungsstudie
+# =========================================================
+# Ein Validierungsdatensatz ist eine repräsentative Stichprobe von Briefen
+# aus dem Bestand. Brieftext und Phenopacket werden bei der Ziehung als
+# Kopie gespeichert, damit der Datensatz unabhängig von späteren
+# Neu-Extraktionen oder Löschungen im Bestand bleibt.
+#
+#   Prüfen        Ärzte bewerten jeden extrahierten Eintrag (korrekt/Fehlertyp)
+#                 und ergänzen fehlende Einträge. Bei Studien-Datensätzen
+#                 zuerst blind eine Checkliste (Teil A), dann die Extraktion.
+#   Referenz      Aus den Bewertungen (bzw. dem Konsens) wird die Referenz
+#                 gebildet und eingefroren.
+#   Regression    Die Briefe des Datensatzes laufen erneut durch die Pipeline
+#                 (oder es werden die gespeicherten Phenopackets genommen) und
+#                 werden mit der Referenz verglichen, inkl. Vergleich mit
+#                 einem Basis-Lauf.
+#   Studie        Kennzahlen nach Bewertungshandbuch (Precision, Attribut-
+#                 genauigkeit, Recall über Checkliste, Kappa, Wachsamkeit
+#                 über eingestreute Fehler), Rohdaten als CSV.
+#
+# Schema: migrations/ontotrial.sql, Version 2.
+#
+# Schutz: Datensätze sind standardmäßig gesperrt. Gesperrte Datensätze
+# lassen sich nicht löschen, eingefrorene Bewertungen nicht ändern. Das
+# erzwingen Trigger in der Datenbank, also auch gegen die generischen
+# Tabellen-Routen; diese sind für validation_* zusätzlich gesperrt.
+#
+# Routen müssen VOR den generischen CRUD-Routen stehen.
+# =========================================================
+
+our $VAL_CONSENSUS = 'Konsens';
+our @VAL_DOMAINS   = qw(disease phenotype procedure treatment measurement);
+
+# Das Schema der Validierung ist Version 2 der Migration in migrations/ontotrial.sql.
+
+# Generische Tabellen-Routen dürfen die Validierungstabellen nicht anfassen
+hook before_dispatch => sub {
+    my $c = shift;
+    if ($c->req->url->path->to_string =~ m{^/BBB/validation_}i) {
+        $c->render(json => { error => 'Validierungstabellen sind nur über /BBB/validation/... erreichbar.' }, status => 403);
+    }
+};
+
+# ---------------------------------------------------------
+# Hilfsfunktionen
+# ---------------------------------------------------------
+
+# deterministische Zufallszahl in [0,1) aus Seed und Kennung
+sub _val_rand {
+    my ($seed, $tag) = @_;
+    return hex(substr(md5_hex("$seed:$tag"), 0, 8)) / 4294967296;
+}
+
+sub _val_date {
+    my $t = shift // '';
+    return $t =~ /^(\d{4}(?:-\d{2}(?:-\d{2})?)?)/ ? $1 : '';
+}
+
+sub _val_code {
+    my $c = uc(shift // '');
+    $c =~ s/\s+//g;
+    return $c;
+}
+
+sub _val_num {
+    my $v = shift;
+    return (defined $v && $v =~ /^\s*-?\d+(?:[.,]\d+)?\s*$/) ? ($v =~ tr/,/./r) + 0 : undef;
+}
+
+# Phenopacket -> flache Liste von Einträgen mit stabilem Schlüssel
+sub _val_entries {
+    my ($pp) = @_;
+    my @e;
+    return \@e unless ref $pp eq 'HASH';
+    my $push = sub {
+        my %x = @_;
+        return unless defined $x{code} && length $x{code};
+        $x{label}    //= '';
+        $x{side}     //= '';
+        $x{date}     //= '';
+        $x{excluded} = $x{excluded} ? 1 : 0;
+        push @e, \%x;
+    };
+    for my $d (@{ ref $pp->{diseases} eq 'ARRAY' ? $pp->{diseases} : [] }) {
+        next unless ref $d eq 'HASH' && ref $d->{term} eq 'HASH';
+        $push->(domain => 'disease', code => $d->{term}{id}, label => $d->{term}{label},
+                side => _ppd_side($d->{primarySite}), excluded => to_bool($d->{excluded}),
+                date => _val_date(ref $d->{onset} eq 'HASH' ? $d->{onset}{timestamp} : undef));
+    }
+    for my $p (@{ ref $pp->{phenotypicFeatures} eq 'ARRAY' ? $pp->{phenotypicFeatures} : [] }) {
+        next unless ref $p eq 'HASH' && ref $p->{type} eq 'HASH';
+        $push->(domain => 'phenotype', code => $p->{type}{id}, label => $p->{type}{label},
+                side => _ppd_side_of_mods($p->{modifiers}), excluded => to_bool($p->{excluded}),
+                date => _val_date(ref $p->{onset} eq 'HASH' ? $p->{onset}{timestamp} : undef));
+    }
+    for my $p (@{ ref $pp->{procedures} eq 'ARRAY' ? $pp->{procedures} : [] }) {
+        next unless ref $p eq 'HASH' && ref $p->{code} eq 'HASH';
+        $push->(domain => 'procedure', code => $p->{code}{id}, label => $p->{code}{label},
+                side => _ppd_side($p->{bodySite}), excluded => to_bool($p->{excluded}),
+                date => _val_date($p->{performedTime} // (ref $p->{performed} eq 'HASH' ? $p->{performed}{timestamp} : undef)));
+    }
+    for my $act (@{ ref $pp->{medicalActions} eq 'ARRAY' ? $pp->{medicalActions} : [] }) {
+        next unless ref $act eq 'HASH' && ref $act->{treatment} eq 'HASH';
+        my $tr = $act->{treatment};
+        next unless ref $tr->{agent} eq 'HASH';
+        $push->(domain => 'treatment', code => $tr->{agent}{id}, label => $tr->{agent}{label},
+                side => _ppd_side($tr->{bodySite}), excluded => to_bool($tr->{excluded}),
+                date => _val_date($tr->{performedTime} // (ref $tr->{performed} eq 'HASH' ? $tr->{performed}{timestamp} : undef)));
+    }
+    for my $m (@{ ref $pp->{measurements} eq 'ARRAY' ? $pp->{measurements} : [] }) {
+        next unless ref $m eq 'HASH' && ref $m->{assay} eq 'HASH';
+        my $v  = ref $m->{value} eq 'HASH' ? $m->{value} : {};
+        my $q  = ref $v->{quantity} eq 'HASH' ? $v->{quantity} : {};
+        my $u  = ref $q->{unit} eq 'HASH' ? ($q->{unit}{label} // $q->{unit}{id}) : $q->{unit};
+        my $oc = ref $v->{ontologyClass} eq 'HASH' ? $v->{ontologyClass}{label} : undef;
+        $push->(domain => 'measurement', code => $m->{assay}{id}, label => $m->{assay}{label},
+                side => _ppd_side_of_mods($m->{modifiers}), excluded => to_bool($m->{excluded}),
+                date => _val_date(ref $m->{timeOfCollection} eq 'HASH' ? $m->{timeOfCollection}{timestamp} : undef),
+                value => $q->{value}, unit => $u // '', comparator => $q->{comparator} // '',
+                value_text => $oc // '');
+    }
+    my %seen;
+    for my $x (@e) {
+        my $base = join('|', $x->{domain}, _val_code($x->{code}), $x->{side}, $x->{date}, $x->{excluded},
+                        $x->{value} // $x->{value_text} // '');
+        my $n = ++$seen{$base};
+        $x->{key} = md5_hex(encode('UTF-8', $base)) . ($n > 1 ? "-$n" : '');
+    }
+    my %ord = (disease => 1, phenotype => 2, procedure => 3, treatment => 4, measurement => 5);
+    return [ sort { $ord{$a->{domain}} <=> $ord{$b->{domain}} || lc($a->{label}) cmp lc($b->{label}) } @e ];
+}
+
+# Hierarchische Verwandtschaft zweier Codes derselben Domäne (für tolerante Wertung)
+sub _val_related {
+    my ($c, $domain, $x, $y) = @_;
+    ($x, $y) = (_val_code($x), _val_code($y));
+    return 0 unless length $x && length $y;
+    if ($x =~ /^HP:/ && $y =~ /^HP:/) {
+        return ($c->is_subclass_of($x, $y) || $c->is_subclass_of($y, $x)) ? 1 : 0;
+    }
+    return 0 if $domain eq 'measurement';
+    s/^[A-Z0-9]+://, s/[.\-]//g for $x, $y;
+    return 0 unless length($x) >= 3 && length($y) >= 3;
+    return (index($x, $y) == 0 || index($y, $x) == 0) ? 1 : 0;
+}
+
+# ---------------------------------------------------------
+# Bewertungen eines Briefs auflösen (Einzelprüfer, Übereinstimmung, Konsens)
+# ---------------------------------------------------------
+sub _val_core {
+    my $j = shift // {};
+    return join('/', map { $j->{$_} // '' } qw(verdict concept status side side_correct date date_correct value value_correct));
+}
+
+sub _val_missing_sig {
+    my $m = shift;
+    return join('|', _val_code($m->{code}), $m->{side} // '', _val_date($m->{date}), $m->{excluded} ? 1 : 0);
+}
+
+# Liefert { status => ok|incomplete|conflict, source => reviewer|agreement|Konsens,
+#           judgments => {key => j}, missing => [...], checklist => {...}, conflicts => [...] }
+sub _val_resolve {
+    my ($item, $rows) = @_;
+    my %by;
+    for my $r (@$rows) {
+        my $j = ref $r->{judgment} ? $r->{judgment} : (eval { decode_json(encode('UTF-8', $r->{judgment})) } // {});
+        $by{ $r->{reviewer} }{ $r->{entry_key} } = $j;
+    }
+    my $pack = sub {
+        my ($name, $src) = @_;
+        my $h = $by{$name};
+        my %j = map { $_ => $h->{$_} } grep { !/^(?:_|missing:)/ } keys %$h;
+        my @m = map { $h->{$_} } grep { /^missing:/ && !$h->{$_}{deleted} } sort keys %$h;
+        return { status => 'ok', source => $src, reviewer => $name, judgments => \%j, missing => \@m,
+                 checklist => $h->{_checklist} };
+    };
+    my $is_done = sub { my $h = $by{ $_[0] }; return $h && ref $h->{_done} eq 'HASH' && $h->{_done}{done} ? 1 : 0 };
+    return $pack->($VAL_CONSENSUS, $VAL_CONSENSUS) if $is_done->($VAL_CONSENSUS);
+
+    my @done = sort grep { $_ ne $VAL_CONSENSUS && $is_done->($_) } keys %by;
+    return { status => 'incomplete', done => \@done } if !@done || ($item->{double_review} && @done < 2);
+    return $pack->($done[0], 'reviewer') if @done == 1;
+
+    # mehrere Prüfer: Übereinstimmung prüfen
+    my ($a, $b) = @by{ @done[0, 1] };
+    my @conf;
+    for my $e (@{ $item->{entries} }) {
+        push @conf, $e->{key} if _val_core($a->{ $e->{key} }) ne _val_core($b->{ $e->{key} });
+    }
+    my $ms = sub { my $h = shift; join(';', sort map { _val_missing_sig($h->{$_}) } grep { /^missing:/ && !$h->{$_}{deleted} } keys %$h) };
+    push @conf, 'missing' if $ms->($a) ne $ms->($b);
+    return { status => 'conflict', conflicts => \@conf, reviewers => [ @done[0, 1] ] } if @conf;
+    my $res = $pack->($done[0], 'agreement');
+    $res->{reviewers} = [ @done ];
+    return $res;
+}
+
+# Referenz eines Briefs aus der aufgelösten Bewertung
+sub _val_build_reference {
+    my ($item, $res) = @_;
+    my (@ref, @tol);
+    my %inj = map { $_->{key} => $_ } @{ $item->{injected} // [] };
+    my %dropped_sig;
+
+    for my $e (@{ $item->{entries} }) {
+        if (my $i = $inj{ $e->{key} }) {               # eingestreuter Fehler: Wahrheit ist das Original
+            push @ref, { %{ $i->{original} }, src => 'snapshot' };
+            next;
+        }
+        my $j = $res->{judgments}{ $e->{key} } // {};
+        my $v = $j->{verdict} // '';
+        if ($v eq 'duplicate' || $v eq 'unclear') { push @tol, { %$e, why => $v }; next; }
+        my $concept = $j->{concept} // 'ok';
+        next if $concept =~ /^(?:wrong|absent|wrong_subject)$/;
+        if ($concept =~ /^(?:broader|narrower)$/) { push @tol, { %$e, why => $concept }; next; }
+        my $status = $j->{status} // 'ok';
+        next if $status eq 'suspected' || $status eq 'planned';
+
+        my %r = (%$e, src => 'snapshot');
+        $r{excluded} = $r{excluded} ? 0 : 1 if $status eq 'negation';
+        for my $attr (qw(side date value)) {
+            my $s = $j->{$attr} // 'ok';
+            next if $s eq 'ok' || $s eq 'na';
+            my $corr = $j->{"${attr}_correct"};
+            if ($s eq 'superfluous') { $r{$attr} = ''; $r{"${attr}_absent"} = 1; }
+            elsif (defined $corr && length $corr) { $r{$attr} = $attr eq 'date' ? _val_date($corr) : $corr; }
+            else { $r{$attr} = '?'; }
+        }
+        push @ref, \%r;
+    }
+    for my $i (values %inj) {
+        next unless $i->{type} eq 'drop';
+        push @ref, { %{ $i->{original} }, src => 'snapshot' };
+        $dropped_sig{ _val_code($i->{original}{code}) } = 1;
+    }
+    for my $m (@{ $res->{missing} // [] }) {
+        next unless defined $m->{code} && length $m->{code};
+        next if delete $dropped_sig{ _val_code($m->{code}) };
+        push @ref, { domain => $m->{domain}, code => $m->{code}, label => $m->{label} // '',
+                     side => $m->{side} // '', date => _val_date($m->{date}), excluded => $m->{excluded} ? 1 : 0,
+                     value => $m->{value}, unit => $m->{unit} // '', key => 'missing:' . md5_hex(encode('UTF-8', _val_missing_sig($m))),
+                     src => 'missing' };
+    }
+    return { entries => \@ref, tolerated => \@tol, source => $res->{source},
+             reviewers => $res->{reviewers} // [ $res->{reviewer} // () ] };
+}
+
+# ---------------------------------------------------------
+# Vergleich einer Extraktion mit der Referenz
+# ---------------------------------------------------------
+sub _val_attr_check {
+    my ($r, $p, $attr) = @_;
+    my $rv = $r->{$attr};
+    if ($attr eq 'value') {
+        return undef if $r->{domain} ne 'measurement';
+        return undef if defined $rv && $rv eq '?';
+        my ($a, $b) = (_val_num($rv), _val_num($p->{value}));
+        if (defined $a) {
+            return 0 unless defined $b;
+            return abs($a - $b) <= 1e-6 * (abs($a) > 1 ? abs($a) : 1) ? 1 : 0;
+        }
+        my $rt = lc($r->{value_text} // '');
+        return undef unless length $rt;
+        return lc($p->{value_text} // '') eq $rt ? 1 : 0;
+    }
+    $rv //= '';
+    return undef if $rv eq '?';
+    my $pv = $p->{$attr} // '';
+    if ($attr eq 'date') {
+        return ($pv eq '' ? 1 : 0) if $r->{date_absent};
+        return undef if $rv eq '';
+        return 0 if $pv eq '';
+        return (index($pv, $rv) == 0 || index($rv, $pv) == 0) ? 1 : 0;
+    }
+    return $pv eq $rv ? 1 : 0;   # side
+}
+
+sub _val_compare {
+    my ($c, $ref, $pred) = @_;
+    my %dom = map { $_ => { tp => 0, fp => 0, fn => 0, partial => 0, tolerated => 0,
+                            map { ("${_}_ok" => 0, "${_}_n" => 0) } qw(side date status value) } } @VAL_DOMAINS;
+    my (@fn, @fp, @partial, @attr_err, @tp_keys);
+    my @p = map { { %$_, _used => 0 } } @$pred;
+
+    my $pairscore = sub {
+        my ($r, $q) = @_;
+        my $s = 0;
+        $s += 4 if ($r->{excluded} // 0) == ($q->{excluded} // 0);
+        $s += 2 if ($r->{side} // '') eq ($q->{side} // '');
+        $s += 1 if length($r->{date} // '') && ($q->{date} // '') eq $r->{date};
+        $s += 1 if defined _val_num($r->{value}) && defined _val_num($q->{value}) && _val_num($r->{value}) == _val_num($q->{value});
+        return $s;
+    };
+
+    my @unmatched;
+    for my $r (@{ $ref->{entries} }) {
+        my $code = _val_code($r->{code});
+        my ($best, $bs) = (undef, -1);
+        for my $q (@p) {
+            next if $q->{_used} || $q->{domain} ne $r->{domain} || _val_code($q->{code}) ne $code;
+            my $s = $pairscore->($r, $q);
+            ($best, $bs) = ($q, $s) if $s > $bs;
+        }
+        unless ($best) { push @unmatched, $r; next; }
+        $best->{_used} = 1;
+        my $d = $dom{ $r->{domain} } //= {};
+        $d->{tp}++;
+        push @tp_keys, $r->{key};
+        my %err;
+        for my $attr (qw(side date value)) {
+            my $ok = _val_attr_check($r, $best, $attr);
+            next unless defined $ok;
+            $d->{"${attr}_n"}++;
+            $d->{"${attr}_ok"} += $ok;
+            $err{$attr} = { ref => $r->{$attr} // '', pred => $best->{$attr} // '' } unless $ok;
+        }
+        $d->{status_n}++;
+        if (($r->{excluded} // 0) == ($best->{excluded} // 0)) { $d->{status_ok}++ }
+        else { $err{status} = { ref => $r->{excluded} ? 'verneint' : 'vorhanden', pred => $best->{excluded} ? 'verneint' : 'vorhanden' } }
+        push @attr_err, { key => $r->{key}, domain => $r->{domain}, code => $r->{code}, label => $r->{label}, errors => \%err } if %err;
+    }
+    # zweite Runde: hierarchisch verwandte Codes (zählen nur tolerant als Treffer)
+    for my $r (@unmatched) {
+        my ($hit) = grep { !$_->{_used} && $_->{domain} eq $r->{domain} && _val_related($c, $r->{domain}, $r->{code}, $_->{code}) } @p;
+        if ($hit) {
+            $hit->{_used} = 1;
+            $dom{ $r->{domain} }{partial}++;
+            push @partial, { key => $r->{key}, domain => $r->{domain}, ref_code => $r->{code}, ref_label => $r->{label},
+                             pred_code => $hit->{code}, pred_label => $hit->{label} };
+        } else {
+            $dom{ $r->{domain} }{fn}++;
+            push @fn, { key => $r->{key}, map { $_ => $r->{$_} } qw(domain code label side date excluded value) };
+        }
+    }
+    # tolerierte Referenzeinträge (Dublette, unklar, zu allgemein/spezifisch) neutralisieren
+    for my $t (@{ $ref->{tolerated} // [] }) {
+        my ($hit) = grep { !$_->{_used} && $_->{domain} eq $t->{domain} && _val_code($_->{code}) eq _val_code($t->{code}) } @p;
+        next unless $hit;
+        $hit->{_used} = 1;
+        $dom{ $t->{domain} }{tolerated}++;
+    }
+    for my $q (grep { !$_->{_used} } @p) {
+        $dom{ $q->{domain} }{fp}++;
+        push @fp, { sig => join('|', $q->{domain}, _val_code($q->{code}), $q->{side}, $q->{date}, $q->{excluded}),
+                    map { $_ => $q->{$_} } qw(domain code label side date excluded value) };
+    }
+    return { domains => \%dom, fn => \@fn, fp => \@fp, partial => \@partial, attr_errors => \@attr_err, tp_keys => \@tp_keys };
+}
+
+sub _val_ratio { my ($a, $b) = @_; return $b ? sprintf('%.4f', $a / $b) + 0 : undef }
+
+sub _val_metrics {
+    my ($results) = @_;
+    my %sum;
+    for my $res (@$results) {
+        for my $d (keys %{ $res->{domains} }) {
+            $sum{$d}{$_} += $res->{domains}{$d}{$_} // 0 for keys %{ $res->{domains}{$d} };
+        }
+    }
+    my %out;
+    my %all;
+    for my $d (@VAL_DOMAINS, 'all') {
+        my $s = $d eq 'all' ? \%all : ($sum{$d} // {});
+        if ($d ne 'all') { $all{$_} += $s->{$_} // 0 for keys %$s }
+        my ($tp, $fp, $fn, $pa) = map { $s->{$_} // 0 } qw(tp fp fn partial);
+        my %m = (n_ref => $tp + $fn + $pa, n_pred => $tp + $fp + $pa, tp => $tp, fp => $fp, fn => $fn,
+                 partial => $pa, tolerated => $s->{tolerated} // 0);
+        $m{precision}     = _val_ratio($tp, $tp + $fp + $pa);
+        $m{recall}        = _val_ratio($tp, $tp + $fn + $pa);
+        $m{f1}            = _val_ratio(2 * $tp, 2 * $tp + $fp + $fn + 2 * $pa);
+        $m{precision_tol} = _val_ratio($tp + $pa, $tp + $fp + $pa);
+        $m{recall_tol}    = _val_ratio($tp + $pa, $tp + $fn + $pa);
+        $m{f1_tol}        = _val_ratio(2 * ($tp + $pa), 2 * ($tp + $pa) + $fp + $fn);
+        $m{"${_}_accuracy"} = _val_ratio($s->{"${_}_ok"} // 0, $s->{"${_}_n"} // 0) for qw(side date status value);
+        $m{"${_}_n"} = $s->{"${_}_n"} // 0 for qw(side date status value);
+        $out{$d} = \%m;
+    }
+    return \%out;
+}
+
+# ---------------------------------------------------------
+# Datenbankzugriffe
+# ---------------------------------------------------------
+sub _val_json { my $v = shift; return ref $v ? $v : (defined $v ? (eval { decode_json(encode('UTF-8', $v)) } // eval { from_json($v) }) : undef) }
+
+sub _val_load_set {
+    my ($db, $id) = @_;
+    return undef unless defined $id && $id =~ /^\d+$/;
+    my $s = $db->query('SELECT * FROM validation_sets WHERE id = ?', $id)->hash or return undef;
+    $s->{params} = _val_json($s->{params}) // {};
+    return $s;
+}
+
+sub _val_load_items {
+    my ($db, $set_id) = @_;
+    return $db->query('SELECT * FROM validation_items WHERE set_id = ? ORDER BY position', $set_id)->expand->hashes->to_array;
+}
+
+sub _val_reviews_by_item {
+    my ($db, $set_id) = @_;
+    my %r;
+    my $rows = $db->query(q{SELECT r.item_id, r.reviewer, r.entry_key, r.judgment::text AS judgment, r.updated_at
+                            FROM validation_reviews r JOIN validation_items i ON i.id = r.item_id
+                            WHERE i.set_id = ?}, $set_id)->hashes;
+    push @{ $r{ $_->{item_id} } }, $_ for @$rows;
+    return \%r;
+}
+
+sub _val_confirm_ok {
+    my ($set, $given) = @_;
+    return defined $given && $given eq $set->{name};
+}
+
+sub _val_fingerprint {
+    my ($app) = @_;
+    my $db = $app->pg->db;
+    my %fp;
+    my $file = $0 =~ m{^/} ? $0 : $app->home->rel_file($0) . '';
+    if (open my $fh, '<:raw', $file) { local $/; $fp{backend_md5} = md5_hex(<$fh>); close $fh; }
+    (my $dir = $file) =~ s{/[^/]*$}{};
+    my $git = `git -C '$dir' rev-parse --short HEAD 2>/dev/null` // '';
+    chomp $git;
+    $fp{git} = $git if length $git;
+    my $prov = lc($ENV{LLM_PROVIDER} // 'vllm');
+    $fp{model} = $prov eq 'ollama' ? ($ENV{OLLAMA_MODEL} // '') : ($ENV{VLLM_MODEL} // '');
+    for my $t (qw(llm_prompts ontology_intercepts filter_rules catalog_versions)) {
+        my $h = eval { $db->query("SELECT md5(coalesce(string_agg(x::text, '|' ORDER BY x::text), '')) AS h FROM $t x")->hash->{h} };
+        $fp{$t} = $h if $h;
+    }
+    $fp{env} = { map { $_ => $ENV{$_} } grep { /^ONTOTRIAL_(?:RERANK|OCULAR|ICD|LABEL|BLOCK|INTERCEPT|PARENT|GROUND|TRANSLATION)/ } sort keys %ENV };
+    $fp{hash} = substr(md5_hex(encode('UTF-8', join('|', map { "$_=" . (ref $fp{$_} ? to_json($fp{$_}) : $fp{$_}) } sort keys %fp))), 0, 12);
+    return \%fp;
+}
+
+# ---------------------------------------------------------
+# Datensätze: Liste, Ziehung, Sperre, Löschen, Sicherung
+# ---------------------------------------------------------
+get '/BBB/validation/sets' => sub {
+    my $c = shift;
+    my $rows = $c->pg->db->query(q{
+        SELECT s.id, s.name, s.purpose, s.locked, s.frozen_at, s.frozen_by, s.created_at, s.created_by, s.reference_source,
+               s.baseline_run_id, s.params, s.notes,
+               (SELECT count(*) FROM validation_items i WHERE i.set_id = s.id) AS n_items,
+               (SELECT count(*) FROM validation_runs r WHERE r.set_id = s.id) AS n_runs
+        FROM validation_sets s ORDER BY s.created_at DESC
+    })->hashes->to_array;
+    $_->{params} = _val_json($_->{params}) for @$rows;
+    $c->render(json => $rows);
+};
+
+post '/BBB/validation/sets' => sub {
+    my $c  = shift;
+    my $p  = $c->req->json // {};
+    my $db = $c->pg->db;
+
+    return $c->render(json => { error => "Zum Anlegen \"ANLEGEN\" bestätigen." }, status => 400)
+        unless ($p->{confirm} // '') eq 'ANLEGEN';
+    my $name = $p->{name} // '';
+    $name =~ s/^\s+|\s+$//g;
+    return $c->render(json => { error => 'Name fehlt.' }, status => 400) unless length $name;
+    return $c->render(json => { error => "Datensatz \"$name\" existiert bereits." }, status => 409)
+        if $db->query('SELECT 1 FROM validation_sets WHERE name = ?', $name)->array;
+
+    my $purpose = ($p->{purpose} // '') eq 'study' ? 'study' : 'regression';
+    my $n       = int($p->{n} // ($purpose eq 'study' ? 150 : 50));
+    return $c->render(json => { error => 'Stichprobengröße muss zwischen 5 und 2000 liegen.' }, status => 400)
+        unless $n >= 5 && $n <= 2000;
+    my $seed    = defined $p->{seed} && $p->{seed} =~ /^\d+$/ ? $p->{seed} + 0 : int(rand(1e9));
+    my $double  = $purpose eq 'study' ? ($p->{double_fraction} // 0.3) + 0 : 0;
+    my $inject  = $purpose eq 'study' ? ($p->{inject_fraction} // 0.08) + 0 : 0;
+    my @tags    = grep { length } map { lc s/^\s+|\s+$//gr } split /,/, ($p->{tag} // '');
+    my $per_pat = exists $p->{one_per_patient} ? to_bool($p->{one_per_patient}) : 1;
+    my $minlen  = int($p->{min_length} // 300);
+
+    # Grundgesamtheit: Briefe mit Text und Phenopacket, je Brieftext einmal,
+    # optional ein Brief je Patient, ohne Briefe aus anderen Validierungsdatensätzen
+    my @bind = ($seed, $minlen);
+    my $tag_sql = '';
+    if (@tags) {
+        $tag_sql = "AND EXISTS (SELECT 1 FROM unnest(string_to_array(COALESCE(c.tags, ''), ',')) tt(t) WHERE lower(trim(tt.t)) = ANY(?))";
+        push @bind, \@tags;
+    }
+    my $pool = $db->query(qq{
+        WITH pool AS (
+            SELECT DISTINCT ON (md5(c.narrative_report))
+                   c.id, c.pseudonym, c.doc_source, c.reference_date::text AS reference_date,
+                   md5(?::text || ':' || c.id) AS r
+            FROM candidates c
+            WHERE c.phenopacket_json IS NOT NULL AND length(c.phenopacket_json::text) > 20
+              AND c.narrative_report IS NOT NULL AND length(c.narrative_report) >= ?
+              AND c.id NOT IN (SELECT candidate_id FROM validation_items WHERE candidate_id IS NOT NULL)
+              $tag_sql
+            ORDER BY md5(c.narrative_report), c.id
+        )
+        SELECT * FROM pool
+    }, @bind)->hashes->to_array;
+
+    if ($per_pat) {
+        my %best;
+        for my $r (@$pool) {
+            my $k = $r->{pseudonym} // "id$r->{id}";
+            $best{$k} = $r if !$best{$k} || $r->{r} lt $best{$k}{r};
+        }
+        $pool = [ values %best ];
+    }
+    return $c->render(json => { error => "Nur " . scalar(@$pool) . " geeignete Briefe gefunden, $n angefordert." }, status => 422)
+        if @$pool < $n;
+
+    # proportionale Schichtung nach Quelle und Jahr (Largest-Remainder-Verfahren)
+    my %strata;
+    for my $r (@$pool) {
+        my $year = ($r->{reference_date} // '') =~ /^(\d{4})/ ? $1 : 'unbekannt';
+        $r->{stratum} = ($r->{doc_source} // 'unbekannt') . "|$year";
+        push @{ $strata{ $r->{stratum} } }, $r;
+    }
+    my $total = scalar @$pool;
+    my (%alloc, @rem);
+    for my $s (keys %strata) {
+        my $exact = $n * @{ $strata{$s} } / $total;
+        $alloc{$s} = int($exact);
+        push @rem, [ $s, $exact - int($exact) ];
+    }
+    my $left = $n;
+    $left -= $_ for values %alloc;
+    for my $x (sort { $b->[1] <=> $a->[1] || $a->[0] cmp $b->[0] } @rem) {
+        last if $left <= 0;
+        $alloc{ $x->[0] }++;
+        $left--;
+    }
+    my @chosen;
+    for my $s (sort keys %strata) {
+        my @sorted = sort { $a->{r} cmp $b->{r} } @{ $strata{$s} };
+        push @chosen, @sorted[0 .. $alloc{$s} - 1] if $alloc{$s};
+    }
+    @chosen = sort { md5_hex("$seed:pos:$a->{id}") cmp md5_hex("$seed:pos:$b->{id}") } @chosen;
+
+    my $tx = $db->begin;
+    my $set_id = $db->insert('validation_sets', {
+        name => $name, purpose => $purpose, created_by => $p->{created_by} // '', notes => $p->{notes} // '',
+        params => to_json({ n => $n, seed => $seed, tags => \@tags, one_per_patient => $per_pat ? 1 : 0,
+                            min_length => $minlen, double_fraction => $double, inject_fraction => $inject,
+                            pool_size => $total, strata => { map { $_ => { pool => scalar @{ $strata{$_} }, sample => $alloc{$_} } } keys %strata } }),
+    }, { returning => 'id' })->hash->{id};
+
+    my ($pos, $n_double, $n_inject) = (0, 0, 0);
+    for my $r (@chosen) {
+        my $row = $db->query('SELECT narrative_report, phenopacket_json::text AS pp FROM candidates WHERE id = ?', $r->{id})->hash;
+        my $pp  = _ppd_parse_json($row->{pp}) // {};
+        my $entries = _val_entries($pp);
+        my $is_double = $double > 0 && _val_rand($seed, "double:$r->{id}") < $double ? 1 : 0;
+        my @inj;
+        if ($inject > 0 && @$entries && _val_rand($seed, "inject:$r->{id}") < $inject) {
+            my @cand = sort { _val_rand($seed, "pick:$a->{key}") <=> _val_rand($seed, "pick:$b->{key}") } @$entries;
+            my $t = $cand[0];
+            my ($sw) = grep { $_->{side} eq 'R' || $_->{side} eq 'L' } @cand;
+            my ($dt) = grep { $_->{date} =~ /^\d{4}/ } @cand;
+            my $kind = _val_rand($seed, "kind:$r->{id}");
+            if ($sw && $kind < 0.4) {
+                push @inj, { type => 'side_swap', key => $sw->{key}, original => { %$sw } };
+                $sw->{side} = $sw->{side} eq 'R' ? 'L' : 'R';
+            } elsif ($dt && $kind < 0.7) {
+                push @inj, { type => 'date_shift', key => $dt->{key}, original => { %$dt } };
+                $dt->{date} =~ s/^(\d{4})/$1 - 1/e;
+            } else {
+                push @inj, { type => 'drop', key => $t->{key}, original => { %$t } };
+                $entries = [ grep { $_->{key} ne $t->{key} } @$entries ];
+            }
+        }
+        $n_double++ if $is_double;
+        $n_inject++ if @inj;
+        $db->insert('validation_items', {
+            set_id => $set_id, position => ++$pos, candidate_id => $r->{id}, pseudonym => $r->{pseudonym},
+            doc_source => $r->{doc_source}, reference_date => $r->{reference_date}, stratum => $r->{stratum},
+            narrative => $row->{narrative_report}, narrative_md5 => md5_hex(encode('UTF-8', $row->{narrative_report})),
+            snapshot => to_json($pp), entries => to_json($entries),
+            injected => @inj ? to_json(\@inj) : undef, double_review => $is_double ? 1 : 0,
+        });
+    }
+    $tx->commit;
+    $c->app->log->info("[VALIDATION] Datensatz \"$name\" ($purpose) mit $pos Briefen angelegt (Seed $seed).");
+    $c->render(json => { id => $set_id, name => $name, n => $pos, seed => $seed, pool => $total,
+                         double => $n_double, injected => $n_inject, strata => scalar keys %strata });
+};
+
+post '/BBB/validation/sets/:id/lock' => sub {
+    my $c   = shift;
+    my $p   = $c->req->json // {};
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $lock = to_bool($p->{locked}) ? 1 : 0;
+    return $c->render(json => { error => 'Zum Entsperren den Namen des Datensatzes eingeben.' }, status => 400)
+        if !$lock && !_val_confirm_ok($set, $p->{confirm});
+    $db->update('validation_sets', { locked => $lock }, { id => $set->{id} });
+    $c->render(json => { ok => 1, locked => $lock });
+};
+
+del '/BBB/validation/sets/:id' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $confirm = ($c->req->json // {})->{confirm} // $c->param('confirm');
+    return $c->render(json => { error => 'Datensatz ist gesperrt. Zuerst entsperren.' }, status => 409) if $set->{locked};
+    return $c->render(json => { error => 'Zum Löschen den Namen des Datensatzes eingeben.' }, status => 400)
+        unless _val_confirm_ok($set, $confirm);
+    my $ok = eval {
+        my $tx = $db->begin;
+        $db->query('DELETE FROM validation_run_items WHERE run_id IN (SELECT id FROM validation_runs WHERE set_id = ?)', $set->{id});
+        $db->query('DELETE FROM validation_runs WHERE set_id = ?', $set->{id});
+        $db->query('UPDATE validation_sets SET frozen_at = NULL WHERE id = ?', $set->{id});
+        $db->query('DELETE FROM validation_reviews WHERE item_id IN (SELECT id FROM validation_items WHERE set_id = ?)', $set->{id});
+        $db->query('DELETE FROM validation_ai_reviews WHERE item_id IN (SELECT id FROM validation_items WHERE set_id = ?)', $set->{id});
+        $db->query('DELETE FROM validation_items WHERE set_id = ?', $set->{id});
+        $db->query('DELETE FROM validation_sets WHERE id = ?', $set->{id});
+        $tx->commit;
+        1;
+    };
+    return $c->render(json => { error => "Löschen fehlgeschlagen: $@" }, status => 500) unless $ok;
+    $c->app->log->warn("[VALIDATION] Datensatz \"$set->{name}\" gelöscht.");
+    $c->render(json => { ok => 1 });
+};
+
+get '/BBB/validation/sets/:id/export' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $items = _val_load_items($db, $set->{id});
+    my $rev   = $db->query(q{SELECT r.item_id, r.reviewer, r.entry_key, r.judgment, r.updated_at FROM validation_reviews r
+                             JOIN validation_items i ON i.id = r.item_id WHERE i.set_id = ? ORDER BY r.id}, $set->{id})->expand->hashes->to_array;
+    my $runs  = $db->query('SELECT id, mode, label, status, fingerprint, metrics, comparison, started_at, finished_at FROM validation_runs WHERE set_id = ? ORDER BY id',
+                           $set->{id})->expand->hashes->to_array;
+    (my $fn = $set->{name}) =~ s/[^A-Za-z0-9_\-]+/_/g;
+    $c->res->headers->content_disposition("attachment; filename=\"validierung_${fn}.json\"");
+    $c->render(json => { format => 'ontotrial-validation-1', exported_at => POSIX::strftime('%Y-%m-%dT%H:%M:%S', localtime),
+                         set => $set, items => $items, reviews => $rev, runs => $runs });
+};
+
+# ---------------------------------------------------------
+# Prüfen: Briefliste, Brief mit Einträgen, Bewertungen speichern
+# ---------------------------------------------------------
+get '/BBB/validation/sets/:id/items' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $me  = $c->param('reviewer') // '';
+    my $rows = $db->query(q{
+        SELECT i.id, i.position, i.candidate_id, i.pseudonym, i.doc_source, i.reference_date, i.stratum, i.double_review,
+               jsonb_array_length(i.entries) AS n_entries,
+               EXISTS (SELECT 1 FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.entry_key = '_done'
+                       AND (r.judgment->>'done')::boolean) AS my_done,
+               EXISTS (SELECT 1 FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.entry_key = '_checklist'
+                       AND (r.judgment->>'done')::boolean) AS my_checklist,
+               (SELECT count(*) FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.entry_key NOT LIKE '\_%' AND r.entry_key NOT LIKE 'missing:%') AS my_judged,
+               (SELECT count(DISTINCT r.reviewer) FROM validation_reviews r WHERE r.item_id = i.id AND r.entry_key = '_done'
+                AND (r.judgment->>'done')::boolean) AS n_done
+        FROM validation_items i WHERE i.set_id = ? ORDER BY i.position
+    }, $me, $me, $me, $set->{id})->hashes->to_array;
+    $c->render(json => { set => $set, items => $rows });
+};
+
+get '/BBB/validation/items/:id' => sub {
+    my $c    = shift;
+    my $db   = $c->pg->db;
+    my $me   = $c->param('reviewer') // '';
+    my $item = $db->query('SELECT * FROM validation_items WHERE id = ?', $c->param('id'))->hash
+        or return $c->render(json => { error => 'Brief nicht gefunden.' }, status => 404);
+    $item->{entries} = _val_json($item->{entries});
+    my $set = _val_load_set($db, $item->{set_id});
+    my $rows = $db->query('SELECT reviewer, entry_key, judgment::text AS judgment FROM validation_reviews WHERE item_id = ?', $item->{id})->hashes;
+    my (%mine, %others);
+    for my $r (@$rows) {
+        my $j = _val_json($r->{judgment});
+        if ($r->{reviewer} eq $me) { $mine{ $r->{entry_key} } = $j }
+        else { $others{ $r->{reviewer} }{ $r->{entry_key} } = $j }
+    }
+    my $blind = $set->{purpose} eq 'study' && $me ne $VAL_CONSENSUS && !($mine{_checklist} && $mine{_checklist}{done});
+    my %out = (
+        id => $item->{id}, set_id => $item->{set_id}, position => $item->{position}, pseudonym => $item->{pseudonym},
+        doc_source => $item->{doc_source}, reference_date => $item->{reference_date}, double_review => $item->{double_review} ? 1 : 0,
+        purpose => $set->{purpose}, frozen => $set->{frozen_at} ? 1 : 0,
+        narrative => $item->{narrative}, blind => $blind ? 1 : 0,
+        entries => $blind ? [] : $item->{entries}, judgments => \%mine,
+    );
+    # Konsens sieht die Urteile aller Prüfer, normale Prüfer nur die eigenen
+    $out{others} = \%others if $me eq $VAL_CONSENSUS;
+    $c->render(json => \%out);
+};
+
+post '/BBB/validation/items/:id/review' => sub {
+    my $c    = shift;
+    my $p    = $c->req->json // {};
+    my $db   = $c->pg->db;
+    my $me   = $p->{reviewer} // '';
+    $me =~ s/^\s+|\s+$//g;
+    return $c->render(json => { error => 'Prüfername fehlt.' }, status => 400) unless length $me;
+    my $item = $db->query('SELECT id, set_id, entries FROM validation_items WHERE id = ?', $c->param('id'))->hash
+        or return $c->render(json => { error => 'Brief nicht gefunden.' }, status => 404);
+    my %valid = map { $_->{key} => 1 } @{ _val_json($item->{entries}) // [] };
+    my @list = ref $p->{reviews} eq 'ARRAY' ? @{ $p->{reviews} } : ({ entry_key => $p->{entry_key}, judgment => $p->{judgment} });
+    for my $r (@list) {
+        my $k = $r->{entry_key} // '';
+        return $c->render(json => { error => "Unbekannter Eintrag: $k" }, status => 400)
+            unless $valid{$k} || $k =~ /^missing:[A-Za-z0-9\-]{1,64}$/ || $k eq '_checklist' || $k eq '_done';
+        return $c->render(json => { error => 'Bewertung fehlt.' }, status => 400) unless ref $r->{judgment} eq 'HASH';
+    }
+    my $ok = eval {
+        my $tx = $db->begin;
+        for my $r (@list) {
+            $db->query(q{INSERT INTO validation_reviews (item_id, reviewer, entry_key, judgment) VALUES (?, ?, ?, ?::jsonb)
+                         ON CONFLICT (item_id, reviewer, entry_key) DO UPDATE SET judgment = EXCLUDED.judgment, updated_at = now()},
+                       $item->{id}, $me, $r->{entry_key}, to_json($r->{judgment}));
+        }
+        $tx->commit;
+        1;
+    };
+    return $c->render(json => { error => ($@ =~ /eingefroren/ ? 'Die Referenz ist eingefroren; Bewertungen sind nicht mehr änderbar.' : "Speichern fehlgeschlagen: $@") },
+                      status => 409) unless $ok;
+    $c->render(json => { ok => 1, saved => scalar @list });
+};
+
+# offene Punkte vor dem Einfrieren: unvollständig geprüfte Briefe und Abweichungen
+get '/BBB/validation/sets/:id/status' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $items = _val_load_items($db, $set->{id});
+    my $revs  = _val_reviews_by_item($db, $set->{id});
+    my (@incomplete, @conflicts, %reviewers);
+    for my $i (@$items) {
+        $reviewers{ $_->{reviewer} }++ for grep { $_->{entry_key} eq '_done' && (_val_json($_->{judgment}) // {})->{done} } @{ $revs->{ $i->{id} } // [] };
+        my $res = _val_resolve($i, $revs->{ $i->{id} } // []);
+        push @incomplete, { id => $i->{id}, position => $i->{position}, done => $res->{done} // [], double => $i->{double_review} ? 1 : 0 }
+            if $res->{status} eq 'incomplete';
+        push @conflicts, { id => $i->{id}, position => $i->{position}, reviewers => $res->{reviewers}, keys => $res->{conflicts} }
+            if $res->{status} eq 'conflict';
+    }
+    $c->render(json => { set => $set, n_items => scalar @$items, incomplete => \@incomplete, conflicts => \@conflicts,
+                         reviewers => \%reviewers });
+};
+
+post '/BBB/validation/sets/:id/freeze' => sub {
+    my $c   = shift;
+    my $p   = $c->req->json // {};
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    return $c->render(json => { error => 'Referenz ist bereits eingefroren.' }, status => 409) if $set->{frozen_at};
+    return $c->render(json => { error => 'Zum Einfrieren den Namen des Datensatzes eingeben.' }, status => 400)
+        unless _val_confirm_ok($set, $p->{confirm});
+    my $items = _val_load_items($db, $set->{id});
+    my $revs  = _val_reviews_by_item($db, $set->{id});
+    my $judge = ($p->{source} // '') eq 'judge';
+    my $ai    = {};
+    if ($judge) {
+        my $all = _val_ai_rows($db, $set->{id});
+        my @m   = sort keys %$all;
+        my $mod = $p->{model} // (@m == 1 ? $m[0] : undef);
+        return $c->render(json => { error => @m ? 'Bitte das Judge-Modell wählen: ' . join(', ', @m) : 'Es gibt noch keine KI-Bewertungen.' }, status => 400)
+            unless defined $mod && $all->{$mod};
+        $ai = $all->{$mod};
+    }
+    my (@open, %refs, $source);
+    for my $i (@$items) {
+        my $res = $judge ? (_val_ai_resolution($ai->{ $i->{id} }) // { status => 'judge_missing' })
+                         : _val_resolve($i, $revs->{ $i->{id} } // []);
+        if ($res->{status} ne 'ok') { push @open, { position => $i->{position}, status => $res->{status} }; next; }
+        $refs{ $i->{id} } = _val_build_reference($i, $res);
+        $source = $judge ? 'judge:' . $ai->{ $i->{id} }{model} : 'human';
+    }
+    return $c->render(json => { error => scalar(@open) . ($judge ? ' Briefe haben noch keine fehlerfreie KI-Bewertung.'
+                                                                 : ' Briefe sind noch nicht abschließend bewertet oder haben Abweichungen.'), open => \@open },
+                      status => 409) if @open;
+    my $tx = $db->begin;
+    $db->update('validation_items', { reference => to_json($refs{$_}) }, { id => $_ }) for keys %refs;
+    $db->update('validation_sets', { frozen_at => \'now()', frozen_by => $p->{by} // '', reference_source => $source // 'human' }, { id => $set->{id} });
+    $tx->commit;
+    my $n_ref = 0;
+    $n_ref += scalar @{ $_->{entries} } for values %refs;
+    $c->app->log->info("[VALIDATION] Referenz von \"$set->{name}\" eingefroren ($n_ref Einträge).");
+    $c->render(json => { ok => 1, items => scalar keys %refs, reference_entries => $n_ref });
+};
+
+post '/BBB/validation/sets/:id/unfreeze' => sub {
+    my $c   = shift;
+    my $p   = $c->req->json // {};
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    return $c->render(json => { error => 'Datensatz ist gesperrt. Zum Auftauen zuerst entsperren.' }, status => 409) if $set->{locked};
+    return $c->render(json => { error => 'Zum Auftauen den Namen des Datensatzes eingeben.' }, status => 400)
+        unless _val_confirm_ok($set, $p->{confirm});
+    $db->update('validation_sets', { frozen_at => undef, frozen_by => undef }, { id => $set->{id} });
+    $c->render(json => { ok => 1 });
+};
+
+# ---------------------------------------------------------
+# Regressionstest
+# ---------------------------------------------------------
+post '/BBB/validation/sets/:id/runs' => sub {
+    my $c   = shift;
+    my $p   = $c->req->json // {};
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    return $c->render(json => { error => 'Erst die Referenz einfrieren.' }, status => 409) unless $set->{frozen_at};
+    return $c->render(json => { error => 'Für diesen Datensatz läuft bereits ein Lauf.' }, status => 409)
+        if $db->query(q{SELECT 1 FROM validation_runs WHERE set_id = ? AND status IN ('queued', 'running')}, $set->{id})->array;
+    my $mode = ($p->{mode} // '') eq 'stored' ? 'stored' : 'reextract';
+    my $run_id = $db->insert('validation_runs', { set_id => $set->{id}, mode => $mode, label => $p->{label} // '',
+                                                  fingerprint => to_json(_val_fingerprint($c->app)) }, { returning => 'id' })->hash->{id};
+    $c->minion->enqueue(validation_run_task => [{ run_id => $run_id, model => $p->{model} }], { attempts => 1 });
+    $c->render(json => { ok => 1, run_id => $run_id, mode => $mode });
+};
+
+get '/BBB/validation/sets/:id/runs' => sub {
+    my $c = shift;
+    my $rows = $c->pg->db->query(q{SELECT id, mode, label, status, progress, fingerprint, metrics, comparison, error, started_at, finished_at
+                                   FROM validation_runs WHERE set_id = ? ORDER BY id DESC}, $c->param('id'))->expand->hashes->to_array;
+    $c->render(json => $rows);
+};
+
+get '/BBB/validation/runs/:id' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $run = $db->query('SELECT * FROM validation_runs WHERE id = ?', $c->param('id'))->expand->hash
+        or return $c->render(json => { error => 'Lauf nicht gefunden.' }, status => 404);
+    $run->{items} = $db->query(q{SELECT ri.item_id, i.position, i.pseudonym, ri.result, ri.error FROM validation_run_items ri
+                                 JOIN validation_items i ON i.id = ri.item_id WHERE ri.run_id = ? ORDER BY i.position}, $run->{id})->expand->hashes->to_array;
+    $c->render(json => $run);
+};
+
+post '/BBB/validation/sets/:id/baseline' => sub {
+    my $c   = shift;
+    my $p   = $c->req->json // {};
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $ok  = $db->query(q{SELECT 1 FROM validation_runs WHERE id = ? AND set_id = ? AND status = 'finished'}, $p->{run_id} // 0, $set->{id})->array;
+    return $c->render(json => { error => 'Nur abgeschlossene Läufe dieses Datensatzes können Basis werden.' }, status => 400) unless $ok;
+    $db->update('validation_sets', { baseline_run_id => $p->{run_id} }, { id => $set->{id} });
+    $c->render(json => { ok => 1 });
+};
+
+get '/BBB/validation/runs/:id/report.csv' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $rows = $db->query(q{SELECT i.position, i.pseudonym, ri.result, ri.error FROM validation_run_items ri
+                            JOIN validation_items i ON i.id = ri.item_id WHERE ri.run_id = ? ORDER BY i.position}, $c->param('id'))->expand->hashes;
+    my $cell = sub { my $v = shift // ''; $v =~ /[";\n]/ ? '"' . ($v =~ s/"/""/gr) . '"' : $v };
+    my @out = ('position;pseudonym;art;domain;code;label;side;date;detail');
+    for my $r (@$rows) {
+        my $res = $r->{result} // {};
+        push @out, join(';', map { $cell->($_) } $r->{position}, $r->{pseudonym}, 'fehler', '', '', '', '', '', $r->{error}) if $r->{error};
+        push @out, join(';', map { $cell->($_) } $r->{position}, $r->{pseudonym}, 'fehlt', @$_{qw(domain code label side date)}, '') for @{ $res->{fn} // [] };
+        push @out, join(';', map { $cell->($_) } $r->{position}, $r->{pseudonym}, 'zusaetzlich', @$_{qw(domain code label side date)}, '') for @{ $res->{fp} // [] };
+        push @out, join(';', map { $cell->($_) } $r->{position}, $r->{pseudonym}, 'verwandt', $_->{domain}, $_->{pred_code}, $_->{pred_label}, '', '',
+                                                  "Referenz $_->{ref_code} $_->{ref_label}") for @{ $res->{partial} // [] };
+        for my $a (@{ $res->{attr_errors} // [] }) {
+            my $d = join(', ', map { "$_: Referenz '$a->{errors}{$_}{ref}', Extraktion '$a->{errors}{$_}{pred}'" } sort keys %{ $a->{errors} });
+            push @out, join(';', map { $cell->($_) } $r->{position}, $r->{pseudonym}, 'attribut', $a->{domain}, $a->{code}, $a->{label}, '', '', $d);
+        }
+    }
+    $c->res->headers->content_type('text/csv; charset=utf-8');
+    $c->res->headers->content_disposition('attachment; filename="regression_lauf_' . $c->param('id') . '.csv"');
+    $c->render(data => encode('UTF-8', join("\n", @out) . "\n"));
+};
+
+sub _val_regression_compare {
+    my ($metrics, $base_metrics, $items, $base_items) = @_;
+    my $tol = $ENV{ONTOTRIAL_REGRESSION_TOLERANCE} // 0.02;
+    my (%delta, @worse);
+    for my $d (@VAL_DOMAINS, 'all') {
+        my ($now, $was) = ($metrics->{$d}{f1}, $base_metrics->{$d}{f1});
+        next unless defined $now && defined $was;
+        $delta{$d} = sprintf('%.4f', $now - $was) + 0;
+        push @worse, $d if $now - $was < -$tol;
+    }
+    my %base = map { $_->{item_id} => $_->{result} // {} } @$base_items;
+    my @changes;
+    for my $it (@$items) {
+        my $b = $base{ $it->{item_id} } or next;
+        my $r = $it->{result} // {};
+        my %tp_now = map { $_ => 1 } @{ $r->{tp_keys} // [] };
+        my %fp_was = map { $_->{sig} => 1 } @{ $b->{fp} // [] };
+        my %ref_by_key = map { $_->{key} => $_ } @{ $r->{fn} // [] };
+        my @lost   = map { $ref_by_key{$_} // { key => $_ } } grep { !$tp_now{$_} } @{ $b->{tp_keys} // [] };
+        my %tp_was = map { $_ => 1 } @{ $b->{tp_keys} // [] };
+        my @gained = grep { !$tp_was{$_} } @{ $r->{tp_keys} // [] };
+        my @new_fp = grep { !$fp_was{ $_->{sig} } } @{ $r->{fp} // [] };
+        push @changes, { item_id => $it->{item_id}, position => $it->{position}, lost => \@lost,
+                         gained => scalar @gained, new_fp => \@new_fp } if @lost || @gained || @new_fp;
+    }
+    return { delta_f1 => \%delta, worse_domains => \@worse, tolerance => $tol + 0,
+             verdict => @worse ? 'regression' : 'ok', changes => \@changes };
+}
+
+app->minion->add_task(validation_run_task => sub {
+    my ($job, $payload) = @_;
+    my $app    = $job->app;
+    my $db     = $app->pg->db;
+    my $run_id = $payload->{run_id};
+    my $run    = $db->query('SELECT * FROM validation_runs WHERE id = ?', $run_id)->hash or return $job->fail('Lauf fehlt');
+    my $set    = _val_load_set($db, $run->{set_id});
+    my $items  = _val_load_items($db, $set->{id});
+    my $task   = "validation_run_$run_id";
+    my $n      = scalar @$items;
+    $db->update('validation_runs', { status => 'running' }, { id => $run_id });
+
+    my $k = 0;
+    for my $i (@$items) {
+        $k++;
+        my ($pp, $err);
+        if ($run->{mode} eq 'stored') {
+            my $row = $i->{candidate_id} ? $db->query('SELECT narrative_report, phenopacket_json::text AS pp FROM candidates WHERE id = ?', $i->{candidate_id})->hash : undef;
+            if (!$row) { $err = 'Brief nicht mehr im Bestand' }
+            elsif (md5_hex(encode('UTF-8', $row->{narrative_report} // '')) ne $i->{narrative_md5}) { $err = 'Brieftext im Bestand wurde geändert' }
+            else { $pp = _ppd_parse_json($row->{pp}) or $err = 'Phenopacket nicht lesbar' }
+        } else {
+            $app->generate_phenopacket_impl($i->{narrative}, $payload->{model}, undef, $i->{reference_date}, 0, $task)
+                ->then(sub { $pp = shift })->catch(sub { $err = 'Pipeline-Fehler: ' . shift })->wait;
+        }
+        my $result = $pp && !$err ? _val_compare($app, $i->{reference} // { entries => [] }, _val_entries($pp)) : undef;
+        $db->query(q{INSERT INTO validation_run_items (run_id, item_id, phenopacket, result, error) VALUES (?, ?, ?::jsonb, ?::jsonb, ?)
+                     ON CONFLICT (run_id, item_id) DO UPDATE SET phenopacket = EXCLUDED.phenopacket, result = EXCLUDED.result, error = EXCLUDED.error},
+                   $run_id, $i->{id}, $pp ? to_json($pp) : undef, $result ? to_json($result) : undef, $err);
+        my $pct = int(100 * $k / ($n || 1));
+        $db->update('validation_runs', { progress => $pct }, { id => $run_id });
+        $app->notify_task_progress($task, 'running', $pct, "Validierung: Brief $k von $n");
+    }
+
+    my $rows    = $db->query('SELECT ri.item_id, i.position, ri.result FROM validation_run_items ri JOIN validation_items i ON i.id = ri.item_id WHERE ri.run_id = ? ORDER BY i.position', $run_id)->expand->hashes->to_array;
+    my @results = map { $_->{result} } grep { $_->{result} } @$rows;
+    my $metrics = _val_metrics(\@results);
+    $metrics->{n_items}  = $n;
+    $metrics->{n_failed} = $n - scalar @results;
+    my $cmp;
+    if (my $base_id = $set->{baseline_run_id}) {
+        my $base = $db->query('SELECT metrics FROM validation_runs WHERE id = ?', $base_id)->expand->hash;
+        my $bi   = $db->query('SELECT item_id, result FROM validation_run_items WHERE run_id = ?', $base_id)->expand->hashes->to_array;
+        $cmp = _val_regression_compare($metrics, $base->{metrics} // {}, $rows, $bi) if $base;
+        $cmp->{baseline_run_id} = $base_id + 0 if $cmp;
+    }
+    $db->update('validation_runs', { status => 'finished', progress => 100, metrics => to_json($metrics),
+                                     comparison => $cmp ? to_json($cmp) : undef, finished_at => \'now()' }, { id => $run_id });
+    $app->notify_task_progress($task, 'finished', 100, 'Validierung abgeschlossen');
+    $job->finish({ run_id => $run_id });
+});
+
+# ---------------------------------------------------------
+# Validierungsstudie: Kennzahlen nach Bewertungshandbuch und Rohdaten
+# ---------------------------------------------------------
+sub _val_kappa {
+    my ($pairs) = @_;
+    return undef unless @$pairs;
+    my ($agree, %pa, %pb) = (0);
+    for my $p (@$pairs) { $agree++ if $p->[0] eq $p->[1]; $pa{ $p->[0] }++; $pb{ $p->[1] }++; }
+    my $n  = scalar @$pairs;
+    my $po = $agree / $n;
+    my $pe = 0;
+    $pe += ($pa{$_} // 0) * ($pb{$_} // 0) / ($n * $n) for keys %{ { %pa, %pb } };
+    return { n => $n, agreement => sprintf('%.4f', $po) + 0, kappa => $pe < 1 ? sprintf('%.4f', ($po - $pe) / (1 - $pe)) + 0 : undef };
+}
+
+sub _val_study_counts {
+    my ($item, $res) = @_;
+    my %inj = map { $_->{key} => $_ } @{ $item->{injected} // [] };
+    my %c;
+    for my $e (@{ $item->{entries} }) {
+        next if $inj{ $e->{key} };
+        my $j = $res->{judgments}{ $e->{key} } or next;
+        my $v = $j->{verdict} // '';
+        my $d = $e->{domain};
+        if ($v eq 'duplicate') { $c{$d}{duplicate}++; next }
+        if ($v eq 'unclear')   { $c{$d}{unclear}++;   next }
+        my $concept = $j->{concept} // 'ok';
+        $c{$d}{judged}++;
+        $c{$d}{strict}++   if $concept eq 'ok';
+        $c{$d}{tolerant}++ if $concept eq 'ok' || $concept eq 'broader';
+        $c{$d}{"concept_$concept"}++;
+        next unless $concept eq 'ok';
+        for my $a (qw(side date value)) {
+            my $s = $j->{$a} // 'ok';
+            next if $s eq 'na' || ($a eq 'value' && $d ne 'measurement');
+            $c{$d}{"${a}_n"}++;
+            $c{$d}{"${a}_ok"}++ if $s eq 'ok';
+        }
+        $c{$d}{status_n}++;
+        $c{$d}{status_ok}++ if ($j->{status} // 'ok') eq 'ok';
+    }
+    for my $l (@{ ($res->{checklist} // {})->{lines} // [] }) {
+        my $cat = $l->{cat} // 'sonstiges';
+        next unless length($l->{match} // '');
+        $c{_recall}{$cat}{n}++;
+        $c{_recall}{$cat}{found}++ if $l->{match} eq 'found' || $l->{match} eq 'attr';
+        $c{_recall}{$cat}{exact}++ if $l->{match} eq 'found';
+    }
+    return \%c;
+}
+
+sub _val_detected {
+    my ($inj, $judg) = @_;
+    my $h = $judg // {};
+    my $j = $h->{ $inj->{key} } // {};
+    return (($j->{side} // '') =~ /^(?:wrong|missing)$/ || ($j->{concept} // 'ok') ne 'ok') ? 1 : 0 if $inj->{type} eq 'side_swap';
+    return (($j->{date} // '') eq 'wrong' || ($j->{concept} // 'ok') ne 'ok') ? 1 : 0 if $inj->{type} eq 'date_shift';
+    my $code = _val_code($inj->{original}{code});
+    return (grep { /^missing:/ && !$h->{$_}{deleted} && _val_code($h->{$_}{code}) eq $code } keys %$h) ? 1 : 0;
+}
+
+get '/BBB/validation/sets/:id/study' => sub {
+    my $c   = shift;
+    $c->inactivity_timeout(600);
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $items = _val_load_items($db, $set->{id});
+    my $revs  = _val_reviews_by_item($db, $set->{id});
+
+    my (@per_item, %kappa_pairs, %vig, $skipped);
+    for my $i (@$items) {
+        my $rows = $revs->{ $i->{id} } // [];
+        my $res  = _val_resolve($i, $rows);
+        if ($res->{status} eq 'ok') { push @per_item, _val_study_counts($i, $res) } else { $skipped++ }
+
+        # Übereinstimmung der beiden ersten Prüfer (vor Konsens)
+        my %by;
+        for my $r (@$rows) { $by{ $r->{reviewer} }{ $r->{entry_key} } = _val_json($r->{judgment}) }
+        my $dn = sub { my $h = $by{ $_[0] }{_done}; ref $h eq 'HASH' && $h->{done} };
+        my @rv = sort grep { $_ ne $VAL_CONSENSUS && $dn->($_) } keys %by;
+        if (@rv >= 2) {
+            for my $e (@{ $i->{entries} }) {
+                my ($a, $b) = map { $by{$_}{ $e->{key} } } @rv[0, 1];
+                next unless $a && $b;
+                push @{ $kappa_pairs{overall} }, [ ($a->{verdict} // '') eq 'correct' ? 1 : 0, ($b->{verdict} // '') eq 'correct' ? 1 : 0 ];
+                for my $attr (qw(concept status side date)) {
+                    push @{ $kappa_pairs{$attr} }, [ $a->{$attr} // 'ok', $b->{$attr} // 'ok' ];
+                }
+            }
+        }
+        # Wachsamkeit: eingestreute Fehler je Prüfer
+        for my $inj (@{ $i->{injected} // [] }) {
+            for my $rv (@rv) {
+                $vig{ $inj->{type} }{n}++;
+                $vig{ $inj->{type} }{detected} += _val_detected($inj, $by{$rv});
+            }
+        }
+    }
+
+    my $agg = sub {
+        my ($sample) = @_;
+        my %s;
+        for my $c (@$sample) {
+            for my $d (keys %$c) {
+                next if $d eq '_recall';
+                $s{$d}{$_} += $c->{$d}{$_} for keys %{ $c->{$d} };
+                $s{all}{$_} += $c->{$d}{$_} for keys %{ $c->{$d} };
+            }
+            for my $cat (keys %{ $c->{_recall} // {} }) {
+                $s{_recall}{$cat}{$_} += $c->{_recall}{$cat}{$_} for keys %{ $c->{_recall}{$cat} };
+                $s{_recall}{all}{$_}  += $c->{_recall}{$cat}{$_} for keys %{ $c->{_recall}{$cat} };
+            }
+        }
+        my %m;
+        for my $d (@VAL_DOMAINS, 'all') {
+            my $x = $s{$d} // {};
+            $m{$d} = { judged => $x->{judged} // 0, duplicate => $x->{duplicate} // 0, unclear => $x->{unclear} // 0,
+                       precision_strict => _val_ratio($x->{strict} // 0, $x->{judged} // 0),
+                       precision_tolerant => _val_ratio($x->{tolerant} // 0, $x->{judged} // 0),
+                       map { ("${_}_accuracy" => _val_ratio($x->{"${_}_ok"} // 0, $x->{"${_}_n"} // 0), "${_}_n" => $x->{"${_}_n"} // 0) } qw(side date status value) };
+            $m{$d}{"concept_$_"} = $x->{"concept_$_"} // 0 for qw(ok broader narrower wrong absent wrong_subject);
+        }
+        for my $cat (keys %{ $s{_recall} // {} }) {
+            my $x = $s{_recall}{$cat};
+            $m{recall}{$cat} = { n => $x->{n} // 0, recall => _val_ratio($x->{found} // 0, $x->{n} // 0),
+                                 recall_exact => _val_ratio($x->{exact} // 0, $x->{n} // 0) };
+        }
+        return \%m;
+    };
+
+    my $point = $agg->(\@per_item);
+    # 95-%-KI per Cluster-Bootstrap über Briefe
+    my $B = 2000;
+    my (%boot);
+    my $rng = 42;
+    my $rand = sub { $rng = ($rng * 1103515245 + 12345) % 2147483648; return $rng / 2147483648 };
+    if (@per_item) {
+        for (1 .. $B) {
+            my @s = map { $per_item[ int($rand->() * @per_item) ] } 1 .. @per_item;
+            my $m = $agg->(\@s);
+            for my $d (@VAL_DOMAINS, 'all') {
+                for my $k (qw(precision_strict precision_tolerant side_accuracy date_accuracy status_accuracy value_accuracy)) {
+                    push @{ $boot{$d}{$k} }, $m->{$d}{$k} if defined $m->{$d}{$k};
+                }
+            }
+            for my $cat (keys %{ $m->{recall} // {} }) {
+                push @{ $boot{"recall:$cat"}{recall} }, $m->{recall}{$cat}{recall} if defined $m->{recall}{$cat}{recall};
+            }
+        }
+    }
+    my $ci = sub {
+        my $v = shift;
+        return undef unless $v && @$v >= 20;
+        my @s = sort { $a <=> $b } @$v;
+        return [ $s[ int(0.025 * $#s) ], $s[ int(0.975 * $#s) ] ];
+    };
+    for my $d (@VAL_DOMAINS, 'all') {
+        $point->{$d}{"${_}_ci"} = $ci->($boot{$d}{$_}) for keys %{ $boot{$d} // {} };
+    }
+    for my $cat (keys %{ $point->{recall} // {} }) {
+        $point->{recall}{$cat}{recall_ci} = $ci->($boot{"recall:$cat"}{recall});
+    }
+    my %kappa = map { $_ => _val_kappa($kappa_pairs{$_}) } keys %kappa_pairs;
+    my %vigil = map { $_ => { %{ $vig{$_} }, rate => _val_ratio($vig{$_}{detected} // 0, $vig{$_}{n}) } } keys %vig;
+    my $ai = _val_ai_rows($db, $set->{id});
+    my %judges = map { $_ => _val_judge_agreement($items, $revs, $ai->{$_}) } keys %$ai;
+    my @jm = sort keys %$ai;
+    my $between;
+    if (@jm >= 2) {
+        my @pairs;
+        for my $i (@$items) {
+            my ($a, $b) = map { $ai->{$_}{ $i->{id} } } @jm[0, 1];
+            next unless $a && $b && !$a->{error} && !$b->{error};
+            for my $e (@{ $i->{entries} }) {
+                my ($x, $y) = ($a->{judgments}{ $e->{key} }, $b->{judgments}{ $e->{key} });
+                push @pairs, [ ($x->{verdict} // '') eq 'correct' ? 1 : 0, ($y->{verdict} // '') eq 'correct' ? 1 : 0 ] if $x && $y;
+            }
+        }
+        $between = { models => [ @jm[0, 1] ], overall => _val_kappa(\@pairs) };
+    }
+    $c->render(json => { set => { id => $set->{id}, name => $set->{name}, purpose => $set->{purpose}, frozen_at => $set->{frozen_at},
+                                  reference_source => $set->{reference_source} },
+                         n_items => scalar @$items, n_evaluated => scalar @per_item, n_skipped => $skipped // 0,
+                         metrics => $point, kappa => \%kappa, vigilance => \%vigil, bootstrap => $B,
+                         judges => \%judges, judges_between => $between });
+};
+
+get '/BBB/validation/sets/:id/judgments.csv' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $items = _val_load_items($db, $set->{id});
+    my $revs  = _val_reviews_by_item($db, $set->{id});
+    my $cell  = sub { my $v = shift // ''; $v =~ /[";\n]/ ? '"' . ($v =~ s/"/""/gr) . '"' : $v };
+    my @cols  = qw(verdict concept status side side_correct date date_correct value value_correct comment);
+    my @out   = (join(';', qw(set position item_id pseudonym stratum double_review reviewer row_type entry_key domain code label
+                              side date excluded value injected), @cols, 'checklist_cat', 'checklist_match'));
+    for my $i (@$items) {
+        my %e   = map { $_->{key} => $_ } @{ $i->{entries} };
+        my %inj = map { $_->{key} => $_->{type} } @{ $i->{injected} // [] };
+        for my $r (sort { $a->{reviewer} cmp $b->{reviewer} || $a->{entry_key} cmp $b->{entry_key} } @{ $revs->{ $i->{id} } // [] }) {
+            my $j    = _val_json($r->{judgment}) // {};
+            my @base = ($set->{name}, $i->{position}, $i->{id}, $i->{pseudonym}, $i->{stratum}, $i->{double_review} ? 1 : 0, $r->{reviewer});
+            if ($r->{entry_key} eq '_checklist') {
+                for my $l (@{ $j->{lines} // [] }) {
+                    push @out, join(';', map { $cell->($_) } @base, 'checkliste', '', '', '', $l->{text}, $l->{side}, $l->{date}, '', $l->{value},
+                                                             '', ('') x @cols, $l->{cat}, $l->{match});
+                }
+                next;
+            }
+            next if $r->{entry_key} eq '_done';
+            my $x    = $r->{entry_key} =~ /^missing:/ ? $j : ($e{ $r->{entry_key} } // {});
+            my $type = $r->{entry_key} =~ /^missing:/ ? ($j->{deleted} ? 'ergaenzt_geloescht' : 'ergaenzt') : 'eintrag';
+            push @out, join(';', map { $cell->($_) } @base, $type, $r->{entry_key}, @$x{qw(domain code label side date)}, $x->{excluded} ? 1 : 0,
+                                                     $x->{value}, $inj{ $r->{entry_key} } // '', @$j{@cols}, '', '');
+        }
+    }
+    (my $fn = $set->{name}) =~ s/[^A-Za-z0-9_\-]+/_/g;
+    $c->res->headers->content_type('text/csv; charset=utf-8');
+    $c->res->headers->content_disposition("attachment; filename=\"bewertungen_${fn}.csv\"");
+    $c->render(data => encode('UTF-8', join("\n", @out) . "\n"));
+};
+
+
+
+# ---------------------------------------------------------
+# KI-Judge: automatische Bewertung durch ein Claude-Modell
+# ---------------------------------------------------------
+# Der Judge bewertet jeden extrahierten Eintrag nach denselben Regeln wie die
+# Ärzte (Bewertungshandbuch) und nennt fehlende Einträge. Seine Urteile liegen
+# getrennt von den ärztlichen Bewertungen in validation_ai_reviews und dienen
+#   - als KI-Referenz, solange (noch) keine ärztliche Referenz existiert,
+#   - als zusätzlicher Bewerter, der in der Studie gegen die Ärzte gemessen wird.
+#
+# Zwei Anbieter, einzeln oder beide (dann werden sie auch gegeneinander verglichen):
+#   anthropic  Claude über die externe API (Briefe verlassen die Klinik)
+#   local      eigenes Modell, z. B. GLM-5, über eine OpenAI-kompatible API (vLLM)
+#              oder Ollama; die Briefe bleiben im Haus
+#
+# Konfiguration (Environment), Claude:
+#   ANTHROPIC_API_KEY              API-Schlüssel (ohne ihn ist der Claude-Judge aus)
+#   ONTOTRIAL_JUDGE_MODEL          Default claude-opus-5-5
+#   ONTOTRIAL_JUDGE_URL            Default https://api.anthropic.com/v1/messages
+#   ONTOTRIAL_JUDGE_MAX_TOKENS     Default 16000
+#   ONTOTRIAL_JUDGE_TEMPERATURE    leer = Modell-Default
+#   ONTOTRIAL_JUDGE_PII_GUARD      1 (Default) = Briefe mit Geburtsdatum oder
+#                                  Name mit Anrede werden nicht gesendet
+#   ONTOTRIAL_JUDGE_PII_REGEX      zusätzliche eigene Sperr-Regel
+# Lokaler Judge:
+#   ONTOTRIAL_JUDGE_LOCAL_MODEL    Modellname, z. B. glm-5 (ohne ihn ist der lokale Judge aus)
+#   ONTOTRIAL_JUDGE_LOCAL_URL      Chat-Completions-Endpunkt; Default wie die Pipeline (VLLM_ENDPOINT)
+#   ONTOTRIAL_JUDGE_LOCAL_KEY      API-Schlüssel; Default VLLM_API_KEY
+#   ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS  Default 32000 (Platz für den Denkprozess)
+#   ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE Default 0
+#   ONTOTRIAL_JUDGE_LOCAL_THINKING    0 = Denkmodus über chat_template_kwargs abschalten
+#   ONTOTRIAL_JUDGE_LOCAL_PII_GUARD   Default 0 (Briefe bleiben im Haus)
+# ---------------------------------------------------------
+
+our $VAL_JUDGE_SYSTEM = <<'TXT';
+Du bist ein erfahrener Augenarzt und prüfst die automatische Kodierung eines deutschen augenärztlichen Arztbriefs.
+Du erhältst den Brieftext und eine nummerierte Liste extrahierter Einträge (E1, E2, …). Jeder Eintrag hat eine
+Domäne (Diagnose ICD-10-GM, Befund HPO, Eingriff OPS, Medikation ATC, Messwert LOINC), einen Code mit Bezeichnung,
+eine Augenseite (RA, LA, beidseits oder keine), ein Datum, gegebenenfalls einen Messwert und den Status vorhanden/verneint.
+
+Bewerte jeden Eintrag ausschließlich am Brieftext. Ergänze kein klinisches Wissen und prüfe nicht, ob der Brief medizinisch stimmt.
+
+Konzept:
+- ok: der Code trifft den im Brief genannten Sachverhalt auf der Ebene, die der Brief hergibt
+- broader: richtige Oberklasse, der Brief stützt einen spezifischeren Code
+- narrower: der Code enthält ein Detail, das der Brief nicht trägt
+- wrong: der Code bezeichnet einen anderen Sachverhalt
+- absent: der Sachverhalt steht nicht im Brief
+- wrong_subject: der Sachverhalt betrifft nicht den Patienten (Familienanamnese, Spender, andere Person)
+Status:
+- ok: vorhanden/verneint stimmt
+- negation: verneint und vorhanden sind vertauscht („kein Anhalt für“, „keine“, „ausgeschlossen“ = verneint)
+- suspected: Verdacht, Differenzialdiagnose oder „fraglich“ wurde als gesichert übernommen
+- planned: geplante oder empfohlene Maßnahme wurde als erfolgt übernommen
+Augenseite und Datum: ok, wrong, missing (Brief nennt eine Angabe, der Eintrag hat keine), superfluous (Eintrag hat eine Angabe,
+die der Brief nicht hergibt) oder na (nicht anwendbar, etwa bei systemischen Befunden). Gib bei wrong oder missing die richtige
+Angabe an (Seite: R, L, B; bei superfluous: none; Datum: JJJJ, JJJJ-MM oder JJJJ-MM-TT, so genau wie im Brief).
+Messwert: ok, wrong (Zahl, Einheit oder Vergleichsoperator falsch) oder na bei Nicht-Messwerten; bei wrong den richtigen Wert.
+
+Regeln:
+- Anamnestische Angaben („Z. n.“, „bekannte“, „seit“) gehören zum Brief. Ihr Datum muss der Genauigkeit im Brief entsprechen.
+- Aktuelle Befunde ohne eigenes Datum gelten mit dem Briefdatum als korrekt datiert. Ein anamnestisches Ereignis ohne Datum
+  darf nicht das Briefdatum tragen (dann Datum superfluous).
+- Angaben wie „Tensio 18/21 mmHg“ werden als RA/LA gelesen.
+- Zitierte Vorbefunde anderer Kliniken gelten als Inhalt des Briefs.
+- Dosis und Applikationsfrequenz von Medikamenten werden nicht bewertet; Kombinationspräparate dürfen als Kombinationscode
+  oder als Einzelwirkstoffe kodiert sein.
+
+Fehlende Einträge: Nenne zusätzlich, was im Brief steht, aber nicht extrahiert wurde, beschränkt auf Augendiagnosen,
+augenrelevante Befunde, Augenoperationen und -eingriffe, Augenmedikation, Visus, Augendruck und andere augenärztliche Messwerte
+(höchstens 30). Gib einen Code nur an, wenn du ihn sicher kennst (ICD-10-GM, OPS, ATC, LOINC, HPO), sonst einen leeren Code.
+Verneinte Befunde nur, wenn sie klinisch relevant sind.
+
+Begründe jedes Urteil in höchstens einem kurzen Satz.
+TXT
+
+our $VAL_JUDGE_PROMPT_VERSION = substr(md5_hex(encode('UTF-8', $VAL_JUDGE_SYSTEM)), 0, 10);
+
+sub _val_judge_schema {
+    my $enum = sub { { type => 'string', enum => [@_] } };
+    my $attr = $enum->(qw(ok wrong missing superfluous na));
+    return {
+        type => 'object',
+        properties => {
+            entries => { type => 'array', items => {
+                type => 'object',
+                properties => {
+                    id            => { type => 'string' },
+                    concept       => $enum->(qw(ok broader narrower wrong absent wrong_subject)),
+                    status        => $enum->(qw(ok negation suspected planned)),
+                    side          => $attr,
+                    side_correct  => $enum->('', 'R', 'L', 'B', 'none'),
+                    date          => $attr,
+                    date_correct  => { type => 'string' },
+                    value         => $enum->(qw(ok wrong na)),
+                    value_correct => { type => 'string' },
+                    reason        => { type => 'string' },
+                },
+                required => [qw(id concept status side side_correct date date_correct value value_correct reason)],
+                additionalProperties => \0,
+            } },
+            missing => { type => 'array', items => {
+                type => 'object',
+                properties => {
+                    domain   => $enum->(@VAL_DOMAINS),
+                    label    => { type => 'string' },
+                    code     => { type => 'string' },
+                    side     => $enum->('', 'R', 'L', 'B'),
+                    date     => { type => 'string' },
+                    value    => { type => 'string' },
+                    unit     => { type => 'string' },
+                    excluded => { type => 'boolean' },
+                    reason   => { type => 'string' },
+                },
+                required => [qw(domain label code side date value unit excluded reason)],
+                additionalProperties => \0,
+            } },
+        },
+        required => [qw(entries missing)],
+        additionalProperties => \0,
+    };
+}
+
+sub _val_judge_user_message {
+    my ($item) = @_;
+    my %dom  = (disease => 'Diagnose', phenotype => 'Befund', procedure => 'Eingriff', treatment => 'Medikation', measurement => 'Messwert');
+    my %side = (R => 'RA', L => 'LA', B => 'beidseits', '' => 'keine');
+    my @lines;
+    my $n = 0;
+    for my $e (@{ $item->{entries} // [] }) {
+        $n++;
+        my $val = defined $e->{value} && length $e->{value} ? " | Wert: " . ($e->{comparator} && $e->{comparator} ne '=' ? "$e->{comparator} " : '') .
+                  "$e->{value}" . (length($e->{unit} // '') ? " $e->{unit}" : '') : (length($e->{value_text} // '') ? " | Wert: $e->{value_text}" : '');
+        push @lines, sprintf('E%d | %s | %s %s | Seite: %s | Datum: %s | %s%s', $n, $dom{ $e->{domain} } // $e->{domain}, $e->{code},
+                             $e->{label} // '', $side{ $e->{side} // '' } // $e->{side}, length($e->{date} // '') ? $e->{date} : 'keins',
+                             $e->{excluded} ? 'verneint' : 'vorhanden', $val);
+    }
+    return "Briefdatum: " . ($item->{reference_date} // 'unbekannt') . "\n\n<brief>\n" . ($item->{narrative} // '') . "\n</brief>\n\n" .
+           "Extrahierte Einträge (" . scalar(@lines) . "):\n" . (@lines ? join("\n", @lines) : '(keine)') . "\n\n" .
+           "Bewerte jeden Eintrag (id = E-Nummer) und nenne fehlende Einträge.";
+}
+
+sub _val_pii_hit {
+    my $t = shift // '';
+    return undef if ($ENV{ONTOTRIAL_JUDGE_PII_GUARD} // '1') eq '0';
+    if (my $re = $ENV{ONTOTRIAL_JUDGE_PII_REGEX}) {
+        return 'eigene Sperr-Regel' if eval { $t =~ /$re/ };
+    }
+    return 'Geburtsdatum' if $t =~ /\bgeb(?:oren|\.)\s*(?:am\s*)?\d{1,2}\.\s*\d{1,2}\.\s*\d{2,4}/i;
+    return 'Name mit Anrede' if $t =~ /\b(?:Herrn?|Frau)\s+(?!Kolleg|Dr\b|Dr\.|Prof|Doktor|Doctor)[A-ZÄÖÜ][a-zäöüß]{2,}/;
+    return undef;
+}
+
+sub _val_judge_model { return $ENV{ONTOTRIAL_JUDGE_MODEL} || 'claude-opus-5-5' }
+
+sub _val_judge_providers {
+    return [
+        { id => 'anthropic', label => 'Claude (externe API)', model => _val_judge_model(), external => 1,
+          configured => $ENV{ANTHROPIC_API_KEY} ? 1 : 0 },
+        { id => 'local', label => 'lokales Modell', model => $ENV{ONTOTRIAL_JUDGE_LOCAL_MODEL} // '', external => 0,
+          configured => $ENV{ONTOTRIAL_JUDGE_LOCAL_MODEL} ? 1 : 0 },
+    ];
+}
+
+sub _val_judge_provider {
+    my $id = shift // '';
+    my ($p) = grep { $_->{id} eq $id } @{ _val_judge_providers() };
+    return $p;
+}
+
+sub _val_judge_call_local {
+    my ($item) = @_;
+    my $model = $ENV{ONTOTRIAL_JUDGE_LOCAL_MODEL} or die "ONTOTRIAL_JUDGE_LOCAL_MODEL ist nicht gesetzt\n";
+    my $cfg   = resolve_llm_config($model);
+    my $url   = $ENV{ONTOTRIAL_JUDGE_LOCAL_URL} || $cfg->{endpoint};
+    my %hdr   = (%{ $cfg->{headers} // {} });
+    $hdr{Authorization} = "Bearer $ENV{ONTOTRIAL_JUDGE_LOCAL_KEY}" if $ENV{ONTOTRIAL_JUDGE_LOCAL_KEY};
+    my $ollama = $cfg->{is_ollama} && !$ENV{ONTOTRIAL_JUDGE_LOCAL_URL} ? 1 : ($url =~ m{/api/chat\b} ? 1 : 0);
+    my $temp   = $ENV{ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE} // '0';
+    my $maxtok = ($ENV{ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS} || 32000) + 0;
+    my @msgs   = ({ role => 'system', content => $VAL_JUDGE_SYSTEM }, { role => 'user', content => _val_judge_user_message($item) });
+    my $body = $ollama
+        ? { model => $model, messages => \@msgs, format => _val_judge_schema(), stream => Mojo::JSON->false,
+            options => { (length $temp ? (temperature => $temp + 0) : ()), num_predict => $maxtok, num_ctx => 65536 } }
+        : { model => $model, messages => \@msgs, max_tokens => $maxtok, (length $temp ? (temperature => $temp + 0) : ()),
+            response_format => { type => 'json_schema', json_schema => { name => 'validation_judgment', strict => \1, schema => _val_judge_schema() } } };
+    $body->{chat_template_kwargs} = { enable_thinking => Mojo::JSON->false }
+        if !$ollama && ($ENV{ONTOTRIAL_JUDGE_LOCAL_THINKING} // '1') eq '0';
+
+    my $ua = Mojo::UserAgent->new(connect_timeout => 30, inactivity_timeout => 1800, request_timeout => 1800);
+    $ua->proxy->detect;
+    my $last = '';
+    for my $try (1 .. 3) {
+        my $tx  = $ua->post($url => \%hdr => json => $body);
+        my $res = $tx->res;
+        if (my $err = $tx->error) {
+            $last = $err->{code} ? "HTTP $err->{code}: " . substr($res->body // '', 0, 300) : "Verbindung: $err->{message}";
+            die "Lokales Modell: $last\n" if ($err->{code} // 0) && $err->{code} < 500 && $err->{code} != 429;
+            sleep 10 * $try;
+            next;
+        }
+        my $j = $res->json // {};
+        my ($content, $finish, %usage);
+        if ($ollama) {
+            $content = $j->{message}{content} // '';
+            $finish  = ($j->{done_reason} // '') eq 'length' ? 'length' : 'stop';
+            %usage   = (input_tokens => $j->{prompt_eval_count} // 0, output_tokens => $j->{eval_count} // 0);
+        } else {
+            my $ch = $j->{choices}[0] // {};
+            $content = $ch->{message}{content} // '';
+            $finish  = $ch->{finish_reason} // '';
+            %usage   = (input_tokens => $j->{usage}{prompt_tokens} // 0, output_tokens => $j->{usage}{completion_tokens} // 0);
+        }
+        die "Antwort abgeschnitten (ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS zu klein)\n" if $finish eq 'length';
+        my $out = clean_and_parse_json($content);
+        if (ref $out ne 'HASH' && $content =~ /(\{.*\})/s) { $out = clean_and_parse_json($1) }
+        die "Antwort des lokalen Modells ist kein gültiges JSON\n" unless ref $out eq 'HASH' && ref $out->{entries} eq 'ARRAY';
+        return ($out, \%usage, $model);
+    }
+    die "Lokales Modell nicht erreichbar ($last)\n";
+}
+
+sub _val_judge_call {
+    my ($item, $provider) = @_;
+    return _val_judge_call_local($item) if ($provider // 'anthropic') eq 'local';
+    my $key = $ENV{ANTHROPIC_API_KEY} or die "ANTHROPIC_API_KEY ist nicht gesetzt\n";
+    my $model = _val_judge_model();
+    my $body = {
+        model      => $model,
+        max_tokens => ($ENV{ONTOTRIAL_JUDGE_MAX_TOKENS} || 16000) + 0,
+        system     => $VAL_JUDGE_SYSTEM,
+        messages   => [ { role => 'user', content => _val_judge_user_message($item) } ],
+        output_config => { format => { type => 'json_schema', schema => _val_judge_schema() } },
+    };
+    my $temp = $ENV{ONTOTRIAL_JUDGE_TEMPERATURE} // '';
+    $body->{temperature} = $temp + 0 if length $temp;
+
+    my $ua = Mojo::UserAgent->new(connect_timeout => 30, inactivity_timeout => 900, request_timeout => 900);
+    $ua->proxy->detect;
+    my $url = $ENV{ONTOTRIAL_JUDGE_URL} || 'https://api.anthropic.com/v1/messages';
+    my $last = '';
+    for my $try (1 .. 5) {
+        my $tx  = $ua->post($url => { 'x-api-key' => $key, 'anthropic-version' => '2023-06-01' } => json => $body);
+        my $res = $tx->res;
+        if (my $err = $tx->error) {
+            $last = $err->{code} ? "HTTP $err->{code}: " . substr($res->body // '', 0, 300) : "Verbindung: $err->{message}";
+            my $code = $err->{code} // 0;
+            die "API-Fehler $last\n" if $code && $code != 429 && $code < 500;
+            my $wait = $res->headers->header('retry-after');
+            sleep(($wait && $wait =~ /^\d+$/) ? $wait : 10 * $try);
+            next;
+        }
+        my $j = $res->json // {};
+        my $stop = $j->{stop_reason} // '';
+        die "Antwort abgeschnitten (max_tokens zu klein)\n" if $stop eq 'max_tokens';
+        die "Modell hat die Bewertung abgelehnt\n" if $stop eq 'refusal';
+        my ($text) = map { $_->{text} } grep { ($_->{type} // '') eq 'text' } @{ $j->{content} // [] };
+        my $out = eval { decode_json(encode('UTF-8', $text // '')) };
+        die "Antwort ist kein gültiges JSON\n" unless ref $out eq 'HASH';
+        return ($out, $j->{usage} // {}, $j->{model} // $model);
+    }
+    die "API nicht erreichbar ($last)\n";
+}
+
+my %VAL_ONT = (disease => 'icd10', phenotype => 'hpo', procedure => 'ops', treatment => 'atc', measurement => 'loinc');
+
+sub _val_norm_code {
+    my ($domain, $code) = @_;
+    $code //= '';
+    $code =~ s/^\s+|\s+$//g;
+    return '' unless length $code;
+    if ($domain eq 'phenotype') {
+        return $code =~ /(\d{1,7})\s*$/ ? sprintf('HP:%07d', $1) : '';
+    }
+    my %pre = (disease => 'ICD10', procedure => 'OPS', treatment => 'ATC', measurement => 'LOINC');
+    $code =~ s/^(?:ICD-?10(?:-GM)?|OPS|ATC|LOINC)\s*:\s*//i;
+    $code = uc $code unless $domain eq 'measurement';
+    return "$pre{$domain}:$code";
+}
+
+# Antwort des Judge in das Bewertungsformat der Ärzte übersetzen
+sub _val_ai_convert {
+    my ($c, $item, $out) = @_;
+    my %by = map { uc($_->{id} // '') => $_ } @{ $out->{entries} // [] };
+    my (%j, @missing, $unjudged);
+    my $n = 0;
+    for my $e (@{ $item->{entries} // [] }) {
+        $n++;
+        my $a = $by{"E$n"} or do { $unjudged++; next };
+        my %x = map { $_ => lc($a->{$_} // '') } qw(concept status side date value);
+        $x{side_correct}  = uc($a->{side_correct} // '');
+        $x{date_correct}  = $a->{date_correct} // '';
+        $x{value_correct} = $a->{value_correct} // '';
+        $x{comment}       = $a->{reason} // '';
+        if ($x{side_correct} eq 'NONE') {
+            $x{side_correct} = '';
+            $x{side} = 'superfluous' if $x{side} eq 'wrong' || $x{side} eq 'missing';
+        }
+        $x{value} = 'na' if $e->{domain} ne 'measurement';
+        my $ok = $x{concept} eq 'ok' && $x{status} eq 'ok' && $x{side} =~ /^(?:ok|na)$/ && $x{date} =~ /^(?:ok|na)$/ && $x{value} =~ /^(?:ok|na)$/;
+        $x{verdict} = $ok ? 'correct' : 'error';
+        $j{ $e->{key} } = \%x;
+    }
+    for my $m (@{ $out->{missing} // [] }) {
+        my $domain = lc($m->{domain} // '');
+        next unless $VAL_ONT{$domain} && length($m->{label} // '');
+        my $code  = _val_norm_code($domain, $m->{code});
+        my $label = length $code ? eval { $c->get_canonical_ontology_label($VAL_ONT{$domain}, $code) } : undef;
+        push @missing, {
+            missing => 1, domain => $domain, label => $m->{label}, side => uc($m->{side} // ''),
+            code => (defined $label ? $code : ''), code_suggested => $code, code_label => $label // '',
+            date => _val_date($m->{date}), value => $m->{value} // '', unit => $m->{unit} // '',
+            excluded => $m->{excluded} ? 1 : 0, comment => $m->{reason} // '',
+        };
+    }
+    return (\%j, \@missing, $unjudged // 0);
+}
+
+# KI-Bewertungen eines Datensatzes: { model => { item_id => row } }
+sub _val_ai_rows {
+    my ($db, $set_id) = @_;
+    my $rows = $db->query(q{SELECT a.* FROM validation_ai_reviews a JOIN validation_items i ON i.id = a.item_id WHERE i.set_id = ?}, $set_id)
+                  ->expand->hashes->to_array;
+    my %by;
+    $by{ $_->{model} }{ $_->{item_id} } = $_ for @$rows;
+    return \%by;
+}
+
+sub _val_ai_resolution {
+    my ($ai) = @_;
+    return undef unless $ai && !$ai->{error} && $ai->{judgments};
+    return { status => 'ok', source => "KI-Judge ($ai->{model})", reviewer => "KI-Judge ($ai->{model})",
+             judgments => $ai->{judgments}, missing => $ai->{missing} // [] };
+}
+
+get '/BBB/validation/sets/:id/judge' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $models = $db->query(q{
+        SELECT a.model, count(*) FILTER (WHERE a.error IS NULL) AS n_ok, count(*) FILTER (WHERE a.error IS NOT NULL) AS n_errors,
+               coalesce(sum((a.usage->>'input_tokens')::bigint), 0) AS tokens_in, coalesce(sum((a.usage->>'output_tokens')::bigint), 0) AS tokens_out,
+               max(a.created_at) AS last_at
+        FROM validation_ai_reviews a JOIN validation_items i ON i.id = a.item_id WHERE i.set_id = ?
+        GROUP BY a.model ORDER BY a.model
+    }, $set->{id})->hashes->to_array;
+    for my $m (@$models) {
+        $m->{$_} += 0 for qw(n_ok n_errors tokens_in tokens_out);
+        $m->{errors} = $db->query(q{SELECT i.position, a.error FROM validation_ai_reviews a JOIN validation_items i ON i.id = a.item_id
+                                    WHERE i.set_id = ? AND a.model = ? AND a.error IS NOT NULL ORDER BY i.position LIMIT 10},
+                                  $set->{id}, $m->{model})->hashes->to_array;
+    }
+    my @running;
+    my $jobs = $c->minion->jobs({ tasks => ['validation_judge_task'], states => [qw(inactive active)] });
+    while (my $job = $jobs->next) { push @running, $job->{args}[0]{provider} // 'anthropic' if ($job->{args}[0]{set_id} // 0) == $set->{id} }
+    my $n_items = $db->query('SELECT count(*) AS n FROM validation_items WHERE set_id = ?', $set->{id})->hash->{n};
+    $c->render(json => { providers => _val_judge_providers(), prompt_version => $VAL_JUDGE_PROMPT_VERSION, n_items => $n_items + 0,
+                         running => \@running, reference_source => $set->{reference_source}, models => $models });
+};
+
+post '/BBB/validation/sets/:id/judge' => sub {
+    my $c   = shift;
+    my $p   = $c->req->json // {};
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $prov = _val_judge_provider($p->{provider} // 'anthropic')
+        or return $c->render(json => { error => 'Unbekannter Judge-Anbieter.' }, status => 400);
+    return $c->render(json => { error => "$prov->{label} ist nicht konfiguriert." }, status => 409) unless $prov->{configured};
+    return $c->render(json => { error => 'Zum Senden der Briefe an die externe API "EXTERN" bestätigen.' }, status => 400)
+        if $prov->{external} && ($p->{confirm} // '') ne 'EXTERN';
+    my $jobs = $c->minion->jobs({ tasks => ['validation_judge_task'], states => [qw(inactive active)] });
+    while (my $job = $jobs->next) {
+        my $a = $job->{args}[0] // {};
+        return $c->render(json => { error => "Für diesen Datensatz läuft $prov->{label} bereits." }, status => 409)
+            if ($a->{set_id} // 0) == $set->{id} && ($a->{provider} // 'anthropic') eq $prov->{id};
+    }
+    my $id = $c->minion->enqueue(validation_judge_task => [{ set_id => $set->{id}, provider => $prov->{id},
+                                                             overwrite => to_bool($p->{overwrite}) ? 1 : 0 }], { attempts => 1 });
+    $c->app->log->info("[VALIDATION] KI-Judge für \"$set->{name}\" gestartet (Job $id, $prov->{label}, Modell $prov->{model}).");
+    $c->render(json => { ok => 1, job => $id, provider => $prov->{id}, model => $prov->{model} });
+};
+
+app->minion->add_task(validation_judge_task => sub {
+    my ($job, $payload) = @_;
+    my $app   = $job->app;
+    my $db    = $app->pg->db;
+    my $set   = _val_load_set($db, $payload->{set_id}) or return $job->fail('Datensatz fehlt');
+    my $items = _val_load_items($db, $set->{id});
+    my $prov  = _val_judge_provider($payload->{provider} // 'anthropic') or return $job->fail('Unbekannter Anbieter');
+    my $have  = _val_ai_rows($db, $set->{id})->{ $prov->{model} } // {};
+    my $guard = $prov->{external} ? 1 : (($ENV{ONTOTRIAL_JUDGE_LOCAL_PII_GUARD} // '0') ne '0');
+    my $task  = "validation_judge_$set->{id}";
+    my ($k, $n, $done, $failed, $skipped) = (0, scalar @$items, 0, 0, 0);
+
+    for my $i (@$items) {
+        $k++;
+        if ($have->{ $i->{id} } && !$have->{ $i->{id} }{error} && !$payload->{overwrite}) { $skipped++; next }
+        my ($out, $usage, $model, $err);
+        if (my $why = $guard ? _val_pii_hit($i->{narrative}) : undef) {
+            $err = "nicht gesendet: Brief enthält möglicherweise identifizierende Angaben ($why)";
+        } else {
+            ($out, $usage, $model) = eval { _val_judge_call($i, $prov->{id}) };
+            $err = $@ =~ s/\s+$//r if $@;
+        }
+        my ($judg, $missing, $unjudged) = $out ? _val_ai_convert($app, $i, $out) : ({}, [], 0);
+        $err //= "$unjudged Einträge ohne Urteil" if $out && $unjudged;
+        $db->query(q{INSERT INTO validation_ai_reviews (item_id, model, prompt_version, judgments, missing, raw, usage, error)
+                     VALUES (?, ?, ?, ?::jsonb, ?::jsonb, ?::jsonb, ?::jsonb, ?)
+                     ON CONFLICT (item_id, model) DO UPDATE SET prompt_version = EXCLUDED.prompt_version,
+                       judgments = EXCLUDED.judgments, missing = EXCLUDED.missing, raw = EXCLUDED.raw, usage = EXCLUDED.usage,
+                       error = EXCLUDED.error, created_at = now()},
+                   $i->{id}, $prov->{model}, $VAL_JUDGE_PROMPT_VERSION, to_json($judg), to_json($missing),
+                   $out ? to_json($out) : undef, to_json($usage // {}), $err);
+        $err ? $failed++ : $done++;
+        my $pct = int(100 * $k / ($n || 1));
+        $job->note(progress => $pct, done => $done, failed => $failed);
+        $app->notify_task_progress($task, 'running', $pct, "KI-Judge ($prov->{model}): Brief $k von $n");
+    }
+    $app->notify_task_progress($task, 'finished', 100, 'KI-Judge abgeschlossen');
+    $job->finish({ done => $done, failed => $failed, skipped => $skipped });
+});
+
+# Vergleich KI-Judge gegen die aufgelöste ärztliche Bewertung
+sub _val_judge_agreement {
+    my ($items, $revs, $ai) = @_;
+    my (%pairs, %conf, %miss, %vig);
+    my $n_items = 0;
+    for my $i (@$items) {
+        my $a = $ai->{ $i->{id} };
+        next unless $a && !$a->{error};
+        my $res = _val_resolve($i, $revs->{ $i->{id} } // []);
+        next unless $res->{status} eq 'ok';
+        $n_items++;
+        my %inj = map { $_->{key} => 1 } @{ $i->{injected} // [] };
+        for my $e (@{ $i->{entries} }) {
+            next if $inj{ $e->{key} };
+            my ($h, $k) = ($res->{judgments}{ $e->{key} }, $a->{judgments}{ $e->{key} });
+            next unless $h && $k && ($h->{verdict} // '') =~ /^(?:correct|error)$/;
+            my ($hc, $kc) = (($h->{verdict} eq 'correct') ? 1 : 0, (($k->{verdict} // '') eq 'correct') ? 1 : 0);
+            push @{ $pairs{overall} }, [ $hc, $kc ];
+            $conf{ $hc ? ($kc ? 'both_correct' : 'judge_only_error') : ($kc ? 'judge_missed_error' : 'both_error') }++;
+            push @{ $pairs{$_} }, [ $h->{$_} // 'ok', $k->{$_} // 'ok' ] for qw(concept status side date);
+        }
+        my %hm = map { _val_code($_->{code}) => 1 } grep { length($_->{code} // '') } @{ $res->{missing} // [] };
+        my %km = map { _val_code($_->{code}) => 1 } grep { length($_->{code} // '') } @{ $a->{missing} // [] };
+        $miss{both}       += scalar grep { $km{$_} } keys %hm;
+        $miss{human_only} += scalar grep { !$km{$_} } keys %hm;
+        $miss{judge_only} += scalar grep { !$hm{$_} } keys %km;
+    }
+    for my $i (@$items) {
+        my $a = $ai->{ $i->{id} };
+        next unless $a && !$a->{error};
+        my %h = %{ $a->{judgments} // {} };
+        my $m = 0;
+        $h{ 'missing:' . $m++ } = $_ for @{ $a->{missing} // [] };
+        for my $inj (@{ $i->{injected} // [] }) {
+            $vig{ $inj->{type} }{n}++;
+            $vig{ $inj->{type} }{detected} += _val_detected($inj, \%h);
+        }
+    }
+    my $err_h = ($conf{both_error} // 0) + ($conf{judge_missed_error} // 0);
+    my $ok_h  = ($conf{both_correct} // 0) + ($conf{judge_only_error} // 0);
+    return {
+        n_items     => $n_items,
+        kappa       => { map { $_ => _val_kappa($pairs{$_}) } keys %pairs },
+        confusion   => \%conf,
+        sensitivity => _val_ratio($conf{both_error} // 0, $err_h),
+        specificity => _val_ratio($conf{both_correct} // 0, $ok_h),
+        missing     => \%miss,
+        vigilance   => { map { $_ => { %{ $vig{$_} }, rate => _val_ratio($vig{$_}{detected} // 0, $vig{$_}{n}) } } keys %vig },
+    };
+}
+
 
 # =========================================================
 # GENERIC DB REST CRUD ENDPOINTS
