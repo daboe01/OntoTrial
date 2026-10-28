@@ -40,7 +40,7 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 | **Medications** | **ATC** | Active agents and trade names, eye drops, anti-VEGF/steroid IVOM auto-detection. |
 | **Measurements** | **LOINC** | Clinical chemistry, haematology, coagulation, thyroid, serology, blood pressure, BMI, PROMs (e.g. OSDI) and quantitative ophthalmic measurements. Supports local extension codes (`86290-4a`, `86301-9b`, …). |
 | **Anatomy & laterality** | **SNOMED CT / HPO** | Right/left/both eyes (`SNOMED:18944008`, `8966001`, `40638003`; `HP:0012834/5/2`). |
-| **Output standards** | **FHIR R6 `Group`**, `**Phenopacket v2.0.0**` | Nested definitional/conceptual criteria groups; patient phenopackets with features, measurements, diseases, procedures and medical actions. |
+| **Output standards** | **FHIR R6 `Group`**, **`Phenopacket v2`** | Nested definitional/conceptual criteria groups; patient phenopackets with features, measurements, diseases, procedures and medical actions. |
 
 Highlights added in recent versions:
 
@@ -49,7 +49,6 @@ Highlights added in recent versions:
 - **Deep mode** – optional two-stage extraction with an unconstrained reasoning trace (pre-extraction table) followed by schema-constrained JSON sampling.
 - **Anonymized export** – de-identified phenopackets for data sharing: no free text, ephemeral subject IDs, month truncation with patient-constant date shift, age top-coding and hierarchical generalization of rare codes (k ≥ 5).
 - **Long-format export** – one row per coded element as CSV or NDJSON, deduplicated across letters, streamed from a server-side cursor and directly readable from R (details [below](#long-format-export-for-statistics)).
-- **Validation** – protected reference data sets drawn from the stock, physician review per extracted element, regression tests of the pipeline against the frozen reference, study metrics with bootstrap confidence intervals and optional LLM judges (Claude or a local model) (details [below](#validation)).
 - **Patient similarity** – laterality-agnostic distance (unilateral vs. bilateral), nearest-neighbour search and greedy 1:n case-control matching with caliper.
 - **Catalog maintenance** – `update_catalogs.pl` for inventory, versioned imports with backups and post-import checks.
 - **Server-side persistence and live sync** – extracted phenopackets are stored by the backend under the `candidate_id` of the request; all open browsers receive the update over the WebSocket.
@@ -565,6 +564,8 @@ The schema is in `migrations/ontotrial.sql`. Minion manages its own tables, and 
 This project is licensed under the MIT License – see [LICENSE](LICENSE).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+For scientific reference, please cite it as [![DOI](https://zenodo.org/badge/1371450472.svg)](https://doi.org/10.5281/zenodo.23659642)
 
 OntoTrial interfaces with medical terminologies that retain their own copyright and terms of use. They are **not** included in this repository and must be obtained from their publishers:
 
