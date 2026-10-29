@@ -478,8 +478,13 @@ function OVAlert(aMessage, anInfo)
     _runs = [];
     _hudTasks = {};
 
-    _window = [[CPWindow alloc] initWithContentRect:CGRectMake(0, 0, 1300, 800)
-                                          styleMask:CPTitledWindowMask | CPClosableWindowMask | CPResizableWindowMask];
+    // Floating panel: same window level as the background-process HUD and the other
+    // floating panels of the app. Cappuccino delivers a click to the highest window
+    // level under the mouse, so an ordinary window below a floating panel would lose
+    // its clicks wherever the two overlap, even if it appears on top.
+    _window = [[CPPanel alloc] initWithContentRect:CGRectMake(0, 0, 1300, 800)
+                                         styleMask:CPTitledWindowMask | CPClosableWindowMask | CPResizableWindowMask];
+    [_window setFloatingPanel:YES];
     [_window setMinSize:CGSizeMake(1000, 560)];
     [_window setTitle:@"Validierung der Extraktion"];
     [_window setDelegate:self];
@@ -622,8 +627,9 @@ function OVAlert(aMessage, anInfo)
 {
     if (!_newPanel)
     {
-        _newPanel = [[CPWindow alloc] initWithContentRect:CGRectMake(0, 0, 480, 400)
+        _newPanel = [[CPPanel alloc] initWithContentRect:CGRectMake(0, 0, 480, 400)
                                                 styleMask:CPTitledWindowMask | CPClosableWindowMask];
+        [_newPanel setFloatingPanel:YES];
         [_newPanel setTitle:@"Neuen Validierungsdatensatz ziehen"];
         var cv = [_newPanel contentView];
         var y = 15;
@@ -1105,8 +1111,9 @@ function OVAlert(aMessage, anInfo)
 
     if (!_errorPanel)
     {
-        _errorPanel = [[CPWindow alloc] initWithContentRect:CGRectMake(0, 0, 470, 330)
+        _errorPanel = [[CPPanel alloc] initWithContentRect:CGRectMake(0, 0, 470, 330)
                                                   styleMask:CPTitledWindowMask | CPClosableWindowMask];
+        [_errorPanel setFloatingPanel:YES];
         [_errorPanel setTitle:@"Eintrag bewerten"];
         var cv = [_errorPanel contentView];
         _ePTitle = OTLabel(CGRectMake(20, 12, 430, 36), "", YES);
@@ -1205,8 +1212,9 @@ function OVAlert(aMessage, anInfo)
     _entryMode = aMode;
     if (!_entryPanel)
     {
-        _entryPanel = [[CPWindow alloc] initWithContentRect:CGRectMake(0, 0, 470, 320)
+        _entryPanel = [[CPPanel alloc] initWithContentRect:CGRectMake(0, 0, 470, 320)
                                                   styleMask:CPTitledWindowMask | CPClosableWindowMask];
+        [_entryPanel setFloatingPanel:YES];
         var cv = [_entryPanel contentView];
         _enTitle = OTLabel(CGRectMake(20, 12, 430, 36), "", NO);
         [cv addSubview:_enTitle];
@@ -1471,7 +1479,7 @@ function OVAlert(aMessage, anInfo)
     var rt = OVTable(CGRectMake(5, 212, 1260, 190), [["id", "Lauf", 45], ["started", "Gestartet", 135], ["mode", "Quelle", 120],
                                                     ["status", "Status", 95], ["f1", "F1", 65], ["precision", "Precision", 75],
                                                     ["recall", "Recall", 65], ["delta", "ΔF1 zur Basis", 95], ["verdict", "Ergebnis", 105],
-                                                    ["fingerprint", "Pipeline-Stand", 120], ["label", "Bezeichnung", 300]], self);
+                                                    ["model", "Modell", 130], ["fingerprint", "Pipeline-Stand", 110], ["label", "Bezeichnung", 260]], self);
     _runsTable = rt.table;
     [v addSubview:OVM(rt.scroll, CPViewWidthSizable)];
 
@@ -2013,13 +2021,19 @@ function OVAlert(aMessage, anInfo)
         return;
     }
     var setId = _currentSet.id;
-    [OVDialog prompt:(aMode === "stored" ? "Gespeicherte Phenopackets gegen die Referenz prüfen" : "Alle " + _currentSet.n_items + " Briefe neu extrahieren und prüfen")
-                info:(aMode === "stored" ? "Bezeichnung des Laufs, z. B. „Bestand vor Neu-Extraktion“:" : "Bezeichnung des Laufs, z. B. „nach Update Reranker“. Die Neu-Extraktion dauert.")
-               value:"" ok:"Lauf starten" then:function(label)
+    // Extraktionsmodell aus der Auswahl „LLM Model“ im Hauptfenster
+    var model = (aMode === "reextract" && _app && [_app respondsToSelector:@selector(selectedModel)]) ? [_app selectedModel] : nil;
+    [OVDialog prompt:(aMode === "stored" ? "Gespeicherte Phenopackets gegen die Referenz prüfen" : "Alle " + _currentSet.n_items + " Briefe mit " + (model || "dem Standardmodell") + " neu extrahieren und prüfen")
+                info:(aMode === "stored" ? "Bezeichnung des Laufs, z. B. „Bestand vor Neu-Extraktion“:" :
+                      "Das Modell kommt aus der Auswahl „LLM Model“ oben rechts im Hauptfenster. Bezeichnung des Laufs, z. B. „" + (model || "gpt-oss-120b") + " Lauf 1“. Die Neu-Extraktion dauert.")
+               value:(model ? model + " " : "") ok:"Lauf starten" then:function(label)
     {
         if (label === nil)
             return;
-        OTPostJSON("/BBB/validation/sets/" + setId + "/runs", { mode: aMode, label: label }, 60.0, function(res, error)
+        var payload = { mode: aMode, label: label };
+        if (model)
+            payload.model = model;
+        OTPostJSON("/BBB/validation/sets/" + setId + "/runs", payload, 60.0, function(res, error)
         {
             if (!res || res.error)
             {
@@ -2370,6 +2384,7 @@ function OVAlert(aMessage, anInfo)
                     return (_currentSet && _currentSet.baseline_run_id === r.id) ? "Basis" : "";
                 return r.comparison.verdict === "ok" ? "ok" : "Regression";
             case "fingerprint": return r.fingerprint ? (r.fingerprint.hash || "") : "";
+            case "model":       return r.mode === "stored" ? "Bestand" : (r.fingerprint ? (r.fingerprint.model || "") : "");
             default:            return r[ident] === undefined || r[ident] === null ? @"" : String(r[ident]);
         }
     }

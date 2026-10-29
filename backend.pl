@@ -11350,7 +11350,7 @@ sub _val_confirm_ok {
 }
 
 sub _val_fingerprint {
-    my ($app) = @_;
+    my ($app, $run_model) = @_;
     my $db = $app->pg->db;
     my %fp;
     my $file = $0 =~ m{^/} ? $0 : $app->home->rel_file($0) . '';
@@ -11360,7 +11360,7 @@ sub _val_fingerprint {
     chomp $git;
     $fp{git} = $git if length $git;
     my $prov = lc($ENV{LLM_PROVIDER} // 'vllm');
-    $fp{model} = $prov eq 'ollama' ? ($ENV{OLLAMA_MODEL} // '') : ($ENV{VLLM_MODEL} // '');
+    $fp{model} = $run_model || resolve_llm_config(undef)->{model} || ($prov eq 'ollama' ? ($ENV{OLLAMA_MODEL} // '') : ($ENV{VLLM_MODEL} // ''));
     for my $t (qw(llm_prompts ontology_intercepts filter_rules catalog_versions)) {
         my $h = eval { $db->query("SELECT md5(coalesce(string_agg(x::text, '|' ORDER BY x::text), '')) AS h FROM $t x")->hash->{h} };
         $fp{$t} = $h if $h;
@@ -11740,10 +11740,14 @@ post '/BBB/validation/sets/:id/runs' => sub {
     return $c->render(json => { error => 'Für diesen Datensatz läuft bereits ein Lauf.' }, status => 409)
         if $db->query(q{SELECT 1 FROM validation_runs WHERE set_id = ? AND status IN ('queued', 'running')}, $set->{id})->array;
     my $mode = ($p->{mode} // '') eq 'stored' ? 'stored' : 'reextract';
+    # bei Neu-Extraktion das gewählte Extraktionsmodell verwenden und im Pipeline-Stand vermerken
+    my $model  = $mode eq 'reextract' && defined $p->{model} && length $p->{model} ? $p->{model} : undef;
+    my $fp     = _val_fingerprint($c->app, $model);
+    $fp->{mode} = $mode;
     my $run_id = $db->insert('validation_runs', { set_id => $set->{id}, mode => $mode, label => $p->{label} // '',
-                                                  fingerprint => to_json(_val_fingerprint($c->app)) }, { returning => 'id' })->hash->{id};
-    $c->minion->enqueue(validation_run_task => [{ run_id => $run_id, model => $p->{model} }], { attempts => 1 });
-    $c->render(json => { ok => 1, run_id => $run_id, mode => $mode });
+                                                  fingerprint => to_json($fp) }, { returning => 'id' })->hash->{id};
+    $c->minion->enqueue(validation_run_task => [{ run_id => $run_id, model => $model }], { attempts => 1 });
+    $c->render(json => { ok => 1, run_id => $run_id, mode => $mode, model => $fp->{model} });
 };
 
 get '/BBB/validation/sets/:id/runs' => sub {
