@@ -49,7 +49,7 @@ Highlights added in recent versions:
 - **Deep mode** – optional two-stage extraction with an unconstrained reasoning trace (pre-extraction table) followed by schema-constrained JSON sampling.
 - **Anonymized export** – de-identified phenopackets for data sharing: no free text, ephemeral subject IDs, month truncation with patient-constant date shift, age top-coding and hierarchical generalization of rare codes (k ≥ 5).
 - **Long-format export** – one row per coded element as CSV or NDJSON, deduplicated across letters, streamed from a server-side cursor and directly readable from R (details [below](#long-format-export-for-statistics)).
-- **Validation** – protected reference data sets drawn from the stock, physician review per extracted element, regression tests of the pipeline against the frozen reference, study metrics with bootstrap confidence intervals and optional LLM judges (Claude or a local model) (details [below](#validation)).
+- **Validation** – protected reference data sets drawn from the stock, physician review per extracted element, regression tests of the pipeline against the frozen reference, study metrics with bootstrap confidence intervals, and an ensemble of local LLMs for quick review and as a second look (details [below](#validation)).
 - **Patient similarity** – laterality-agnostic distance (unilateral vs. bilateral), nearest-neighbour search and greedy 1:n case-control matching with caliper.
 - **Catalog maintenance** – `update_catalogs.pl` for inventory, versioned imports with backups and post-import checks.
 - **Server-side persistence and live sync** – extracted phenopackets are stored by the backend under the `candidate_id` of the request; all open browsers receive the update over the WebSocket.
@@ -325,14 +325,19 @@ The validation window (actions menu of the candidate list → *Validation...*) s
 
 **Study metrics.** Precision per domain (strict and tolerant), attribute accuracy, recall from the blinded checklist, Cohen's κ between two reviewers and detection rate of injected errors, each with 95 % confidence intervals from a cluster bootstrap over letters. All reviews can be exported in long format as CSV.
 
-**LLM judges.** An LLM can rate the extractions with the same rules as the physicians. Its ratings are stored separately and never mixed with the physician reviews. They can serve as an interim reference for regression tests (*Freeze AI reference*) and are compared with the physicians in the study metrics (sensitivity for errors found by physicians, specificity, κ, missing elements, injected errors); with two judges, their agreement with each other is reported as well.
+**AI ensemble.** Several local LLMs (letters stay in-house) pre-assess a data set: each model rates every extracted element by the reviewing rules and cites the supporting passage, which must occur verbatim in the letter. Candidates for missing elements come from the models' ratings, a section-wise recall pass and pipeline runs of the set; they need a verbatim quote, are coded through the mapping pipeline, and are kept only if at least two models confirm them. The verdict per element is the majority of the models (tie: *split*).
 
-| Judge | Variables | Notes |
-| :--- | :--- | :--- |
-| Claude (external API) | `ANTHROPIC_API_KEY`, `ONTOTRIAL_JUDGE_MODEL` (default `claude-opus-5-5`), `ONTOTRIAL_JUDGE_MAX_TOKENS`, `ONTOTRIAL_JUDGE_TEMPERATURE` | Letters leave the institution. Requires approval by data protection; every run must be confirmed with `EXTERN`. Letters with a date of birth or a name with salutation are withheld (`ONTOTRIAL_JUDGE_PII_GUARD`, `ONTOTRIAL_JUDGE_PII_REGEX`). |
-| Local models, e.g. gpt-oss-120b, GLM-5 | `ONTOTRIAL_JUDGE_LOCAL_MODELS` (comma-separated; default: the pipeline model `VLLM_MODEL`), `ONTOTRIAL_JUDGE_URL_<MODEL>` and `ONTOTRIAL_JUDGE_KEY_<MODEL>` per model (name in upper case, other characters as `_`, e.g. `ONTOTRIAL_JUDGE_KEY_GLM_5`; default: `VLLM_ENDPOINT`, `VLLM_API_KEY`), `ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS` (default 32000), `ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE` (default 0), `ONTOTRIAL_JUDGE_REASONING_EFFORT` (default `high`), `ONTOTRIAL_JUDGE_LOCAL_THINKING` | OpenAI-compatible endpoint (vLLM) or Ollama; letters stay in-house. |
+- **Quick review (regression sets).** The ensemble verdicts are shown next to each element, and the supporting passages are highlighted in the letter (green correct, orange possible error, blue missing, yellow selected). The reviewer confirms with Enter or corrects (K correct, F error, D duplicate, U unclear); the next letter is prefetched and saving runs in the background. This is deliberately biased and meant for regression references only.
+- **Second look (study sets).** The ensemble stays hidden until the reviewer has completed the letter; that state is saved as the unassisted review. Then the ensemble can be shown; changes are recorded separately. Study metrics report the unassisted values as the main result plus what the second look changed.
 
-The judge is chosen from a pop-up menu in the validation window; *Stop run* ends a running judge after the current letter, *Clear error log* removes failed ratings (valid ratings stay protected). Progress is shown in the background-process panel. Judge runs and regression runs are Minion jobs: the variables must be set for the Minion worker, and the worker must be restarted after updating `backend.pl`.
+There is no stand-alone AI reference; references come from physician reviews or from a pipeline run (*Freeze run as reference*). Variables: `ONTOTRIAL_JUDGE_LOCAL_MODELS` (comma-separated; default: `VLLM_MODEL`), `ONTOTRIAL_ENSEMBLE_MODELS` (subset), `ONTOTRIAL_JUDGE_URL_<MODEL>`/`ONTOTRIAL_JUDGE_KEY_<MODEL>` (default: `VLLM_ENDPOINT`, `VLLM_API_KEY`), `ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS` (32000), `ONTOTRIAL_JUDGE_REASONING_EFFORT` (medium), `ONTOTRIAL_ENSEMBLE_REASONING_EFFORT` (low), `ONTOTRIAL_ENSEMBLE_CHUNK_CHARS` (1800). Prompts: `validation_judge`, `validation_recall`, `validation_verify` in `llm_prompts`.
+
+Preparation, regression runs and the ensemble are Minion jobs in the queue `validation`, so they do not compete with everyday extraction. Run a dedicated worker for it:
+
+```bash
+perl backend.pl minion worker                      # default queue (extraction, import)
+perl backend.pl minion worker -q validation -j 1   # validation and AI ensemble
+```
 
 ---
 
@@ -370,7 +375,7 @@ cpanm Mojolicious Mojo::Pg Minion DateTime
 createdb hpo
 ```
 
-The schema is created automatically when `backend.pl` starts for the first time. It is maintained as a Mojo::Pg migration in `migrations/ontotrial.sql`: version 1 is the core schema (tables, views, functions, indexes and the extensions `pg_trgm` and `fuzzystrmatch`), version 2 adds the validation tables, version 3 allows deleting failed LLM-judge ratings in locked sets. The applied version is tracked in `mojo_migrations` under the name `ontotrial`; each version runs exactly once per database. The database user must be allowed to create the two extensions; since PostgreSQL 13 both are trusted, so owning the database is sufficient.
+The schema is created automatically when `backend.pl` starts for the first time. It is maintained as a Mojo::Pg migration in `migrations/ontotrial.sql`: version 1 is the core schema (tables, views, functions, indexes and the extensions `pg_trgm` and `fuzzystrmatch`), versions 2 to 7 add the validation tables, data set preparation, prompts in `llm_prompts`, the AI ensemble with second-look phases and quotes per rating. The applied version is tracked in `mojo_migrations` under the name `ontotrial`; each version runs exactly once per database. The database user must be allowed to create the two extensions; since PostgreSQL 13 both are trusted, so owning the database is sufficient.
 
 A database that already contains the schema (installations from before the migration) is detected on the first start and registered as core schema version 1 without any change.
 
@@ -505,9 +510,9 @@ Recommended order:
 | GET, POST | `/BBB/validation/sets` | List validation data sets / draw a new one (`name`, `n`, `purpose`, `seed`, `tag`, `confirm: "ANLEGEN"`) |
 | GET | `/BBB/validation/sets/:id/items`, `/BBB/validation/items/:id` | Letters of a set; one letter with its elements and the reviewer's ratings (`reviewer`) |
 | POST | `/BBB/validation/items/:id/review` | Save ratings (`reviewer`, `reviews`) |
-| POST | `/BBB/validation/sets/:id/freeze`, `/unfreeze`, `/lock` | Freeze or unfreeze the reference (`source: "judge"`, `model` for an AI reference), lock or unlock; confirmation with the set name |
+| POST | `/BBB/validation/sets/:id/freeze`, `/unfreeze`, `/lock` | Freeze or unfreeze the reference (physician reviews, or `source: "run"` with `run_id` for a pipeline reference), lock or unlock; confirmation with the set name |
 | POST, GET | `/BBB/validation/sets/:id/runs`, `/BBB/validation/runs/:id` | Start a regression run (`mode`: `reextract` or `stored`), results; `/BBB/validation/runs/:id/report.csv` |
-| POST, GET | `/BBB/validation/sets/:id/judge` | Start an LLM judge (`provider`: `anthropic` or `local`), judge status |
+| POST, GET | `/BBB/validation/sets/:id/ensemble` | Start the AI ensemble, status; `/ensemble/stop` stops it |
 | GET | `/BBB/validation/sets/:id/study`, `/judgments.csv`, `/export` | Study metrics, reviews as CSV, complete backup as JSON |
 | POST | `/BBB/propensity_match` | Greedy case-control matching (`treated_ids`/`treated_tag`, `control_ids`/`control_tag`, `ratio`, `caliper`, `replace`) |
 

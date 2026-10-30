@@ -8,8 +8,9 @@
  *                  Stand der Prüfung, Referenz einfrieren, Regressionsläufe
  *                  gegen die Referenz starten und vergleichen
  *   - Studie       Kennzahlen nach Bewertungshandbuch, Rohdaten als CSV
- *   - KI-Judge     Claude (extern) und/oder ein lokales Modell wie GLM-5 bewerten die
- *                  Briefe automatisch; liefert eine
+ *   - KI-Ensemble  mehrere lokale Modelle bewerten die Briefe vor (mit Belegen);
+ *                  Schnellprüfung bei Regressions-Datensätzen, Zweitblick bei Studien;
+ *                  liefert eine
  *                  KI-Referenz für Regressionstests und wird in der Studie
  *                  gegen die Ärzte gemessen
  *
@@ -154,11 +155,64 @@ function OVM(view, mask)
     return view;
 }
 
-function OVTable(frame, cols, owner)
+// Briefansicht als HTML mit hinterlegten Belegen
+function OVEscapeHTML(t)
+{
+    return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// erste Fundstelle eines Zitats im Text (Leerraum und Groß-/Kleinschreibung tolerant)
+function OVFindQuote(text, quote)
+{
+    var part = String(quote || "").split(/\u2026|\.\.\./)[0].replace(/^\s+|\s+$/g, "");
+    if (part.length < 3)
+        return nil;
+    var words = part.split(/\s+/).map(function(w) { return w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); });
+    try
+    {
+        var m = new RegExp(words.join("\\s+"), "i").exec(text);
+        return m ? [m.index, m.index + m[0].length] : nil;
+    }
+    catch (e) { return nil; }
+}
+
+function OVLetterHTML(text, marks)
+{
+    var ranges = [];
+    for (var i = 0; i < marks.length; i++)
+    {
+        var r = OVFindQuote(text, marks[i].quote);
+        if (!r)
+            continue;
+        var overlap = NO;
+        for (var k = 0; k < ranges.length; k++)
+            if (r[0] < ranges[k].end && r[1] > ranges[k].start)
+                overlap = YES;
+        if (!overlap)
+            ranges.push({ start: r[0], end: r[1], cls: marks[i].cls + (marks[i].cur ? " cur" : ""), title: marks[i].title, cur: marks[i].cur });
+    }
+    ranges.sort(function(a, b) { return a.start - b.start; });
+    var out = "", pos = 0;
+    for (var j = 0; j < ranges.length; j++)
+    {
+        out += OVEscapeHTML(text.substring(pos, ranges[j].start));
+        out += "<mark class='" + ranges[j].cls + "'" + (ranges[j].cur ? " id='cur'" : "") + " title='" + OVEscapeHTML(ranges[j].title || "") + "'>" +
+               OVEscapeHTML(text.substring(ranges[j].start, ranges[j].end)) + "</mark>";
+        pos = ranges[j].end;
+    }
+    out += OVEscapeHTML(text.substring(pos));
+    return "<html><head><meta charset='utf-8'><style>" +
+           "body{font:13px -apple-system,'Helvetica Neue',Arial,sans-serif;line-height:1.45;white-space:pre-wrap;margin:6px 8px;color:#1d1d1f;background:#fff}" +
+           "mark{border-radius:3px;padding:0 1px;color:inherit}.ok{background:#dcf2dc}.err{background:#ffd9b3}.miss{background:#d8e8ff}" +
+           ".cur{background:#ffe066;box-shadow:0 0 0 2px #e0a800}</style></head><body>" + out +
+           "<script>var c=document.getElementById('cur');if(c){c.scrollIntoView({block:'center'});}</script></body></html>";
+}
+
+function OVTable(frame, cols, owner, tableClass)
 {
     var scroll = [[CPScrollView alloc] initWithFrame:frame];
     [scroll setAutohidesScrollers:YES];
-    var table = [[CPTableView alloc] initWithFrame:[scroll bounds]];
+    var table = [[(tableClass || CPTableView) alloc] initWithFrame:[scroll bounds]];
     [table setUsesAlternatingRowBackgroundColors:YES];
     [table setAllowsMultipleSelection:NO];
     for (var c = 0; c < cols.length; c++)
@@ -278,6 +332,32 @@ function OVAlert(aMessage, anInfo)
     [OVDialog message:aMessage info:anInfo];
 }
 
+// Eintragstabelle mit Tastatursteuerung: Eingabe = Ensemble-Urteil bestätigen,
+// K = korrekt, F = Fehler …, D = Dublette, U = unklar
+@implementation OVKeyTableView : CPTableView
+{
+    id keyTarget @accessors;
+}
+
+- (void)keyDown:(CPEvent)anEvent
+{
+    var c = String([anEvent charactersIgnoringModifiers] || "").toLowerCase();
+    if (keyTarget && ([anEvent keyCode] === 13 || c === "\r"))
+        [keyTarget confirmEnsemble:self];
+    else if (keyTarget && c === "k")
+        [keyTarget markCorrect:self];
+    else if (keyTarget && c === "f")
+        [keyTarget showErrorPanel:self];
+    else if (keyTarget && c === "d")
+        [keyTarget markDuplicate:self];
+    else if (keyTarget && c === "u")
+        [keyTarget markUnclear:self];
+    else
+        [super keyDown:anEvent];
+}
+
+@end
+
 @implementation ValidationController : CPObject
 {
     id              _app;
@@ -336,6 +416,19 @@ function OVAlert(aMessage, anInfo)
 
     // Neuer Datensatz
     CPWindow        _newPanel;
+    CPWindow        _cmpPanel;
+    id              _letterWeb;
+    id              _ens;
+    id              _suggs;
+    id              _mrows;
+    BOOL            _ensVisible;
+    id              _itemCache;
+    CPButton        _restButton;
+    CPCheckBox      _nsEnsemble;
+    BOOL            _ensembleActive;
+    CPString        _ensembleText;
+    CPTextView      _cmpView;
+    id              _cmpPair;
     CPTextField     _nsName;
     CPPopUpButton   _nsPurpose;
     CPTextField     _nsSize;
@@ -344,6 +437,8 @@ function OVAlert(aMessage, anInfo)
     CPTextField     _nsDouble;
     CPTextField     _nsInject;
     CPCheckBox      _nsPerPatient;
+    CPCheckBox      _nsReextract;
+    id              _prepTimer;
     CPTextField     _nsConfirm;
 
     // Referenz & Regression
@@ -355,9 +450,7 @@ function OVAlert(aMessage, anInfo)
     BOOL            _runsActive;
     BOOL            _judgeActive;
     id              _judgeStatus;
-    CPPopUpButton   _judgePopUp;
     id              _hudTasks;
-    id              _judgeProviders;
     CPString        _statusText;
     CPString        _judgeText;
 
@@ -547,6 +640,7 @@ function OVAlert(aMessage, anInfo)
 - (void)reviewerChanged:(id)sender
 {
     try { window.localStorage.setItem(OVReviewerStorageKey, [self reviewer]); } catch (e) {}
+    _itemCache = {};
     [self loadItems:nil];
 }
 
@@ -592,6 +686,7 @@ function OVAlert(aMessage, anInfo)
 {
     var i = [_setPopUp indexOfSelectedItem];
     _currentSet = (_sets && i >= 0 && i < _sets.length) ? _sets[i] : nil;
+    _itemCache = {};
     [self _updateSetInfo];
     _item = nil;
     [self _showItem];
@@ -610,10 +705,86 @@ function OVAlert(aMessage, anInfo)
         return;
     }
     var s = _currentSet;
+    [self _watchPreparation];
+    if (s.status === "preparing")
+    {
+        [_setInfoLabel setStringValue:s.n_items + " Briefe · wird vorbereitet (Neu-Extraktion läuft)"];
+        return;
+    }
     var info = s.n_items + " Briefe · Seed " + (s.params ? s.params.seed : "–") +
                (s.locked ? " · gesperrt" : " · ENTSPERRT") +
-               (s.frozen_at ? " · Referenz eingefroren" + (String(s.reference_source || "").indexOf("judge") === 0 ? " (KI)" : " (Ärzte)") : " · Referenz offen");
+               (s.frozen_at ? " · Referenz eingefroren" + (String(s.reference_source || "").indexOf("judge") === 0 ? " (KI)" : (String(s.reference_source || "").indexOf("pipeline") === 0 ? " (Pipeline)" : " (Ärzte)")) : " · Referenz offen");
     [_setInfoLabel setStringValue:info];
+}
+
+// Während ein Datensatz vorbereitet wird, regelmäßig nachsehen: Fortschritt ins HUD,
+// bei abgebrochener Vorbereitung Fortsetzen anbieten, bei Abschluss melden.
+- (void)_watchPreparation
+{
+    var preparing = _currentSet && _currentSet.status === "preparing";
+    if (!preparing || _prepTimer)
+        return;
+    var setId = _currentSet.id, setName = _currentSet.name, asked = NO;
+    var tick = function()
+    {
+        OTGetJSON("/BBB/validation/sets", 60.0, function(res, error)
+        {
+            if (!res || res.length === undefined)
+                return;
+            for (var i = 0; i < res.length; i++)
+            {
+                var r = res[i];
+                if (r.id !== setId)
+                    continue;
+                var hid = "validation_prepare_" + setId;
+                if (r.status === "preparing")
+                {
+                    var pr = r.prep || {};
+                    if (!pr.running && !asked)
+                    {
+                        asked = YES;
+                        [OVDialog confirm:"Die Vorbereitung von „" + setName + "“ ist unterbrochen."
+                                     info:"Vermutlich wurde der Worker neu gestartet. Bereits extrahierte Briefe bleiben erhalten; es geht beim nächsten Brief weiter."
+                                       ok:"Fortsetzen" then:function(yes)
+                        {
+                            if (!yes)
+                                return;
+                            OTPostJSON("/BBB/validation/sets/" + setId + "/prepare", {}, 60.0, function(res2, err2)
+                            {
+                                if (!res2 || res2.error)
+                                    OVAlert("Nicht fortgesetzt.", res2 && res2.error ? res2.error : "Keine Antwort vom Server.");
+                                asked = NO;
+                            });
+                        }];
+                    }
+                    var msg = pr.state === "inactive" ? "wartet auf den Minion-Worker" :
+                              (pr.current ? "Brief " + pr.current + " von " + (pr.total || r.n_items) + (pr.current_s !== undefined && pr.current_s !== null ? " (" + pr.current_s + " s)" : "") : "läuft") +
+                              (pr.failed ? ", " + pr.failed + " nicht extrahierbar" : "");
+                    [self _hudTask:hid name:"Datensatz vorbereiten: " + setName state:"active" message:msg progress:pr.progress || 0];
+                    if (_currentSet && _currentSet.id === setId)
+                        [_setInfoLabel setStringValue:r.n_items + " Briefe · wird vorbereitet: " + msg];
+                    return;
+                }
+                window.clearInterval(_prepTimer);
+                _prepTimer = nil;
+                var ex = (r.params && r.params.extraction) ? r.params.extraction : {};
+                [self _hudTask:hid name:"" state:"finished" message:"fertig" progress:100];
+                if (_currentSet && _currentSet.id === setId)
+                {
+                    _currentSet = r;
+                    [self loadSets:nil];
+                    _item = nil;
+                    [self loadItems:nil];
+                }
+                OVAlert("Datensatz „" + r.name + "“ ist vorbereitet.",
+                        (ex.n_ok || 0) + " Briefe mit " + (ex.model || "dem Standardmodell") + " extrahiert" +
+                        (ex.n_failed ? ", " + ex.n_failed + " nicht extrahierbare Briefe entfernt" : "") + ".");
+                return;
+            }
+        });
+    };
+    _prepTimer = window.setInterval(tick, 5000);
+    tick();
 }
 
 - (void)exportSet:(id)sender
@@ -627,7 +798,7 @@ function OVAlert(aMessage, anInfo)
 {
     if (!_newPanel)
     {
-        _newPanel = [[CPPanel alloc] initWithContentRect:CGRectMake(0, 0, 480, 400)
+        _newPanel = [[CPPanel alloc] initWithContentRect:CGRectMake(0, 0, 480, 492)
                                                 styleMask:CPTitledWindowMask | CPClosableWindowMask];
         [_newPanel setFloatingPanel:YES];
         [_newPanel setTitle:@"Neuen Validierungsdatensatz ziehen"];
@@ -656,7 +827,15 @@ function OVAlert(aMessage, anInfo)
         y += 34;
         _nsPerPatient = OTCheckBox(CGRectMake(170, y, 290, 20), "höchstens ein Brief je Patient", YES);
         [cv addSubview:_nsPerPatient];
-        y += 30;
+        y += 26;
+        _nsReextract = OTCheckBox(CGRectMake(170, y, 300, 20), "Phenopackets neu extrahieren (empfohlen)", YES);
+        [cv addSubview:_nsReextract];
+        y += 22;
+        _nsEnsemble = OTCheckBox(CGRectMake(170, y, 300, 20), "danach KI-Ensemble starten (Schnellprüfung)", YES);
+        [cv addSubview:_nsEnsemble];
+        y += 22;
+        [cv addSubview:OTLabel(CGRectMake(170, y, 290, 32), "mit dem Modell aus „LLM Model“ im Hauptfenster; ohne Haken wird der Stand im Bestand übernommen", NO)];
+        y += 40;
         [cv addSubview:OTLabel(CGRectMake(20, y + 4, 150, 18), "Doppelt prüfen (Anteil):", NO)];
         _nsDouble = OTField(CGRectMake(170, y, 60, 26), "0.3", nil);
         [cv addSubview:_nsDouble];
@@ -685,6 +864,8 @@ function OVAlert(aMessage, anInfo)
     [_nsDouble setEnabled:study];
     [_nsInject setEnabled:study];
     if (sender)
+        [_nsEnsemble setState:(study ? CPOffState : CPOnState)];
+    if (sender)
         [_nsSize setStringValue:(study ? "150" : "50")];
 }
 
@@ -701,6 +882,8 @@ function OVAlert(aMessage, anInfo)
         n: parseInt([_nsSize stringValue], 10),
         tag: OTTrim([_nsTag stringValue]),
         one_per_patient: [_nsPerPatient state] === CPOnState ? 1 : 0,
+        reextract: [_nsReextract state] === CPOnState ? 1 : 0,
+        ensemble: [_nsEnsemble state] === CPOnState ? 1 : 0,
         double_fraction: parseFloat([_nsDouble stringValue]) || 0,
         inject_fraction: parseFloat([_nsInject stringValue]) || 0,
         created_by: [self reviewer],
@@ -709,6 +892,8 @@ function OVAlert(aMessage, anInfo)
     var seed = OTTrim([_nsSeed stringValue]);
     if (seed.length)
         payload.seed = parseInt(seed, 10);
+    if (payload.reextract && _app && [_app respondsToSelector:@selector(selectedModel)])
+        payload.model = [_app selectedModel];
 
     OTPostJSON("/BBB/validation/sets", payload, 600.0, function(res, error)
     {
@@ -718,9 +903,16 @@ function OVAlert(aMessage, anInfo)
             return;
         }
         [_newPanel orderOut:self];
-        OVAlert("Datensatz „" + res.name + "“ angelegt: " + res.n + " Briefe aus " + res.pool + " geeigneten, " +
-              res.strata + " Schichten" + (res.double ? ", " + res.double + " doppelt zu prüfen" : "") +
-              (res.injected ? ", " + res.injected + " mit eingestreutem Fehler" : "") + ".");
+        if (res.preparing)
+        {
+            OVAlert("Datensatz „" + res.name + "“ angelegt: " + res.n + " Briefe aus " + res.pool + " geeigneten, " + res.strata + " Schichten.",
+                    "Die Phenopackets werden jetzt mit " + res.model + " neu extrahiert; der Fortschritt steht im Panel Hintergrundprozesse. " +
+                    "Prüfen, KI-Ensemble und Läufe sind möglich, sobald der Datensatz vorbereitet ist. Briefe, die sich nicht extrahieren lassen, werden entfernt.");
+            [self _hudTask:"validation_prepare_" + res.id name:"Datensatz vorbereiten: " + res.name state:"active" message:"gestartet" progress:0];
+        }
+        else
+            OVAlert("Datensatz „" + res.name + "“ angelegt: " + res.n + " Briefe aus " + res.pool + " geeigneten, " + res.strata + " Schichten" +
+                    (res.double ? ", " + res.double + " doppelt zu prüfen" : "") + (res.injected ? ", " + res.injected + " mit eingestreutem Fehler" : "") + ".");
         _currentSet = { id: res.id };
         [self loadSets:nil];
     });
@@ -744,7 +936,17 @@ function OVAlert(aMessage, anInfo)
     [v addSubview:_letterHeader];
     var lt = OVTextArea(CGRectMake(245, 26, 430, 674), NO);
     _letterView = lt.text;
-    [v addSubview:OVM(lt.scroll, CPViewWidthSizable | CPViewHeightSizable)];
+    // Briefansicht mit hinterlegten Belegen (HTML); ohne CPWebView reiner Text
+    var WebClass = (typeof CPWebView !== "undefined") ? CPWebView : nil;
+    if (WebClass)
+    {
+        _letterWeb = OVM([[WebClass alloc] initWithFrame:CGRectMake(245, 26, 430, 674)], CPViewWidthSizable | CPViewHeightSizable);
+        if ([_letterWeb respondsToSelector:@selector(setScrollMode:)] && typeof CPWebViewScrollNative !== "undefined")
+            [_letterWeb setScrollMode:CPWebViewScrollNative];
+        [v addSubview:_letterWeb];
+    }
+    else
+        [v addSubview:OVM(lt.scroll, CPViewWidthSizable | CPViewHeightSizable)];
 
     // rechte Spalte
     var x = 685, w = 580;
@@ -770,33 +972,40 @@ function OVAlert(aMessage, anInfo)
 
     _entriesBox = OVM([[CPView alloc] initWithFrame:CGRectMake(x, 190, w, 470)], CPViewMinXMargin | CPViewHeightSizable);
     [_entriesBox addSubview:OTLabel(CGRectMake(0, 0, w, 18), "Teil B – Extrahierte Einträge", YES)];
-    var et = OVTable(CGRectMake(0, 20, w, 270), [["domain", "Domäne", 75], ["label", "Bezeichnung", 160], ["code", "Code", 85],
+    var et = OVTable(CGRectMake(0, 20, w, 240), [["domain", "Domäne", 75], ["label", "Bezeichnung", 160], ["code", "Code", 85],
                                                  ["side", "Seite", 38], ["date", "Datum", 72], ["value", "Wert", 50],
-                                                 ["judgment", "Urteil", 160], ["others", "Andere Prüfer", 200]], self);
+                                                 ["ens", "Ensemble", 200], ["judgment", "Urteil", 160], ["others", "Andere Prüfer", 200]], self, OVKeyTableView);
     _entriesTable = et.table;
+    [_entriesTable setKeyTarget:self];
     [_entriesTable setTarget:self];
     [_entriesTable setDoubleAction:@selector(showErrorPanel:)];
     [_entriesBox addSubview:OVM(et.scroll, CPViewHeightSizable)];
-    var by = 296, bm = CPViewMinYMargin;
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(0, by, 75, 26), "Korrekt", self, @selector(markCorrect:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(80, by, 80, 26), "Fehler …", self, @selector(showErrorPanel:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(165, by, 75, 26), "Dublette", self, @selector(markDuplicate:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(245, by, 65, 26), "Unklar", self, @selector(markUnclear:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(315, by, 110, 26), "Zurücksetzen", self, @selector(clearJudgment:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(450, by, 130, 26), "Übrige korrekt", self, @selector(markRestCorrect:)), bm)];
+    var by = 266, bm = CPViewMinYMargin;
+    [_entriesBox addSubview:OVM(OTButton(CGRectMake(0, by, 110, 26), "Bestätigen ⏎", self, @selector(confirmEnsemble:)), bm)];
+    [_entriesBox addSubview:OVM(OTButton(CGRectMake(115, by, 80, 26), "Korrekt", self, @selector(markCorrect:)), bm)];
+    [_entriesBox addSubview:OVM(OTButton(CGRectMake(200, by, 85, 26), "Fehler …", self, @selector(showErrorPanel:)), bm)];
+    [_entriesBox addSubview:OVM(OTButton(CGRectMake(290, by, 80, 26), "Dublette", self, @selector(markDuplicate:)), bm)];
+    [_entriesBox addSubview:OVM(OTButton(CGRectMake(375, by, 70, 26), "Unklar", self, @selector(markUnclear:)), bm)];
+    [_entriesBox addSubview:OVM(OTButton(CGRectMake(450, by, 130, 26), "Zurücksetzen", self, @selector(clearJudgment:)), bm)];
+    _restButton = OVM(OTButton(CGRectMake(0, by + 30, 250, 26), "Übrige korrekt", self, @selector(markRestCorrect:)), bm);
+    [_entriesBox addSubview:_restButton];
+    [_entriesBox addSubview:OVM(OTLabel(CGRectMake(260, by + 34, 320, 18), "Tasten: ⏎ bestätigen · K korrekt · F Fehler · D Dublette · ↑↓", NO), bm)];
 
-    [_entriesBox addSubview:OVM(OTLabel(CGRectMake(0, by + 36, w, 18), "Im Brief vorhanden, aber nicht extrahiert", YES), bm)];
-    var mt = OVTable(CGRectMake(0, by + 56, w, 80), [["domain", "Domäne", 75], ["label", "Bezeichnung", 200], ["code", "Code", 100],
-                                                     ["side", "Seite", 50], ["date", "Datum", 80], ["value", "Wert", 60]], self);
+    [_entriesBox addSubview:OVM(OTLabel(CGRectMake(0, by + 64, w, 18), "Im Brief vorhanden, aber nicht extrahiert", YES), bm)];
+    var mt = OVTable(CGRectMake(0, by + 84, w, 80), [["mstate", "Status", 80], ["domain", "Domäne", 75], ["label", "Bezeichnung", 170],
+                                                     ["code", "Code", 95], ["side", "Seite", 40], ["date", "Datum", 75], ["votes", "Stimmen", 55]], self);
     _missingTable = mt.table;
     [_entriesBox addSubview:OVM(mt.scroll, bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(0, by + 142, 200, 26), "Fehlenden Eintrag ergänzen …", self, @selector(addMissing:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(205, by + 142, 80, 26), "Entfernen", self, @selector(removeMissing:)), bm)];
+    [_entriesBox addSubview:OVM(OTButton(CGRectMake(0, by + 170, 160, 26), "Vorschlag übernehmen", self, @selector(acceptSuggestion:)), bm)];
+    [_entriesBox addSubview:OVM(OTButton(CGRectMake(165, by + 170, 80, 26), "Ablehnen", self, @selector(rejectSuggestion:)), bm)];
+    [_entriesBox addSubview:OVM(OTButton(CGRectMake(250, by + 170, 150, 26), "Eigenen ergänzen …", self, @selector(addMissing:)), bm)];
+    [_entriesBox addSubview:OVM(OTButton(CGRectMake(405, by + 170, 80, 26), "Entfernen", self, @selector(removeMissing:)), bm)];
     [v addSubview:_entriesBox];
 
     _doneButton = OVM(OTButton(CGRectMake(x, 672, 180, 28), "Brief abschließen", self, @selector(toggleDone:)), CPViewMinXMargin | CPViewMinYMargin);
     [v addSubview:_doneButton];
     [v addSubview:OVM(OTButton(CGRectMake(x + 190, 672, 150, 28), "Nächster offener Brief", self, @selector(nextOpenItem:)), CPViewMinXMargin | CPViewMinYMargin)];
+    [v addSubview:OVM(OTLabel(CGRectMake(x + 350, 668, 230, 34), "Belege: grün korrekt · orange Fehler · blau fehlend · gelb ausgewählt", NO), CPViewMinXMargin | CPViewMinYMargin)];
     return v;
 }
 
@@ -854,14 +1063,11 @@ function OVAlert(aMessage, anInfo)
 
 - (void)loadItem:(id)anItemId
 {
-    var me = [self reviewer];
-    OTGetJSON("/BBB/validation/items/" + anItemId + "?reviewer=" + encodeURIComponent(me), 60.0, function(res, error)
+    if (!_itemCache)
+        _itemCache = {};
+    var me = [self reviewer], cached = _itemCache[anItemId];
+    var apply = function(res)
     {
-        if (!res || res.error)
-        {
-            OVAlert("Brief konnte nicht geladen werden: " + (res && res.error ? res.error : "keine Antwort"));
-            return;
-        }
         _item = res;
         _judgments = res.judgments || {};
         _missing = [];
@@ -872,6 +1078,22 @@ function OVAlert(aMessage, anInfo)
         if (!_checklist.lines)
             _checklist.lines = [];
         [self _showItem];
+        [self _prefetchAfter:anItemId];
+    };
+    if (cached && cached !== "loading")
+    {
+        apply(cached);    // sofort anzeigen, ohne auf den Server zu warten
+        return;
+    }
+    OTGetJSON("/BBB/validation/items/" + anItemId + "?reviewer=" + encodeURIComponent(me), 60.0, function(res, error)
+    {
+        if (!res || res.error)
+        {
+            OVAlert("Brief konnte nicht geladen werden: " + (res && res.error ? res.error : "keine Antwort"));
+            return;
+        }
+        _itemCache[anItemId] = res;
+        apply(res);
     });
 }
 
@@ -883,6 +1105,8 @@ function OVAlert(aMessage, anInfo)
     {
         [_letterHeader setStringValue:@""];
         [_letterView setString:@""];
+        if (_letterWeb)
+            [_letterWeb setHidden:YES];
         [_entriesBox setHidden:YES];
         [_checklistBox setHidden:YES];
         [_blindLabel setHidden:YES];
@@ -895,6 +1119,8 @@ function OVAlert(aMessage, anInfo)
                                   (it.double_review ? " · doppelt geprüft" : "")];
     [_letterView setString:it.narrative || ""];
     [_letterView scrollPoint:CGPointMake(0, 0)];
+    if (_letterWeb)
+        [_letterWeb setHidden:NO];
 
     // ohne Checkliste (Regressions-Datensatz) rücken die Einträge nach oben
     var eb = [_entriesBox frame], top = isStudy ? 190 : 5;
@@ -903,15 +1129,27 @@ function OVAlert(aMessage, anInfo)
         [_entriesBox setFrame:CGRectMake(CGRectGetMinX(eb), top, CGRectGetWidth(eb), bottom - top)];
 
     var blind = !!it.blind;
-    [_checklistBox setHidden:!isStudy];
+    [_blindLabel setStringValue:(it.preparing ?
+        "Die Phenopackets dieses Datensatzes werden gerade neu extrahiert. Prüfen ist möglich, sobald er vorbereitet ist (Fortschritt im Panel Hintergrundprozesse)." :
+        "Die Extraktion bleibt verborgen, bis die Checkliste abgeschlossen ist. So wird die Vollständigkeit unverzerrt gemessen.")];
+    [_checklistBox setHidden:!isStudy || it.preparing];
     [_blindLabel setHidden:!blind];
-    [_showExtractionButton setHidden:!blind];
+    [_showExtractionButton setHidden:!blind || it.preparing];
     [_entriesBox setHidden:blind];
 
     var done = !!(_judgments["_done"] && _judgments["_done"].done);
     [_doneButton setTitle:(done ? "Wieder öffnen" : "Brief abschließen")];
     [_doneButton setEnabled:!it.frozen && !blind];
 
+    var a = it.assist || {};
+    _ensVisible = !!a.visible;
+    _ens = a.entries || {};
+    _suggs = a.suggestions || [];
+    [self _buildMissingRows];
+    var ensCol = [_entriesTable tableColumnWithIdentifier:"ens"];
+    if (ensCol)
+        [ensCol setHidden:!_ensVisible];
+    [_restButton setTitle:(_ensVisible ? "Übrige Ensemble-Urteile übernehmen" : "Übrige korrekt")];
     var othersCol = [_entriesTable tableColumnWithIdentifier:"others"];
     if (othersCol)
         [othersCol setHidden:![self isConsensus]];
@@ -919,6 +1157,7 @@ function OVAlert(aMessage, anInfo)
     [_entriesTable reloadData];
     [_missingTable reloadData];
     [_checklistTable reloadData];
+    [self _renderLetter];
 }
 
 - (BOOL)_requireReviewer
@@ -1004,21 +1243,44 @@ function OVAlert(aMessage, anInfo)
 {
     if (![self _requireReviewer])
         return;
-    var reviews = [], ok = { verdict: "correct", concept: "ok", status: "ok", side: "ok", date: "ok", value: "ok" };
+    var reviews = [], skipped = 0, ok = { verdict: "correct", concept: "ok", status: "ok", side: "ok", date: "ok", value: "ok" };
     for (var i = 0; i < _item.entries.length; i++)
     {
         var e = _item.entries[i], j = _judgments[e.key];
-        if (!j || !j.verdict)
+        if (j && j.verdict)
+            continue;
+        if (!_ensVisible)
+        {
             reviews.push({ entry_key: e.key, judgment: ok });
+            continue;
+        }
+        var en = _ens[e.key];
+        if (!en || en.verdict === "split")
+        {
+            skipped++;
+            continue;
+        }
+        var nj = {};
+        for (var k in en.judgment)
+            nj[k] = en.judgment[k];
+        nj.verdict = en.verdict === "correct" ? "correct" : "error";
+        nj.source = "ensemble";
+        reviews.push({ entry_key: e.key, judgment: nj });
     }
     if (!reviews.length)
+    {
+        if (skipped)
+            OVAlert(skipped + " Einträge haben kein eindeutiges Ensemble-Urteil.", "Bitte diese selbst bewerten.");
         return;
-    [OVDialog confirm:reviews.length + " noch nicht bewertete Einträge als korrekt markieren?" info:nil ok:"Als korrekt markieren" then:function(yes)
+    }
+    [OVDialog confirm:(_ensVisible ? reviews.length + " Ensemble-Urteile übernehmen?" : reviews.length + " noch nicht bewertete Einträge als korrekt markieren?")
+                 info:(skipped ? skipped + " Einträge ohne eindeutiges Ensemble-Urteil bleiben offen." : nil)
+                   ok:"Übernehmen" then:function(yes)
     {
         if (!yes)
             return;
         for (var r = 0; r < reviews.length; r++)
-            _judgments[reviews[r].entry_key] = ok;
+            _judgments[reviews[r].entry_key] = reviews[r].judgment;
         [_entriesTable reloadData];
         [self _save:reviews then:function() { [self _refreshItemRow]; }];
     }];
@@ -1076,12 +1338,41 @@ function OVAlert(aMessage, anInfo)
     }
     var j = { done: isDone ? 0 : 1, at: new Date().toISOString() };
     _judgments["_done"] = j;
+    var itemId = _item.id, isStudy = _currentSet && _currentSet.purpose === "study";
     [self _save:[{ entry_key: "_done", judgment: j }] then:function()
     {
         [self _refreshItemRow];
         [self _showItem];
-        if (!isDone)
+        if (isDone)
+            return;
+        if (!isStudy)
+        {
             [self nextOpenItem:nil];
+            return;
+        }
+        // Studie: nach dem ersten Abschluss die KI-Hinweise als Zweitblick anbieten
+        OTGetJSON("/BBB/validation/items/" + itemId + "?reviewer=" + encodeURIComponent([self reviewer]), 60.0, function(res, error)
+        {
+            var a = res && res.assist ? res.assist : {};
+            if (!a.visible)
+            {
+                [self nextOpenItem:nil];
+                return;
+            }
+            [OVDialog choose:"Zweitblick: Das KI-Ensemble hat diesen Brief ebenfalls bewertet."
+                        info:"Ihre Bewertung ist als Stand vor dem Zweitblick gespeichert. Jetzt werden die Ensemble-Urteile, Belege und " + (a.suggestions || []).length +
+                             " Vorschläge für fehlende Einträge eingeblendet; Änderungen werden getrennt ausgewertet."
+                     buttons:["Ensemble einblenden", "Weiter zum nächsten Brief"] then:function(index)
+            {
+                if (index === 0)
+                {
+                    _itemCache[itemId] = res;
+                    [self loadItem:itemId];
+                }
+                else
+                    [self nextOpenItem:nil];
+            }];
+        });
     }];
 }
 
@@ -1341,6 +1632,7 @@ function OVAlert(aMessage, anInfo)
         var key = "missing:" + (new Date().getTime().toString(36)) + Math.floor(Math.random() * 1e6).toString(36);
         _judgments[key] = m;
         _missing.push({ key: key, data: m });
+        [self _buildMissingRows];
         [_missingTable reloadData];
         [self _save:[{ entry_key: key, judgment: m }] then:nil];
     }
@@ -1361,13 +1653,28 @@ function OVAlert(aMessage, anInfo)
 - (void)removeMissing:(id)sender
 {
     var row = [_missingTable selectedRow];
-    if (row < 0 || row >= _missing.length || ![self _requireReviewer])
+    var r = (row >= 0 && _mrows && row < _mrows.length) ? _mrows[row] : nil;
+    if (!r || r.kind !== "own" || ![self _requireReviewer])
         return;
-    var m = _missing[row];
+    var idx = -1;
+    for (var i = 0; i < _missing.length; i++)
+        if (_missing[i].key === r.key)
+            idx = i;
+    if (idx < 0)
+        return;
+    var m = _missing[idx];
     m.data.deleted = 1;
-    _missing.splice(row, 1);
+    _missing.splice(idx, 1);
+    var reviews = [{ entry_key: m.key, judgment: m.data }];
+    if (m.data.suggestion_id)
+    {
+        delete _judgments["ai:" + m.data.suggestion_id];
+        reviews.push({ entry_key: "ai:" + m.data.suggestion_id, judgment: { decision: "", withdrawn: 1 } });
+    }
+    [self _buildMissingRows];
     [_missingTable reloadData];
-    [self _save:[{ entry_key: m.key, judgment: m.data }] then:nil];
+    [self _renderLetter];
+    [self _save:reviews then:nil];
 }
 
 - (void)addChecklistLine:(id)sender
@@ -1461,25 +1768,19 @@ function OVAlert(aMessage, anInfo)
     [v addSubview:OTButton(CGRectMake(bx, 90, 200, 26), "Referenz auftauen …", self, @selector(unfreezeSet:))];
     [v addSubview:OTButton(CGRectMake(bx + 210, 26, 200, 26), "Sperren / Entsperren …", self, @selector(toggleLock:))];
     [v addSubview:OTButton(CGRectMake(bx + 210, 58, 200, 26), "Datensatz löschen …", self, @selector(deleteSet:))];
-    [v addSubview:OTLabel(CGRectMake(bx + 420, 5, 200, 18), "KI-Judge", YES)];
-    _judgePopUp = [[CPPopUpButton alloc] initWithFrame:CGRectMake(bx + 420, 26, 200, 26) pullsDown:NO];
-    [_judgePopUp addItemWithTitle:@"– wird geladen –"];
-    [_judgePopUp setTarget:self];
-    [_judgePopUp setAction:@selector(judgeChanged:)];
-    [v addSubview:_judgePopUp];
-    [v addSubview:OTButton(CGRectMake(bx + 420, 58, 200, 26), "Bewerten lassen …", self, @selector(startJudge:))];
-    [v addSubview:OTButton(CGRectMake(bx + 420, 90, 200, 26), "Lauf beenden", self, @selector(stopJudge:))];
-    [v addSubview:OTButton(CGRectMake(bx + 420, 122, 200, 26), "KI-Referenz einfrieren …", self, @selector(freezeJudgeSet:))];
-    [v addSubview:OTButton(CGRectMake(bx + 420, 154, 200, 26), "Fehlerprotokoll löschen …", self, @selector(clearJudgeErrors:))];
-    [v addSubview:OTLabel(CGRectMake(bx, 120, 410, 66),
-        "Einfrieren übernimmt die Bewertungen als Referenz und schützt sie vor Änderungen. Abweichungen zwischen zwei Prüfern " +
-        "klärt ein Prüfer mit dem Namen „Konsens“; er sieht die Urteile beider. Eine KI-Referenz entsteht aus den Urteilen des KI-Judge.", NO)];
+    [v addSubview:OTButton(CGRectMake(bx + 210, 90, 200, 26), "Datensatz kopieren …", self, @selector(copySet:))];
+    [v addSubview:OTLabel(CGRectMake(bx + 420, 5, 200, 18), "KI-Ensemble", YES)];
+    [v addSubview:OTButton(CGRectMake(bx + 420, 26, 200, 26), "Ensemble starten …", self, @selector(startEnsemble:))];
+    [v addSubview:OTButton(CGRectMake(bx + 420, 58, 200, 26), "Ensemble beenden", self, @selector(stopEnsemble:))];
+    [v addSubview:OTLabel(CGRectMake(bx + 420, 92, 200, 90),
+        "Bewertet alle Briefe mit mehreren lokalen Modellen vor. Danach geht die Prüfung ohne Wartezeit: Urteile bestätigen oder korrigieren.", NO)];
+    [v addSubview:OTButton(CGRectMake(bx, 122, 200, 26), "Referenz vergleichen mit …", self, @selector(compareReference:))];
 
     [v addSubview:OTLabel(CGRectMake(5, 190, 600, 18), "Regressionsläufe gegen die Referenz", YES)];
     var rt = OVTable(CGRectMake(5, 212, 1260, 190), [["id", "Lauf", 45], ["started", "Gestartet", 135], ["mode", "Quelle", 120],
                                                     ["status", "Status", 95], ["f1", "F1", 65], ["precision", "Precision", 75],
                                                     ["recall", "Recall", 65], ["delta", "ΔF1 zur Basis", 95], ["verdict", "Ergebnis", 105],
-                                                    ["model", "Modell", 130], ["fingerprint", "Pipeline-Stand", 110], ["label", "Bezeichnung", 260]], self);
+                                                    ["model", "Modell", 120], ["reference", "Referenz", 170], ["fingerprint", "Pipeline-Stand", 100], ["label", "Bezeichnung", 220]], self);
     _runsTable = rt.table;
     [v addSubview:OVM(rt.scroll, CPViewWidthSizable)];
 
@@ -1488,6 +1789,7 @@ function OVAlert(aMessage, anInfo)
     [v addSubview:OTButton(CGRectMake(240, by, 250, 26), "Gespeicherte Phenopackets prüfen", self, @selector(startStoredRun:))];
     [v addSubview:OTButton(CGRectMake(495, by, 160, 26), "Als Basis festlegen", self, @selector(setBaseline:))];
     [v addSubview:OTButton(CGRectMake(660, by, 140, 26), "Bericht als CSV", self, @selector(downloadRunReport:))];
+    [v addSubview:OTButton(CGRectMake(810, by, 240, 26), "Lauf als Referenz einfrieren …", self, @selector(freezeFromRun:))];
 
     var dt = OVTextArea(CGRectMake(5, 442, 1260, 262), YES);
     _runDetailView = dt.text;
@@ -1513,8 +1815,14 @@ function OVAlert(aMessage, anInfo)
         lines.push("Briefe:      " + res.n_items + "   Seed " + (s.params ? s.params.seed : "–") +
                    "   Grundgesamtheit " + (s.params ? s.params.pool_size : "–"));
         lines.push("Schutz:      " + (s.locked ? "gesperrt" : "ENTSPERRT – kann gelöscht werden"));
+        var ex = (s.params && s.params.extraction) ? s.params.extraction : nil;
+        lines.push("Extraktion:  " + (!ex || ex.mode === "stored" ? "aus dem Bestand übernommen (Stand beim Ziehen)" :
+                   (s.status === "preparing" ? "wird neu extrahiert mit " + (ex.model || "Standardmodell") :
+                    "neu extrahiert mit " + (ex.model || "Standardmodell") + (ex.finished_at ? " am " + String(ex.finished_at).substring(0, 10) : "") +
+                    (ex.fingerprint ? ", Pipeline-Stand " + ex.fingerprint.hash : "") + (ex.n_failed ? ", " + ex.n_failed + " Briefe entfernt" : ""))));
         lines.push("Referenz:    " + (s.frozen_at ? "eingefroren am " + String(s.frozen_at).substring(0, 16) + (s.frozen_by ? " von " + s.frozen_by : "") +
-                   (String(s.reference_source || "").indexOf("judge:") === 0 ? " – Quelle KI-Judge " + s.reference_source.substring(6) : " – Quelle Ärzte") : "noch offen"));
+                   (String(s.reference_source || "").indexOf("judge:") === 0 ? " – Quelle KI-Judge " + s.reference_source.substring(6) :
+                    (String(s.reference_source || "").indexOf("pipeline:") === 0 ? " – Quelle Pipeline " + s.reference_source.substring(9) : " – Quelle Ärzte")) : "noch offen"));
         var rv = [];
         for (var name in res.reviewers)
             rv.push(name + ": " + res.reviewers[name]);
@@ -1543,7 +1851,7 @@ function OVAlert(aMessage, anInfo)
 
 - (void)_renderStatus
 {
-    [_statusView setString:(_judgeText ? _judgeText + "\n\n" : "") + (_statusText || "")];
+    [_statusView setString:(_judgeText ? _judgeText + "\n" : "") + (_ensembleText ? _ensembleText + "\n\n" : (_judgeText ? "\n" : "")) + (_statusText || "")];
     [_statusView scrollPoint:CGPointMake(0, 0)];
 }
 
@@ -1569,291 +1877,83 @@ function OVAlert(aMessage, anInfo)
         delete _hudTasks[anId];
 }
 
-// --- KI-Judge -----------------------------------------------------------------------
+// --- KI-Ensemble: Status ------------------------------------------------------------
 
-- (void)loadJudgeStatus:(id)sender
+- (void)loadEnsembleStatus
 {
     if (!_currentSet)
         return;
-    OTGetJSON("/BBB/validation/sets/" + _currentSet.id + "/judge", 60.0, function(res, error)
+    var setId = _currentSet.id;
+    OTGetJSON("/BBB/validation/sets/" + setId + "/ensemble", 60.0, function(res, error)
     {
-        _judgeStatus = res;
         if (!res || res.error)
+            return;
+        var sg = res.suggestions || {}, hid = "validation_ensemble_" + setId, L = [];
+        if (res.running && res.job)
         {
-            _judgeText = nil;
-            _judgeActive = NO;
+            var jb = res.job;
+            var msg = jb.state === "inactive" ? "wartet auf den Minion-Worker" :
+                      (jb.worker_alive === 0 ? "hängt (Worker beendet)" :
+                       "Brief " + (jb.current || "?") + " von " + (jb.total || "?") + (jb.step ? ", " + jb.step : "") + (jb.current_s !== null && jb.current_s !== undefined ? " (" + jb.current_s + " s)" : ""));
+            L.push("KI-Ensemble: läuft, " + jb.progress + " % – " + msg);
+            [self _hudTask:hid name:"KI-Ensemble " + (res.models || []).join(" + ") state:"active" message:msg progress:jb.progress || 0];
         }
-        else
-        {
-            var L = [], provs = res.providers || [], running = res.running || [], jobs = res.jobs || [];
-            [self _fillJudgePopUp:provs];
-            var labelOf = function(id)
-            {
-                for (var p = 0; p < provs.length; p++)
-                    if (provs[p].id === id)
-                        return provs[p].label;
-                return id;
-            };
-            var now = new Date().getTime();
-            if (!jobs.length)
-                L.push("KI-Judge:    kein Lauf aktiv   (Prompt " + res.prompt_version + ")");
-            for (var j = 0; j < jobs.length; j++)
-            {
-                var jb = jobs[j], line = "KI-Judge:    " + labelOf(jb.provider) + " – ";
-                if (jb.state === "inactive")
-                {
-                    var waited = jb.waiting || 0;
-                    line += "wartet auf den Minion-Worker" + (waited > 20 ? " (seit " + waited + " s – läuft der Worker? perl backend.pl minion worker)" : "");
-                    if (!res.workers)
-                        line += " – KEIN WORKER AKTIV";
-                }
-                else if (jb.worker_alive === 0)
-                    line += "hängt (Worker beendet) – mit „Lauf beenden“ aufräumen";
-                else
-                    line += (jb.cancel ? "wird beendet, " : "läuft, ") + jb.progress + " % (" + jb.done + " bewertet, " + jb.failed + " Fehler)" +
-                            (jb.current ? ", bewertet gerade Brief " + jb.current + " seit " + jb.current_s + " s" : "");
-                L.push(line);
-            }
-            var hudId = "validation_judge_" + _currentSet.id;
-            if (jobs.length)
-            {
-                var hj = jobs[0];
-                var hmsg = hj.state === "inactive" ? "wartet auf den Minion-Worker" :
-                           (hj.worker_alive === 0 ? "hängt (Worker beendet)" :
-                            (hj.current ? "Brief " + hj.current + " (" + hj.current_s + " s) · " : "") + hj.done + " bewertet, " + hj.failed + " Fehler");
-                [self _hudTask:hudId name:"KI-Judge " + labelOf(hj.provider) state:"active" message:hmsg progress:hj.progress || 0];
-            }
-            else if (res.jobs && _hudTasks[hudId])
-                [self _hudTask:hudId name:"" state:"finished" message:"abgeschlossen" progress:100];
-
-            var models = res.models || [];
-            for (var m = 0; m < models.length; m++)
-            {
-                var md = models[m];
-                L.push("  " + OVPad(md.model, 18) + "bewertet " + md.n_ok + " von " + res.n_items + " Briefen" +
-                       (md.n_errors > 0 ? ", " + md.n_errors + " mit Fehler" : "") + "   Tokens " + md.tokens_in + " ein / " + md.tokens_out + " aus");
-                var errs = md.errors || [];
-                for (var i = 0; i < errs.length; i++)
-                    L.push("    zuletzt Brief " + errs[i].position + ": " + errs[i].error);
-            }
-            _judgeText = L.join("\n");
-            _judgeActive = running.length > 0;
-        }
+        else if (_hudTasks[hid])
+            [self _hudTask:hid name:"" state:"finished" message:"abgeschlossen" progress:100];
+        if (sg.missing || sg.flag)
+            L.push("KI-Ensemble: " + (sg.missing || 0) + " Vorschläge für fehlende Einträge, " + (sg.flag || 0) + " Fehlerhinweise" +
+                   (res.last_at ? " (Stand " + String(res.last_at).substring(0, 16) + ")" : ""));
+        else if (!res.running)
+            L.push("KI-Ensemble: noch nicht gelaufen (Modelle: " + ((res.models || []).join(", ") || "keine") + ")");
+        _ensembleText = L.join("\n");
+        _ensembleActive = !!res.running;
         [self _renderStatus];
         [self _updatePolling];
     });
 }
 
-- (void)_fillJudgePopUp:(id)providers
-{
-    var list = [];
-    for (var i = 0; i < providers.length; i++)
-        if (providers[i].configured)
-            list.push(providers[i]);
-    var ids = list.map(function(x) { return x.id; }).join("|");
-    var old = (_judgeProviders || []).map(function(x) { return x.id; }).join("|");
-    if (ids === old && list.length)
-        return;
-    var want = nil;
-    try { want = window.localStorage.getItem(OVJudgeStorageKey); } catch (e) { want = nil; }
-    var cur = [self _selectedJudge];
-    if (cur)
-        want = cur.id;
-    _judgeProviders = list;
-    [_judgePopUp removeAllItems];
-    if (!list.length)
-    {
-        [_judgePopUp addItemWithTitle:@"– kein Judge konfiguriert –"];
-        [_judgePopUp setEnabled:NO];
-        return;
-    }
-    [_judgePopUp setEnabled:YES];
-    var sel = 0;
-    for (var k = 0; k < list.length; k++)
-    {
-        [_judgePopUp addItemWithTitle:list[k].label];
-        if (list[k].id === want)
-            sel = k;
-    }
-    [_judgePopUp selectItemAtIndex:sel];
-}
-
-- (id)_selectedJudge
-{
-    var i = [_judgePopUp indexOfSelectedItem];
-    return (_judgeProviders && i >= 0 && i < _judgeProviders.length) ? _judgeProviders[i] : nil;
-}
-
-- (void)judgeChanged:(id)sender
-{
-    var j = [self _selectedJudge];
-    if (j)
-        try { window.localStorage.setItem(OVJudgeStorageKey, j.id); } catch (e) {}
-}
-
-- (void)startJudge:(id)sender
-{
-    if (!_currentSet)
-        return;
-    var st = _judgeStatus || {}, prov = [self _selectedJudge];
-    if (!prov)
-    {
-        OVAlert("Kein KI-Judge konfiguriert.", "Lokale Modelle über ONTOTRIAL_JUDGE_LOCAL_MODELS, Claude über ANTHROPIC_API_KEY in der .env eintragen " +
-                "und Backend sowie Minion-Worker neu starten.");
-        return;
-    }
-    var setId = _currentSet.id, payload = { provider: prov.id };
-
-    var send = function()
-    {
-        OTPostJSON("/BBB/validation/sets/" + setId + "/judge", payload, 60.0, function(res, error)
-        {
-            if (!res || res.error)
-            {
-                OVAlert("KI-Judge nicht gestartet.", res && res.error ? res.error : "Keine Antwort vom Server.");
-                return;
-            }
-            _judgeActive = YES;
-            [self _hudTask:"validation_judge_" + setId name:"KI-Judge " + prov.label state:"active" message:"gestartet" progress:0];
-            [self loadJudgeStatus:nil];
-        });
-    };
-    var askOverwrite = function()
-    {
-        var done = 0;
-        for (var m = 0; m < (st.models || []).length; m++)
-            if (st.models[m].model === prov.model)
-                done = st.models[m].n_ok;
-        if (!done)
-        {
-            payload.overwrite = 0;
-            send();
-            return;
-        }
-        [OVDialog choose:done + " Briefe hat " + prov.model + " bereits bewertet." info:"Nur fehlende und fehlerhafte Briefe bewerten oder alle neu?"
-                 buttons:["Nur fehlende", "Alle neu bewerten", "Abbrechen"] then:function(index)
-        {
-            if (index < 0 || index > 1)
-                return;
-            payload.overwrite = index === 1 ? 1 : 0;
-            send();
-        }];
-    };
-
-    if (prov.external)
-        [OVDialog prompt:"Brieftexte an die externe API senden?"
-                    info:"Die Briefe dieses Datensatzes gehen an " + prov.label + ". Briefe mit Geburtsdatum oder Namen mit Anrede werden zurückgehalten. " +
-                         "Nur fortfahren, wenn der Datenschutz zugestimmt hat. Zum Bestätigen EXTERN eingeben."
-                   value:"" ok:"Senden" then:function(answer)
-        {
-            if (answer === nil)
-                return;
-            if (answer !== "EXTERN")
-            {
-                OVAlert("Nicht bestätigt.", "Es wurde nichts gesendet.");
-                return;
-            }
-            payload.confirm = "EXTERN";
-            askOverwrite();
-        }];
-    else
-        [OVDialog confirm:"Briefe von " + prov.label + " bewerten lassen?" info:"Alle " + (st.n_items || "") + " Briefe dieses Datensatzes; die Briefe bleiben im Haus."
-                       ok:"Bewerten lassen" then:function(yes) { if (yes) askOverwrite(); }];
-}
-
-- (void)stopJudge:(id)sender
-{
-    if (!_currentSet)
-        return;
-    var running = (_judgeStatus && _judgeStatus.running) ? _judgeStatus.running : [];
-    if (!running.length)
-    {
-        OVAlert("Für diesen Datensatz läuft kein KI-Judge.");
-        return;
-    }
-    var setId = _currentSet.id, prov = [self _selectedJudge], payload = {}, question;
-    if (prov && running.indexOf(prov.id) >= 0)
-    {
-        payload.provider = prov.id;
-        question = "Lauf von " + prov.label + " beenden?";
-    }
-    else
-        question = "Alle laufenden KI-Judge-Läufe dieses Datensatzes beenden?";
-
-    [OVDialog confirm:question info:"Der Brief, der gerade bewertet wird, wird noch abgeschlossen." ok:"Beenden" then:function(yes)
-    {
-        if (!yes)
-            return;
-        OTPostJSON("/BBB/validation/sets/" + setId + "/judge/stop", payload, 60.0, function(res, error)
-        {
-            if (!res || res.error)
-            {
-                OVAlert("Nicht beendet.", res && res.error ? res.error : "Keine Antwort vom Server.");
-                return;
-            }
-            var parts = [];
-            if (res.stopping)
-                parts.push(res.stopping + " Lauf endet nach dem aktuellen Brief");
-            if (res.removed)
-                parts.push(res.removed + " wartender Lauf entfernt");
-            if (res.failed)
-                parts.push(res.failed + " hängender Lauf beendet");
-            OVAlert(parts.length ? parts.join(", ") + "." : "Es war kein Lauf mehr aktiv.");
-            [self loadJudgeStatus:nil];
-        });
-    }];
-}
-
-- (void)clearJudgeErrors:(id)sender
+- (void)startEnsemble:(id)sender
 {
     if (!_currentSet)
         return;
     var setId = _currentSet.id;
-    [OVDialog confirm:"Fehlerprotokoll der KI-Judges löschen?"
-                 info:"Entfernt alle fehlgeschlagenen KI-Bewertungen dieses Datensatzes, etwa Verbindungsfehler oder zurückgehaltene Briefe. " +
-                      "Gültige Bewertungen bleiben erhalten; Modelle mit laufendem Lauf werden übersprungen."
-                   ok:"Löschen" then:function(yes)
+    OTGetJSON("/BBB/validation/sets/" + setId + "/ensemble", 60.0, function(st, error)
     {
-        if (!yes)
-            return;
-        OTPostJSON("/BBB/validation/sets/" + setId + "/judge/clear_errors", {}, 60.0, function(res, error)
+        var models = (st && st.models) ? st.models : [];
+        if (!models.length)
         {
-            if (!res || res.error)
-            {
-                OVAlert("Nicht gelöscht.", res && res.error ? res.error : "Keine Antwort vom Server.");
+            OVAlert("Kein lokales Modell für das Ensemble konfiguriert.", "ONTOTRIAL_JUDGE_LOCAL_MODELS in der .env setzen (mindestens zwei Modelle empfohlen).");
+            return;
+        }
+        [OVDialog confirm:"KI-Ensemble mit " + models.join(", ") + " starten?"
+                     info:"Je Brief und Modell: Judge-Urteil, Recall-Durchgang je Abschnitt und Prüfung aller Vorschläge am Brieftext; dazu die Extraktionen " +
+                          "aus Pipeline-Läufen dieses Datensatzes. Ein Vorschlag braucht ein wörtliches Zitat aus dem Brief und " +
+                          (models.length >= 2 ? "die Bestätigung von mindestens zwei Modellen" : "die Bestätigung des Modells") +
+                          ". Vorhandene Vorschläge werden ersetzt. Die Briefe bleiben im Haus. Das dauert pro Brief einige Minuten."
+                       ok:"Starten" then:function(yes)
+        {
+            if (!yes)
                 return;
-            }
-            OVAlert(res.deleted + " fehlerhafte KI-Bewertungen gelöscht.",
-                    res.skipped_models && res.skipped_models.length ? "Übersprungen, weil gerade ein Lauf aktiv ist: " + res.skipped_models.join(", ") : nil);
-            [self loadJudgeStatus:nil];
-        });
-    }];
+            OTPostJSON("/BBB/validation/sets/" + setId + "/ensemble", {}, 60.0, function(res, err)
+            {
+                if (!res || res.error)
+                {
+                    OVAlert("Ensemble nicht gestartet.", res && res.error ? res.error : "Keine Antwort vom Server.");
+                    return;
+                }
+                _ensembleActive = YES;
+                [self _hudTask:"validation_ensemble_" + setId name:"KI-Ensemble " + res.models.join(" + ") state:"active" message:"gestartet" progress:0];
+                [self loadEnsembleStatus];
+            });
+        }];
+    });
 }
 
-- (void)freezeJudgeSet:(id)sender
+- (void)loadJudgeStatus:(id)sender
 {
-    if (!_currentSet)
-        return;
-    var prov = [self _selectedJudge], models = (_judgeStatus && _judgeStatus.models) ? _judgeStatus.models : [], info = nil;
-    for (var k = 0; k < models.length; k++)
-        if (prov && models[k].model === prov.model)
-            info = models[k];
-    if (!prov || !info || !info.n_ok)
-    {
-        OVAlert("Der ausgewählte Judge hat diesen Datensatz noch nicht bewertet.");
-        return;
-    }
-    if (info.n_ok < _judgeStatus.n_items)
-    {
-        OVAlert(prov.model + " hat erst " + info.n_ok + " von " + _judgeStatus.n_items + " Briefen fehlerfrei bewertet. " +
-              "Fehlende oder fehlerhafte Briefe mit „Bewerten lassen …“ nachholen.");
-        return;
-    }
-    [self _confirmSetName:"KI-Referenz aus " + prov.model + " einfrieren?" then:function()
-    {
-        [self _postSetAction:"freeze" payload:{ confirm: _currentSet.name, by: [self reviewer], source: "judge", model: prov.model }
-                     message:"KI-Referenz aus " + prov.model + " eingefroren. Sie dient als Basis für Regressionstests, bis eine ärztliche Referenz vorliegt."];
-    }];
+    _judgeText = nil;
+    _judgeActive = NO;
+    [self loadEnsembleStatus];
 }
 
 - (void)loadRuns:(id)sender
@@ -1885,7 +1985,7 @@ function OVAlert(aMessage, anInfo)
 
 - (void)_updatePolling
 {
-    if (_runsActive || _judgeActive)
+    if (_runsActive || _judgeActive || _ensembleActive)
         [self _startPolling];
     else
         [self _stopPolling];
@@ -1949,6 +2049,373 @@ function OVAlert(aMessage, anInfo)
         [self loadSets:nil];
         [self refreshRegressionTab:nil];
     });
+}
+
+// --- KI-Hinweise beim Prüfen --------------------------------------------------------
+
+- (void)_decide:(id)s decision:(CPString)aDecision extra:(id)extraReviews
+{
+    if (![self _requireReviewer])
+        return;
+    var d = { decision: aDecision, at: new Date().toISOString() };
+    _judgments["ai:" + s.id] = d;
+    var reviews = (extraReviews || []).concat([{ entry_key: "ai:" + s.id, judgment: d }]);
+    [self _buildMissingRows];
+    [_entriesTable reloadData];
+    [_missingTable reloadData];
+    [self _renderLetter];
+    [self _save:reviews then:function() { [self _refreshItemRow]; }];
+}
+
+- (id)_selectedSuggestion
+{
+    var row = [_missingTable selectedRow];
+    var r = (row >= 0 && _mrows && row < _mrows.length) ? _mrows[row] : nil;
+    return (r && r.kind === "sugg") ? r.sugg : nil;
+}
+
+- (void)acceptSuggestion:(id)sender
+{
+    var s = [self _selectedSuggestion];
+    if (!s)
+    {
+        OVAlert("Bitte einen Vorschlag in der Liste auswählen.");
+        return;
+    }
+    var p = s.payload;
+    var m = { missing: 1, domain: p.domain, label: p.label, code: p.code || "", side: p.side || "", date: p.date || "",
+              value: p.value || "", unit: p.unit || "", excluded: p.excluded ? 1 : 0, source: "ai", suggestion_id: s.id,
+              quote: p.quote || "", votes: (p.votes || 0) + "/" + (p.n_verifiers || "?") };
+    var key = "missing:ai" + s.id;
+    _judgments[key] = m;
+    var found = NO;
+    for (var i = 0; i < _missing.length; i++)
+        if (_missing[i].key === key)
+            found = YES;
+    if (!found)
+        _missing.push({ key: key, data: m });
+    [self _decide:s decision:"accepted" extra:[{ entry_key: key, judgment: m }]];
+}
+
+- (void)rejectSuggestion:(id)sender
+{
+    var s = [self _selectedSuggestion];
+    if (s)
+        [self _decide:s decision:"rejected" extra:[]];
+}
+
+
+// --- Schnellvalidierung mit dem KI-Ensemble -------------------------------------
+
+// Briefansicht: Belege im Text farbig hinterlegen
+- (void)_renderLetter
+{
+    if (!_item)
+        return;
+    var text = _item.narrative || "";
+    if (!_letterWeb)
+    {
+        [_letterView setString:text];
+        return;
+    }
+    var marks = [], cur = nil;
+    var selE = [_entriesTable selectedRow], selM = [_missingTable selectedRow];
+    var entries = (_ensVisible && _item.entries) ? _item.entries : [];
+    for (var i = 0; i < entries.length; i++)
+    {
+        var en = _ens[entries[i].key];
+        if (!en || !en.quote)
+            continue;
+        var m = { quote: en.quote, cls: (en.verdict === "correct" ? "ok" : "err"), title: entries[i].label || "" };
+        if (i === selE && [[_window firstResponder] isEqual:_entriesTable])
+            cur = m;
+        else
+            marks.push(m);
+    }
+    for (var k = 0; k < (_mrows || []).length; k++)
+    {
+        var r = _mrows[k];
+        if (!r.quote)
+            continue;
+        var mm = { quote: r.quote, cls: "miss", title: r.label || "" };
+        if (k === selM && [[_window firstResponder] isEqual:_missingTable])
+            cur = mm;
+        else
+            marks.push(mm);
+    }
+    if (!cur && selE >= 0 && entries[selE] && _ens[entries[selE].key] && _ens[entries[selE].key].quote)
+        cur = { quote: _ens[entries[selE].key].quote, cls: "ok", title: entries[selE].label };
+    if (cur)
+        cur.cur = YES;
+    var html = OVLetterHTML(text, cur ? [cur].concat(marks) : marks);
+    if ([_letterWeb respondsToSelector:@selector(loadHTMLString:baseURL:)])
+        [_letterWeb loadHTMLString:html baseURL:nil];
+    else
+        [_letterWeb loadHTMLString:html];
+}
+
+- (void)_buildMissingRows
+{
+    _mrows = [];
+    for (var i = 0; i < (_missing || []).length; i++)
+    {
+        var d = _missing[i].data;
+        _mrows.push({ kind: "own", key: _missing[i].key, state: d.source === "ai" ? "übernommen" : "eigener", domain: d.domain, label: d.label,
+                      code: d.code, side: d.side, date: d.date, value: d.value, quote: d.quote || "", votes: d.votes || "" });
+    }
+    if (_ensVisible)
+        for (var k = 0; k < (_suggs || []).length; k++)
+        {
+            var s = _suggs[k], p = s.payload || {}, dec = _judgments["ai:" + s.id];
+            if (dec && dec.decision === "accepted")
+                continue;   // steht schon als übernommener Eintrag oben
+            _mrows.push({ kind: "sugg", sugg: s, state: dec ? "abgelehnt" : "Vorschlag", domain: p.domain, label: p.label, code: p.code,
+                          side: p.side, date: p.date, value: p.value, quote: p.quote || "", votes: (p.votes || 0) + "/" + (p.n_verifiers || "?") });
+        }
+}
+
+- (void)confirmEnsemble:(id)sender
+{
+    var e = [self _selectedEntry];
+    if (!e)
+        return;
+    var en = _ensVisible ? _ens[e.key] : nil;
+    if (!en)
+    {
+        OVAlert("Für diesen Eintrag gibt es kein Ensemble-Urteil.", "Bitte selbst bewerten (Korrekt, Fehler …).");
+        return;
+    }
+    if (en.verdict === "split")
+    {
+        OVAlert("Die Ensemble-Modelle sind sich uneinig.", "Bitte selbst bewerten (Korrekt, Fehler …).");
+        return;
+    }
+    var j = {};
+    for (var k in en.judgment)
+        j[k] = en.judgment[k];
+    j.verdict = en.verdict === "correct" ? "correct" : "error";
+    j.source = "ensemble";
+    [self _setJudgment:j forEntry:e advance:YES];
+}
+
+- (void)stopEnsemble:(id)sender
+{
+    if (!_currentSet)
+        return;
+    var setId = _currentSet.id;
+    [OVDialog confirm:"KI-Ensemble für diesen Datensatz beenden?" info:"Der Brief, der gerade bearbeitet wird, wird noch abgeschlossen; bisherige Ergebnisse bleiben erhalten."
+                   ok:"Beenden" then:function(yes)
+    {
+        if (!yes)
+            return;
+        OTPostJSON("/BBB/validation/sets/" + setId + "/ensemble/stop", {}, 60.0, function(res, error)
+        {
+            if (!res || res.error)
+                OVAlert("Nicht beendet.", res && res.error ? res.error : "Keine Antwort vom Server.");
+            else
+                OVAlert((res.stopping || res.removed || res.failed) ? "Das KI-Ensemble wird beendet." : "Es lief kein KI-Ensemble.");
+            [self loadEnsembleStatus];
+        });
+    }];
+}
+
+- (void)_prefetchAfter:(id)anItemId
+{
+    var idx = -1;
+    for (var i = 0; i < (_items || []).length; i++)
+        if (_items[i].id === anItemId)
+            idx = i;
+    for (var k = idx + 1; k < _items.length && k <= idx + 2; k++)
+    {
+        var id = _items[k].id;
+        if (_itemCache[id])
+            continue;
+        _itemCache[id] = "loading";
+        (function(pid)
+        {
+            OTGetJSON("/BBB/validation/items/" + pid + "?reviewer=" + encodeURIComponent([self reviewer]), 60.0, function(res, error)
+            {
+                if (res && !res.error)
+                    _itemCache[pid] = res;
+                else
+                    delete _itemCache[pid];
+            });
+        })(id);
+    }
+}
+
+// --- Referenzvergleich -----------------------------------------------------------
+
+- (void)compareReference:(id)sender
+{
+    if (!_currentSet)
+        return;
+    if (!_currentSet.frozen_at)
+    {
+        OVAlert("Dieser Datensatz hat noch keine eingefrorene Referenz.");
+        return;
+    }
+    var setId = _currentSet.id;
+    OTGetJSON("/BBB/validation/sets/" + setId + "/comparable", 60.0, function(res, error)
+    {
+        var list = (res && res.sets) ? res.sets : [];
+        if (!list.length)
+        {
+            OVAlert("Kein Datensatz zum Vergleichen.",
+                    "Verglichen werden kann nur mit Datensätzen, die dieselben Briefe enthalten und eine eingefrorene Referenz haben, " +
+                    "zum Beispiel mit einer Kopie (Datensatz kopieren …), deren Referenz aus einer anderen Quelle stammt.");
+            return;
+        }
+        var start = function(other) { [self _runReferenceComparison:setId other:other]; };
+        if (list.length <= 3)
+        {
+            var titles = [];
+            for (var i = 0; i < list.length; i++)
+                titles.push(list[i].name);
+            titles.push("Abbrechen");
+            var info = [];
+            for (var k = 0; k < list.length; k++)
+                info.push(list[k].name + ": " + [self _referenceText:list[k].reference] + ", " + list[k].overlap + " gemeinsame Briefe");
+            [OVDialog choose:"Referenz von „" + _currentSet.name + "“ vergleichen mit:" info:info.join("\n")
+                     buttons:titles then:function(index) { if (index >= 0 && index < list.length) start(list[index]); }];
+        }
+        else
+        {
+            var q = [];
+            for (var m = 0; m < list.length; m++)
+                q.push((m + 1) + " = " + list[m].name + " (" + [self _referenceText:list[m].reference] + ")");
+            [OVDialog prompt:"Referenz von „" + _currentSet.name + "“ vergleichen mit:" info:q.join("\n") + "\n\nNummer eingeben:"
+                       value:"1" ok:"Vergleichen" then:function(answer)
+            {
+                var chosen = answer ? list[parseInt(answer, 10) - 1] : nil;
+                if (chosen)
+                    start(chosen);
+            }];
+        }
+    });
+}
+
+- (void)_runReferenceComparison:(int)setId other:(id)other
+{
+    OTGetJSON("/BBB/validation/sets/" + setId + "/compare_reference?other=" + other.id, 300.0, function(res, error)
+    {
+        if (!res || res.error)
+        {
+            OVAlert("Vergleich nicht möglich.", res && res.error ? res.error : "Keine Antwort vom Server.");
+            return;
+        }
+        _cmpPair = { a: res.a.id, b: res.b.id };
+        var la = res.a.reference ? res.a.reference.label : res.a.name, lb = res.b.reference ? res.b.reference.label : res.b.name;
+        var L = [];
+        L.push("A: " + res.a.name + " – Referenz " + [self _referenceText:res.a.reference]);
+        L.push("B: " + res.b.name + " – Referenz " + [self _referenceText:res.b.reference]);
+        L.push(res.n_letters + " gemeinsame Briefe" + (res.only_in_a || res.only_in_b ? " (nur in A: " + res.only_in_a + ", nur in B: " + res.only_in_b + ")" : ""));
+        L.push("");
+        L.push("Übereinstimmung je Domäne (F1 ist symmetrisch: Anteil gemeinsamer Einträge an allen Einträgen beider Referenzen)");
+        L.push(OVPad("Domäne", 14) + OVPad("gemeinsam", 11) + OVPad("nur A", 8) + OVPad("nur B", 8) + OVPad("verwandt", 10) + OVPad("F1", 9) +
+               OVPad("F1 tol.", 9) + OVPad("Seite", 9) + OVPad("Datum", 9) + OVPad("Status", 9) + "Wert");
+        var doms = OVDomains.concat(["all"]);
+        for (var i = 0; i < doms.length; i++)
+        {
+            var d = res.metrics[doms[i]];
+            if (!d)
+                continue;
+            L.push(OVPad(doms[i] === "all" ? "gesamt" : OVDomainTitles[doms[i]], 14) + OVPad(d.tp, 11) + OVPad(d.fn, 8) + OVPad(d.fp, 8) +
+                   OVPad(d.partial, 10) + OVPad(OVPct(d.f1), 9) + OVPad(OVPct(d.f1_tol), 9) + OVPad(OVPct(d.side_accuracy), 9) +
+                   OVPad(OVPct(d.date_accuracy), 9) + OVPad(OVPct(d.status_accuracy), 9) + OVPct(d.value_accuracy));
+        }
+        L.push("");
+        L.push("Briefe mit den meisten Abweichungen");
+        var letters = res.letters || [], shown = 0;
+        for (var k = 0; k < letters.length && shown < 25; k++)
+        {
+            var l = letters[k];
+            if (!l.n_diff)
+                continue;
+            shown++;
+            L.push("Brief " + l.position + " (" + (l.pseudonym || "") + "): " + l.agree + " gemeinsam, " + l.n_diff + " Abweichungen");
+            for (var a = 0; a < l.only_a.length; a++)
+                L.push("    nur " + la + ": " + (OVDomainTitles[l.only_a[a].domain] || "") + " " + (l.only_a[a].label || l.only_a[a].code) +
+                       (l.only_a[a].side ? " " + (OVSideTitles[l.only_a[a].side] || l.only_a[a].side) : ""));
+            for (var b = 0; b < l.only_b.length; b++)
+                L.push("    nur " + lb + ": " + (OVDomainTitles[l.only_b[b].domain] || "") + " " + (l.only_b[b].label || l.only_b[b].code) +
+                       (l.only_b[b].side ? " " + (OVSideTitles[l.only_b[b].side] || l.only_b[b].side) : ""));
+            for (var r = 0; r < l.related.length; r++)
+                L.push("    verwandt: " + l.related[r].ref_label + " (" + l.related[r].ref_code + ") / " + l.related[r].pred_label + " (" + l.related[r].pred_code + ")");
+            for (var t = 0; t < l.attr.length; t++)
+            {
+                var e = l.attr[t], parts = [];
+                for (var key in e.errors)
+                    parts.push(key + " " + (e.errors[key].ref || "–") + " / " + (e.errors[key].pred || "–"));
+                L.push("    " + (e.label || e.code) + ": " + parts.join(", "));
+            }
+        }
+        if (!shown)
+            L.push("  keine Abweichungen");
+        else if (letters.length > shown)
+            L.push("  … alle Abweichungen im CSV");
+        [self _showComparisonPanel:L.join("\n") title:"Referenzvergleich " + res.a.name + " / " + res.b.name];
+    });
+}
+
+- (void)_showComparisonPanel:(CPString)aText title:(CPString)aTitle
+{
+    if (!_cmpPanel)
+    {
+        _cmpPanel = [[CPPanel alloc] initWithContentRect:CGRectMake(0, 0, 1000, 640)
+                                               styleMask:CPTitledWindowMask | CPClosableWindowMask | CPResizableWindowMask];
+        [_cmpPanel setFloatingPanel:YES];
+        var cv = [_cmpPanel contentView];
+        var ta = OVTextArea(CGRectMake(10, 10, 980, 580), YES);
+        _cmpView = ta.text;
+        [cv addSubview:OVM(ta.scroll, CPViewWidthSizable | CPViewHeightSizable)];
+        [cv addSubview:OVM(OTButton(CGRectMake(10, 600, 200, 28), "Abweichungen als CSV", self, @selector(downloadComparison:)), CPViewMinYMargin)];
+    }
+    [_cmpPanel setTitle:aTitle];
+    [_cmpView setString:aText];
+    [_cmpPanel center];
+    [_cmpPanel makeKeyAndOrderFront:self];
+}
+
+- (void)downloadComparison:(id)sender
+{
+    if (_cmpPair)
+        window.open("/BBB/validation/sets/" + _cmpPair.a + "/compare_reference?other=" + _cmpPair.b + "&format=csv", "_blank");
+}
+
+- (CPString)_referenceText:(id)ref
+{
+    if (!ref)
+        return "–";
+    var d = String(ref.frozen_at || "").substring(0, 10).split("-");
+    return ref.label + (d.length === 3 ? ", " + d[2] + "." + d[1] + "." + d[0] : "");
+}
+
+- (void)copySet:(id)sender
+{
+    if (!_currentSet)
+        return;
+    var src = _currentSet;
+    [OVDialog prompt:"Datensatz „" + src.name + "“ kopieren"
+                info:"Die Kopie enthält dieselben Briefe und Extraktionen sowie alle ärztlichen und KI-Bewertungen, aber keine Referenz und keine Läufe. " +
+                     "So kann jede Referenz (Ärzte, Pipeline-Lauf) ihren eigenen Datensatz haben. Name der Kopie:"
+               value:src.name + "_kopie" ok:"Kopieren" then:function(name)
+    {
+        if (name === nil || !OTTrim(name).length)
+            return;
+        OTPostJSON("/BBB/validation/sets/" + src.id + "/copy", { name: OTTrim(name), created_by: [self reviewer] }, 300.0, function(res, error)
+        {
+            if (!res || res.error)
+            {
+                OVAlert("Nicht kopiert.", res && res.error ? res.error : "Keine Antwort vom Server.");
+                return;
+            }
+            OVAlert("Datensatz „" + res.name + "“ angelegt.",
+                    res.items + " Briefe, " + res.reviews + " ärztliche und " + res.ai_reviews + " KI-Bewertungen übernommen. Die Kopie ist gesperrt und hat noch keine Referenz.");
+            _currentSet = { id: res.id };
+            [self loadSets:nil];
+        });
+    }];
 }
 
 - (void)freezeSet:(id)sender
@@ -2015,16 +2482,18 @@ function OVAlert(aMessage, anInfo)
 {
     if (!_currentSet)
         return;
-    if (!_currentSet.frozen_at)
+    if (!_currentSet.frozen_at && aMode === "stored")
     {
-        OVAlert("Erst die Referenz einfrieren.");
+        OVAlert("Erst die Referenz einfrieren.", "Gespeicherte Phenopackets lassen sich nur gegen eine Referenz prüfen.");
         return;
     }
+    var noRef = !_currentSet.frozen_at;
     var setId = _currentSet.id;
     // Extraktionsmodell aus der Auswahl „LLM Model“ im Hauptfenster
     var model = (aMode === "reextract" && _app && [_app respondsToSelector:@selector(selectedModel)]) ? [_app selectedModel] : nil;
     [OVDialog prompt:(aMode === "stored" ? "Gespeicherte Phenopackets gegen die Referenz prüfen" : "Alle " + _currentSet.n_items + " Briefe mit " + (model || "dem Standardmodell") + " neu extrahieren und prüfen")
                 info:(aMode === "stored" ? "Bezeichnung des Laufs, z. B. „Bestand vor Neu-Extraktion“:" :
+                      (noRef ? "Der Datensatz hat noch keine Referenz: Der Lauf speichert nur die Extraktionen. Danach lässt er sich mit „Lauf als Referenz einfrieren …“ zur Pipeline-Referenz machen. " : "") +
                       "Das Modell kommt aus der Auswahl „LLM Model“ oben rechts im Hauptfenster. Bezeichnung des Laufs, z. B. „" + (model || "gpt-oss-120b") + " Lauf 1“. Die Neu-Extraktion dauert.")
                value:(model ? model + " " : "") ok:"Lauf starten" then:function(label)
     {
@@ -2053,6 +2522,27 @@ function OVAlert(aMessage, anInfo)
 {
     var row = [_runsTable selectedRow];
     return (row >= 0 && row < _runs.length) ? _runs[row] : nil;
+}
+
+- (void)freezeFromRun:(id)sender
+{
+    var r = [self _selectedRun];
+    if (!r || r.status !== "finished" || r.mode !== "reextract")
+    {
+        OVAlert("Bitte einen abgeschlossenen Lauf mit Neu-Extraktion auswählen.");
+        return;
+    }
+    if (_currentSet.frozen_at)
+    {
+        OVAlert("Der Datensatz hat bereits eine Referenz.", "Für eine weitere Referenz den Datensatz kopieren und in der Kopie einen Lauf starten.");
+        return;
+    }
+    var model = r.fingerprint ? r.fingerprint.model : "?";
+    [self _confirmSetName:"Extraktionen von Lauf " + r.id + " (" + model + ") als Pipeline-Referenz einfrieren?" then:function()
+    {
+        [self _postSetAction:"freeze" payload:{ confirm: _currentSet.name, by: [self reviewer], source: "run", run_id: r.id }
+                     message:"Pipeline-Referenz aus Lauf " + r.id + " (" + model + ") eingefroren."];
+    }];
 }
 
 - (void)setBaseline:(id)sender
@@ -2088,8 +2578,16 @@ function OVAlert(aMessage, anInfo)
     if (r.error)
         L.push("Fehler: " + r.error);
     var fp = r.fingerprint || {};
-    L.push("Pipeline-Stand " + (fp.hash || "–") + "   Modell " + (fp.model || "–") + "   Git " + (fp.git || "–"));
+    L.push("Pipeline-Stand " + (fp.hash || "–") + "   Modell " + (r.mode === "stored" ? "Bestand" : (fp.model || "–")) + "   Git " + (fp.git || "–"));
+    L.push("Referenz " + [self _referenceText:fp.reference] + (fp.reference && fp.reference.frozen_by ? ", eingefroren von " + fp.reference.frozen_by : ""));
     var m = r.metrics;
+    if (m && m.without_reference)
+    {
+        L.push("");
+        L.push("Lauf ohne Referenz: Die Extraktionen von " + m.n_items + " Briefen sind gespeichert" + (m.n_failed ? " (" + m.n_failed + " ohne Ergebnis)" : "") + ".");
+        L.push("Mit „Lauf als Referenz einfrieren …“ wird daraus die Pipeline-Referenz des Datensatzes.");
+        m = nil;
+    }
     if (m)
     {
         L.push("");
@@ -2114,6 +2612,9 @@ function OVAlert(aMessage, anInfo)
     if (c)
     {
         L.push("");
+        if (c.reference_mismatch)
+            L.push("ACHTUNG: Basis-Lauf " + c.baseline_run_id + " wurde gegen eine andere Referenz gerechnet. Der Vergleich ist nicht aussagekräftig; " +
+                   "einen neuen Basis-Lauf gegen die aktuelle Referenz anlegen.");
         L.push("Vergleich mit Basis-Lauf " + c.baseline_run_id + ": " + (c.verdict === "ok" ? "keine Regression" : "REGRESSION in " + c.worse_domains.join(", ")) +
                " (Toleranz " + OVPct(c.tolerance) + " F1)");
         var ch = c.changes || [];
@@ -2240,24 +2741,24 @@ function OVAlert(aMessage, anInfo)
         if (!jnames.length)
         {
             L.push("");
-            L.push("KI-Judge im Vergleich zu den Ärzten");
-            L.push("  noch keine KI-Bewertungen");
+            L.push("KI-Ensemble im Vergleich zu den Ärzten");
+            L.push("  noch keine Ensemble-Bewertungen");
         }
         for (var q = 0; q < jnames.length; q++)
         {
             var jg = judges[jnames[q]];
             L.push("");
-            L.push("KI-Judge " + jnames[q] + " im Vergleich zu den Ärzten");
+            L.push("Ensemble-Modell " + jnames[q] + " im Vergleich zu den Ärzten");
             if (!jg || !jg.n_items)
             {
-                L.push("  noch keine Briefe, die von Ärzten abgeschlossen und von diesem Judge bewertet sind");
+                L.push("  noch keine Briefe, die von Ärzten abgeschlossen und von diesem Modell bewertet sind");
                 continue;
             }
             var cf = jg.confusion || {};
-            L.push("  " + jg.n_items + " Briefe. Von den Ärzten gefundene Fehler erkennt der Judge zu " + OVPct(jg.sensitivity) +
-                   " (Sensitivität); als korrekt bewertete Einträge bestätigt er zu " + OVPct(jg.specificity) + " (Spezifität).");
-            L.push("  beide korrekt " + (cf.both_correct || 0) + ", beide Fehler " + (cf.both_error || 0) + ", nur Judge Fehler " +
-                   (cf.judge_only_error || 0) + ", vom Judge übersehen " + (cf.judge_missed_error || 0));
+            L.push("  " + jg.n_items + " Briefe. Von den Ärzten gefundene Fehler erkennt das Modell zu " + OVPct(jg.sensitivity) +
+                   " (Sensitivität); als korrekt bewertete Einträge bestätigt es zu " + OVPct(jg.specificity) + " (Spezifität).");
+            L.push("  beide korrekt " + (cf.both_correct || 0) + ", beide Fehler " + (cf.both_error || 0) + ", nur Modell Fehler " +
+                   (cf.judge_only_error || 0) + ", vom Modell übersehen " + (cf.judge_missed_error || 0));
             var jk = jg.kappa || {};
             for (var key2 in kl)
                 if (jk[key2])
@@ -2265,16 +2766,28 @@ function OVAlert(aMessage, anInfo)
                            "κ = " + (jk[key2].kappa === null || jk[key2].kappa === undefined ? "–" : jk[key2].kappa.toFixed(3)));
             var jm = jg.missing || {};
             L.push("  Fehlende Einträge (mit Code): von beiden genannt " + (jm.both || 0) + ", nur Ärzte " + (jm.human_only || 0) +
-                   ", nur Judge " + (jm.judge_only || 0));
+                   ", nur Modell " + (jm.judge_only || 0));
             var jv = jg.vigilance || {};
             for (var t2 in jv)
                 L.push("  eingestreut: " + OVPad(vt[t2] || t2, 18) + OVPad(jv[t2].detected + " von " + jv[t2].n, 12) + "erkannt " + OVPct(jv[t2].rate));
+        }
+        var as = res.assist || {}, asd = res.assisted || {};
+        if (as.shown)
+        {
+            var aa = asd.all || {}, mm = m.all || {};
+            L.push("");
+            L.push("Zweitblick mit KI-Hinweisen");
+            L.push("  Oben stehen die Bewertungen vor dem Zweitblick (Hauptergebnis). Nach dem Zweitblick:");
+            L.push("  Precision streng " + OVPct(aa.precision_strict) + " (vorher " + OVPct(mm.precision_strict) + "), Seite " + OVPct(aa.side_accuracy) +
+                   " (vorher " + OVPct(mm.side_accuracy) + "), Datum " + OVPct(aa.date_accuracy) + " (vorher " + OVPct(mm.date_accuracy) + ")");
+            L.push("  Hinweise entschieden: " + as.shown + " – übernommen " + as.accepted + " (Fehler " + (as.accepted_flag || 0) + ", fehlende Einträge " +
+                   (as.accepted_missing || 0) + "), abgelehnt " + as.rejected + "; Vorschläge insgesamt " + as.suggestions);
         }
         var jb = res.judges_between;
         if (jb && jb.overall)
         {
             L.push("");
-            L.push("Judges untereinander (" + jb.models.join(" vs. ") + "): n = " + jb.overall.n + ", Übereinstimmung " + OVPct(jb.overall.agreement) +
+            L.push("Ensemble-Modelle untereinander (" + jb.models.join(" vs. ") + "): n = " + jb.overall.n + ", Übereinstimmung " + OVPct(jb.overall.agreement) +
                    ", κ = " + (jb.overall.kappa === null || jb.overall.kappa === undefined ? "–" : jb.overall.kappa.toFixed(3)));
         }
         [_studyView setString:L.join("\n")];
@@ -2287,12 +2800,13 @@ function OVAlert(aMessage, anInfo)
 
 - (int)numberOfRowsInTableView:(CPTableView)aTableView
 {
+
     if (aTableView === _itemsTable)
         return _items ? _items.length : 0;
     if (aTableView === _entriesTable)
         return (_item && _item.entries) ? _item.entries.length : 0;
     if (aTableView === _missingTable)
-        return _missing ? _missing.length : 0;
+        return _mrows ? _mrows.length : 0;
     if (aTableView === _checklistTable)
         return (_checklist && _checklist.lines) ? _checklist.lines.length : 0;
     if (aTableView === _runsTable)
@@ -2325,6 +2839,12 @@ function OVAlert(aMessage, anInfo)
             case "side":     return OVSideTitles[e.side] || e.side || "";
             case "value":    return e.value !== undefined && e.value !== null ? String(e.value) + (e.unit ? " " + e.unit : "") : (e.value_text || "");
             case "judgment": return (e.excluded ? "[verneint] " : "") + OVJudgmentText(_judgments[e.key]);
+            case "ens":
+                var en = _ensVisible ? _ens[e.key] : nil;
+                if (!en)
+                    return "";
+                var votes = " (" + (en.verdict === "correct" ? en.ok : en.err) + "/" + en.n + ")";
+                return en.verdict === "correct" ? "korrekt" + votes : (en.verdict === "split" ? "uneinig (" + en.ok + ":" + en.err + ")" : "⚑ " + (en.problem || "Fehler") + votes);
             case "others":
                 if (!_item.others)
                     return @"";
@@ -2337,6 +2857,19 @@ function OVAlert(aMessage, anInfo)
     }
 
     if (aTableView === _missingTable)
+    {
+        var mr = _mrows ? _mrows[row] : nil;
+        if (!mr)
+            return @"";
+        if (ident === "mstate")
+            return mr.state;
+        if (ident === "domain")
+            return OVDomainTitles[mr.domain] || mr.domain || "";
+        if (ident === "side")
+            return OVSideTitles[mr.side] || mr.side || "";
+        return mr[ident] === undefined || mr[ident] === null ? @"" : String(mr[ident]);
+    }
+    if (NO)
     {
         var m = _missing[row] ? _missing[row].data : nil;
         if (!m)
@@ -2378,13 +2911,18 @@ function OVAlert(aMessage, anInfo)
                 if (!r.comparison || !r.comparison.delta_f1 || r.comparison.delta_f1.all === undefined)
                     return (_currentSet && _currentSet.baseline_run_id === r.id) ? "Basis" : "–";
                 var dv = r.comparison.delta_f1.all;
-                return (dv >= 0 ? "+" : "") + (100 * dv).toFixed(1) + " Pp.";
+                return (dv >= 0 ? "+" : "") + (100 * dv).toFixed(1) + " Pp." + (r.comparison.reference_mismatch ? " (andere Ref.)" : "");
             case "verdict":
+                if (r.metrics && r.metrics.without_reference)
+                    return "ohne Referenz";
                 if (!r.comparison)
                     return (_currentSet && _currentSet.baseline_run_id === r.id) ? "Basis" : "";
+                if (r.comparison.reference_mismatch)
+                    return "nicht vergleichbar";
                 return r.comparison.verdict === "ok" ? "ok" : "Regression";
             case "fingerprint": return r.fingerprint ? (r.fingerprint.hash || "") : "";
             case "model":       return r.mode === "stored" ? "Bestand" : (r.fingerprint ? (r.fingerprint.model || "") : "");
+            case "reference":   return [self _referenceText:(r.fingerprint ? r.fingerprint.reference : nil)];
             default:            return r[ident] === undefined || r[ident] === null ? @"" : String(r[ident]);
         }
     }
@@ -2402,6 +2940,8 @@ function OVAlert(aMessage, anInfo)
     }
     else if (table === _runsTable)
         [self _showRunDetail];
+    else if (table === _entriesTable || table === _missingTable)
+        [self _renderLetter];
 }
 
 @end

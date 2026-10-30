@@ -4230,6 +4230,15 @@ helper get_llm_prompt => sub {
     return $prompt_cache->{$name};
 };
 
+# Prompt-Rahmen aus llm_prompts.user_template mit {{platzhalter}}; ohne Eintrag gilt der eingebaute Text
+helper fill_prompt_frame => sub {
+    my ($self, $name, $default, %vars) = @_;
+    my $rec  = $self->get_llm_prompt($name);
+    my $tmpl = ($rec && defined $rec->{user_template} && length $rec->{user_template}) ? $rec->{user_template} : $default;
+    $tmpl =~ s/\{\{(\w+)\}\}/exists $vars{$1} ? ($vars{$1} \/\/ '') : "{{$1}}"/ge;
+    return $tmpl;
+};
+
 helper get_filter_rules => sub {
     my ($self) = @_;
     state $rules_cache = {};
@@ -4472,14 +4481,9 @@ helper extract_atomic_criteria_async => sub {
                 my $pct = int(5 + ($completed_llm_calls / $total_llm_calls) * 45);
                 $self->notify_task_progress($task_id, 'llm1', $pct, "Reasoning Chunk $c_num/$total_chunks ($pct%)...");
 
-                my $augmented_input = qq{ORIGINAL CLINICAL TEXT:
-------------------------
-$current_chunk
-
-CLINICAL REASONING, RULES ALIGNMENT & PRE-EXTRACTION TABLE:
-------------------------
-$reasoning_trace
-};
+                my $augmented_input = $self->fill_prompt_frame('frame_deep_mode_input',
+                    "ORIGINAL CLINICAL TEXT:\n------------------------\n{{text}}\n\nCLINICAL REASONING, RULES ALIGNMENT & PRE-EXTRACTION TABLE:\n------------------------\n{{reasoning}}\n",
+                    text => $current_chunk, reasoning => $reasoning_trace);
 
                 # Stufe 1B: Grammar-Sampling (Original-Prompt aus DB + Originaltext + Voranalyse-Tabelle)
                 return $self->extract_structured_data_async(
@@ -4729,7 +4733,9 @@ helper generate_reasoning_trace_async => sub {
         $system_prompt = $prompt_record ? $prompt_record->{system_prompt} : '';
     }
 
-    my $user_content = qq{KLINISCHER BEFUND:\n------------------------\n$text\n------------------------\n$clinical_task_instruction\n\nErstelle nun Schritt für Schritt deine klinische Überlegung und gib die Markdown-Tabelle aus:};
+    my $user_content = $self->fill_prompt_frame('frame_reasoning_input',
+        "KLINISCHER BEFUND:\n------------------------\n{{text}}\n------------------------\n{{instruction}}\n\nErstelle nun Schritt für Schritt deine klinische Überlegung und gib die Markdown-Tabelle aus:",
+        text => $text, instruction => $clinical_task_instruction);
 
     my $api_payload;
 
@@ -4802,6 +4808,8 @@ helper generate_reasoning_trace_async => sub {
 # =========================================================
 helper extract_structured_data_async => sub {
     my ($self, $text, $schema, $system_instruction, $user_prompt, $client_model) = @_;
+    my $user_content = $self->fill_prompt_frame('frame_extraction_input', "INPUT CLINICAL TEXT:\n---\n{{text}}\n---\nPrompt: {{prompt}}",
+                                                text => $text, prompt => $user_prompt);
 
     my $req_id          = sprintf("LLM-%06d", int(rand(899999)) + 100000);
     my $t0              = [Time::HiRes::gettimeofday()];
@@ -4821,7 +4829,7 @@ helper extract_structured_data_async => sub {
                 think    => Mojo::JSON->false,
                 messages => [
                     { role => 'system', content => $system_instruction },
-                    { role => 'user',   content => "INPUT CLINICAL TEXT:\n---\n$text\n---\nPrompt: $user_prompt" }
+                    { role => 'user',   content => $user_content }
                 ],
                 format   => $schema,
                 stream   => Mojo::JSON->false,
@@ -4839,7 +4847,7 @@ helper extract_structured_data_async => sub {
             model       => $active_model,
             messages    => [
                 { role => 'system', content => $system_instruction },
-                { role => 'user',   content => "INPUT CLINICAL TEXT:\n---\n$text\n---\nPrompt: $user_prompt" }
+                { role => 'user',   content => $user_content }
             ],
             temperature => 0.1,
             response_format => {
@@ -11189,6 +11197,8 @@ sub _val_build_reference {
 sub _val_attr_check {
     my ($r, $p, $attr) = @_;
     my $rv = $r->{$attr};
+    # beim Vergleich zweier Referenzen: unbekannte Angabe auf der Gegenseite nicht werten
+    return undef if defined $p->{$attr} && $p->{$attr} eq '?';
     if ($attr eq 'value') {
         return undef if $r->{domain} ne 'measurement';
         return undef if defined $rv && $rv eq '?';
@@ -11334,14 +11344,62 @@ sub _val_load_items {
     return $db->query('SELECT * FROM validation_items WHERE set_id = ? ORDER BY position', $set_id)->expand->hashes->to_array;
 }
 
+# Bewertungen je Brief. phase: 'final' (Standard, aktueller Stand), 'unassisted' (Stand vor dem
+# Zweitblick, soweit vorhanden, sonst final) oder 'all' (beide Phasen, mit Feld phase)
 sub _val_reviews_by_item {
-    my ($db, $set_id) = @_;
+    my ($db, $set_id, $phase) = @_;
+    $phase //= 'final';
     my %r;
-    my $rows = $db->query(q{SELECT r.item_id, r.reviewer, r.entry_key, r.judgment::text AS judgment, r.updated_at
+    my $rows = $db->query(q{SELECT r.item_id, r.reviewer, r.entry_key, r.judgment::text AS judgment, r.updated_at, r.phase
                             FROM validation_reviews r JOIN validation_items i ON i.id = r.item_id
-                            WHERE i.set_id = ?}, $set_id)->hashes;
+                            WHERE i.set_id = ?} . ($phase eq 'final' ? q{ AND r.phase = 'final'} : ''), $set_id)->hashes;
+    if ($phase eq 'unassisted') {
+        my %has_pre = map { ("$_->{item_id}|$_->{reviewer}" => 1) } grep { $_->{phase} eq 'pre' } @$rows;
+        $rows = [ grep { $has_pre{"$_->{item_id}|$_->{reviewer}"} ? $_->{phase} eq 'pre' : $_->{phase} eq 'final' } @$rows ];
+    }
     push @{ $r{ $_->{item_id} } }, $_ for @$rows;
     return \%r;
+}
+
+# Kennung der eingefrorenen Referenz eines Datensatzes (Quelle + Zeitpunkt)
+sub _val_reference_info {
+    my ($set) = @_;
+    return undef unless $set->{frozen_at};
+    my $src = $set->{reference_source} // 'human';
+    my $label = $src =~ /^judge:(.+)$/ ? "KI-Judge $1" : $src =~ /^pipeline:(.+)$/ ? "Pipeline $1" : 'Ärzte';
+    return { source => $src, label => $label, frozen_at => "$set->{frozen_at}", frozen_by => $set->{frozen_by} // '',
+             id => "$src\@$set->{frozen_at}" };
+}
+
+# Eingestreute Fehler (nur Studien): deterministisch aus Seed und Kandidat
+sub _val_inject {
+    my ($seed, $cid, $entries, $inject) = @_;
+    my @inj;
+    return ($entries, \@inj) unless $inject > 0 && @$entries && _val_rand($seed, "inject:$cid") < $inject;
+    my @cand = sort { _val_rand($seed, "pick:$a->{key}") <=> _val_rand($seed, "pick:$b->{key}") } @$entries;
+    my $t = $cand[0];
+    my ($sw) = grep { $_->{side} eq 'R' || $_->{side} eq 'L' } @cand;
+    my ($dt) = grep { $_->{date} =~ /^\d{4}/ } @cand;
+    my $kind = _val_rand($seed, "kind:$cid");
+    if ($sw && $kind < 0.4) {
+        push @inj, { type => 'side_swap', key => $sw->{key}, original => { %$sw } };
+        $sw->{side} = $sw->{side} eq 'R' ? 'L' : 'R';
+    } elsif ($dt && $kind < 0.7) {
+        push @inj, { type => 'date_shift', key => $dt->{key}, original => { %$dt } };
+        $dt->{date} =~ s/^(\d{4})/$1 - 1/e;
+    } else {
+        push @inj, { type => 'drop', key => $t->{key}, original => { %$t } };
+        $entries = [ grep { $_->{key} ne $t->{key} } @$entries ];
+    }
+    return ($entries, \@inj);
+}
+
+# Datensatz wird noch vorbereitet (Neu-Extraktion läuft)?
+sub _val_preparing {
+    my ($c, $set) = @_;
+    return 0 unless ($set->{status} // 'ready') eq 'preparing';
+    $c->render(json => { error => 'Der Datensatz wird noch vorbereitet: Die Phenopackets werden gerade neu extrahiert.' }, status => 409);
+    return 1;
 }
 
 sub _val_confirm_ok {
@@ -11376,13 +11434,27 @@ sub _val_fingerprint {
 get '/BBB/validation/sets' => sub {
     my $c = shift;
     my $rows = $c->pg->db->query(q{
-        SELECT s.id, s.name, s.purpose, s.locked, s.frozen_at, s.frozen_by, s.created_at, s.created_by, s.reference_source,
+        SELECT s.id, s.name, s.purpose, s.locked, s.status, s.frozen_at, s.frozen_by, s.created_at, s.created_by, s.reference_source,
                s.baseline_run_id, s.params, s.notes,
                (SELECT count(*) FROM validation_items i WHERE i.set_id = s.id) AS n_items,
                (SELECT count(*) FROM validation_runs r WHERE r.set_id = s.id) AS n_runs
         FROM validation_sets s ORDER BY s.created_at DESC
     })->hashes->to_array;
     $_->{params} = _val_json($_->{params}) for @$rows;
+    if (grep { ($_->{status} // '') eq 'preparing' } @$rows) {
+        my %alive = map { $_->{id} => 1 } @{ $c->minion->backend->list_workers(0, 1000)->{workers} // [] };
+        my %job;
+        my $jobs = $c->minion->jobs({ tasks => ['validation_prepare_task'], states => [qw(inactive active)] });
+        while (my $j = $jobs->next) { $job{ $j->{args}[0]{set_id} // 0 } = $j }
+        for my $r (grep { ($_->{status} // '') eq 'preparing' } @$rows) {
+            my $j = $job{ $r->{id} };
+            my $n = $j ? ($j->{notes} // {}) : {};
+            $r->{prep} = { running => ($j && ($j->{state} eq 'inactive' || $alive{ $j->{worker} // 0 })) ? 1 : 0,
+                           state => $j ? $j->{state} : 'none', progress => $n->{progress} // 0, done => $n->{done} // 0,
+                           failed => $n->{failed} // 0, current => $n->{current}, total => $n->{total},
+                           current_s => $n->{current_since} ? int(time - $n->{current_since}) : undef };
+        }
+    }
     $c->render(json => $rows);
 };
 
@@ -11409,8 +11481,13 @@ post '/BBB/validation/sets' => sub {
     my @tags    = grep { length } map { lc s/^\s+|\s+$//gr } split /,/, ($p->{tag} // '');
     my $per_pat = exists $p->{one_per_patient} ? to_bool($p->{one_per_patient}) : 1;
     my $minlen  = int($p->{min_length} // 300);
+    # Standard: Phenopackets mit der aktuellen Pipeline neu extrahieren (reproduzierbar, aktuell)
+    my $reextract = exists $p->{reextract} ? to_bool($p->{reextract}) : 1;
+    my $model     = $reextract && defined $p->{model} && length $p->{model} ? $p->{model} : undef;
+    my $pp_sql    = $reextract ? '' : 'AND c.phenopacket_json IS NOT NULL AND length(c.phenopacket_json::text) > 20';
+    my $with_ensemble = exists $p->{ensemble} ? to_bool($p->{ensemble}) : ($purpose eq 'regression' ? 1 : 0);
 
-    # Grundgesamtheit: Briefe mit Text und Phenopacket, je Brieftext einmal,
+    # Grundgesamtheit: Briefe mit Text (ohne Neu-Extraktion: mit Phenopacket), je Brieftext einmal,
     # optional ein Brief je Patient, ohne Briefe aus anderen Validierungsdatensätzen
     my @bind = ($seed, $minlen);
     my $tag_sql = '';
@@ -11424,8 +11501,8 @@ post '/BBB/validation/sets' => sub {
                    c.id, c.pseudonym, c.doc_source, c.reference_date::text AS reference_date,
                    md5(?::text || ':' || c.id) AS r
             FROM candidates c
-            WHERE c.phenopacket_json IS NOT NULL AND length(c.phenopacket_json::text) > 20
-              AND c.narrative_report IS NOT NULL AND length(c.narrative_report) >= ?
+            WHERE c.narrative_report IS NOT NULL AND length(c.narrative_report) >= ?
+              $pp_sql
               AND c.id NOT IN (SELECT candidate_id FROM validation_items WHERE candidate_id IS NOT NULL)
               $tag_sql
             ORDER BY md5(c.narrative_report), c.id
@@ -11475,7 +11552,11 @@ post '/BBB/validation/sets' => sub {
     my $tx = $db->begin;
     my $set_id = $db->insert('validation_sets', {
         name => $name, purpose => $purpose, created_by => $p->{created_by} // '', notes => $p->{notes} // '',
+        status => $reextract ? 'preparing' : 'ready',
         params => to_json({ n => $n, seed => $seed, tags => \@tags, one_per_patient => $per_pat ? 1 : 0,
+                            extraction => $reextract ? { mode => 'reextract', model => $model // resolve_llm_config(undef)->{model} }
+                                                     : { mode => 'stored' },
+                            ensemble_after_prepare => $with_ensemble ? 1 : 0,
                             min_length => $minlen, double_fraction => $double, inject_fraction => $inject,
                             pool_size => $total, strata => { map { $_ => { pool => scalar @{ $strata{$_} }, sample => $alloc{$_} } } keys %strata } }),
     }, { returning => 'id' })->hash->{id};
@@ -11483,27 +11564,12 @@ post '/BBB/validation/sets' => sub {
     my ($pos, $n_double, $n_inject) = (0, 0, 0);
     for my $r (@chosen) {
         my $row = $db->query('SELECT narrative_report, phenopacket_json::text AS pp FROM candidates WHERE id = ?', $r->{id})->hash;
-        my $pp  = _ppd_parse_json($row->{pp}) // {};
-        my $entries = _val_entries($pp);
+        my $pp  = $reextract ? {} : (_ppd_parse_json($row->{pp}) // {});
+        my $entries = $reextract ? [] : _val_entries($pp);
         my $is_double = $double > 0 && _val_rand($seed, "double:$r->{id}") < $double ? 1 : 0;
         my @inj;
-        if ($inject > 0 && @$entries && _val_rand($seed, "inject:$r->{id}") < $inject) {
-            my @cand = sort { _val_rand($seed, "pick:$a->{key}") <=> _val_rand($seed, "pick:$b->{key}") } @$entries;
-            my $t = $cand[0];
-            my ($sw) = grep { $_->{side} eq 'R' || $_->{side} eq 'L' } @cand;
-            my ($dt) = grep { $_->{date} =~ /^\d{4}/ } @cand;
-            my $kind = _val_rand($seed, "kind:$r->{id}");
-            if ($sw && $kind < 0.4) {
-                push @inj, { type => 'side_swap', key => $sw->{key}, original => { %$sw } };
-                $sw->{side} = $sw->{side} eq 'R' ? 'L' : 'R';
-            } elsif ($dt && $kind < 0.7) {
-                push @inj, { type => 'date_shift', key => $dt->{key}, original => { %$dt } };
-                $dt->{date} =~ s/^(\d{4})/$1 - 1/e;
-            } else {
-                push @inj, { type => 'drop', key => $t->{key}, original => { %$t } };
-                $entries = [ grep { $_->{key} ne $t->{key} } @$entries ];
-            }
-        }
+        ($entries, my $injected) = _val_inject($seed, $r->{id}, $entries, $inject);
+        @inj = @$injected;
         $n_double++ if $is_double;
         $n_inject++ if @inj;
         $db->insert('validation_items', {
@@ -11515,9 +11581,170 @@ post '/BBB/validation/sets' => sub {
         });
     }
     $tx->commit;
-    $c->app->log->info("[VALIDATION] Datensatz \"$name\" ($purpose) mit $pos Briefen angelegt (Seed $seed).");
-    $c->render(json => { id => $set_id, name => $name, n => $pos, seed => $seed, pool => $total,
-                         double => $n_double, injected => $n_inject, strata => scalar keys %strata });
+    if ($reextract) {
+        $c->minion->enqueue(validation_prepare_task => [{ set_id => $set_id, model => $model, seed => $seed, inject => $inject,
+                                                          ensemble => $with_ensemble ? 1 : 0 }], { attempts => 1, queue => 'validation', priority => -5 });
+    }
+    $c->app->log->info("[VALIDATION] Datensatz \"$name\" ($purpose) mit $pos Briefen angelegt (Seed $seed)" . ($reextract ? ', Neu-Extraktion eingereiht.' : '.'));
+    $c->render(json => { id => $set_id, name => $name, n => $pos, seed => $seed, pool => $total, preparing => $reextract ? 1 : 0,
+                         model => $reextract ? ($model // resolve_llm_config(undef)->{model}) : undef,
+                         double => $n_double, injected => $reextract ? undef : $n_inject, strata => scalar keys %strata });
+};
+
+# Abgebrochene Vorbereitung fortsetzen (z. B. nach Neustart des Workers)
+post '/BBB/validation/sets/:id/prepare' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    return $c->render(json => { error => 'Der Datensatz ist bereits vorbereitet.' }, status => 409) unless ($set->{status} // '') eq 'preparing';
+    my %alive = map { $_->{id} => 1 } @{ $c->minion->backend->list_workers(0, 1000)->{workers} // [] };
+    my $jobs = $c->minion->jobs({ tasks => ['validation_prepare_task'], states => [qw(inactive active)] });
+    while (my $j = $jobs->next) {
+        next unless ($j->{args}[0]{set_id} // 0) == $set->{id};
+        if ($j->{state} eq 'active' && !$alive{ $j->{worker} // 0 }) { $c->minion->job($j->{id})->fail('Worker beendet'); next }
+        return $c->render(json => { error => 'Die Vorbereitung läuft bereits.' }, status => 409);
+    }
+    my $p = $set->{params} // {};
+    my $id = $c->minion->enqueue(validation_prepare_task => [{ set_id => $set->{id}, model => ($p->{extraction} // {})->{model},
+                                                               seed => $p->{seed}, inject => $p->{inject_fraction} // 0,
+                                                               ensemble => $p->{ensemble_after_prepare} ? 1 : 0 }],
+                                 { attempts => 1, queue => 'validation', priority => -5 });
+    $c->render(json => { ok => 1, job => $id });
+};
+
+# Datensatz kopieren: dieselben Briefe und Extraktionen, alle ärztlichen und KI-Bewertungen,
+# aber ohne Referenz und ohne Läufe. So kann jede Referenz (Ärzte, je KI-Judge) ihren
+# eigenen Datensatz haben.
+post '/BBB/validation/sets/:id/copy' => sub {
+    my $c   = shift;
+    my $p   = $c->req->json // {};
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    return if _val_preparing($c, $set);
+    my $name = $p->{name} // '';
+    $name =~ s/^\s+|\s+$//g;
+    return $c->render(json => { error => 'Name fehlt.' }, status => 400) unless length $name;
+    return $c->render(json => { error => "Datensatz \"$name\" existiert bereits." }, status => 409)
+        if $db->query('SELECT 1 FROM validation_sets WHERE name = ?', $name)->array;
+    my $with_reviews = exists $p->{reviews} ? to_bool($p->{reviews}) : 1;
+
+    my ($new_id, $n_items, $n_rev, $n_ai) = (undef, 0, 0, 0);
+    my $ok = eval {
+        my $tx = $db->begin;
+        my %params = %{ $set->{params} // {} };
+        $params{copied_from} = { id => $set->{id} + 0, name => $set->{name} };
+        $new_id = $db->insert('validation_sets', {
+            name => $name, purpose => $set->{purpose}, params => to_json(\%params), created_by => $p->{created_by} // '',
+            notes => "Kopie von $set->{name}",
+        }, { returning => 'id' })->hash->{id};
+        my $items = $db->query(q{SELECT id, position, candidate_id, pseudonym, doc_source, reference_date, stratum, narrative, narrative_md5,
+                                        snapshot::text AS snapshot, entries::text AS entries, injected::text AS injected, double_review
+                                 FROM validation_items WHERE set_id = ? ORDER BY position}, $set->{id})->hashes;
+        my %map;
+        for my $i (@$items) {
+            $map{ $i->{id} } = $db->query(q{INSERT INTO validation_items (set_id, position, candidate_id, pseudonym, doc_source, reference_date,
+                                              stratum, narrative, narrative_md5, snapshot, entries, injected, double_review)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?::jsonb, ?) RETURNING id},
+                                          $new_id, @$i{qw(position candidate_id pseudonym doc_source reference_date stratum narrative narrative_md5
+                                                          snapshot entries injected)}, $i->{double_review} ? 1 : 0)->hash->{id};
+            $n_items++;
+        }
+        if ($with_reviews && %map) {
+            my @old = keys %map;
+            for my $r (@{ $db->query('SELECT item_id, reviewer, entry_key, judgment::text AS judgment, phase FROM validation_reviews WHERE item_id = ANY(?)', \@old)->hashes }) {
+                $db->query('INSERT INTO validation_reviews (item_id, reviewer, entry_key, judgment, phase) VALUES (?, ?, ?, ?::jsonb, ?)',
+                           $map{ $r->{item_id} }, @$r{qw(reviewer entry_key judgment phase)});
+                $n_rev++;
+            }
+            for my $sg (@{ $db->query('SELECT item_id, ensemble_job, kind, entry_key, payload::text AS payload, confidence, created_at FROM validation_ai_suggestions WHERE item_id = ANY(?)', \@old)->hashes }) {
+                $db->query('INSERT INTO validation_ai_suggestions (item_id, ensemble_job, kind, entry_key, payload, confidence, created_at) VALUES (?, ?, ?, ?, ?::jsonb, ?, ?)',
+                           $map{ $sg->{item_id} }, @$sg{qw(ensemble_job kind entry_key payload confidence created_at)});
+            }
+            for my $a (@{ $db->query(q{SELECT item_id, model, prompt_version, judgments::text AS judgments, missing::text AS missing,
+                                              raw::text AS raw, usage::text AS usage, error, created_at
+                                       FROM validation_ai_reviews WHERE item_id = ANY(?)}, \@old)->hashes }) {
+                $db->query(q{INSERT INTO validation_ai_reviews (item_id, model, prompt_version, judgments, missing, raw, usage, error, created_at)
+                             VALUES (?, ?, ?, ?::jsonb, ?::jsonb, ?::jsonb, ?::jsonb, ?, ?)},
+                           $map{ $a->{item_id} }, @$a{qw(model prompt_version judgments missing raw usage error created_at)});
+                $n_ai++;
+            }
+        }
+        $tx->commit;
+        1;
+    };
+    return $c->render(json => { error => "Kopieren fehlgeschlagen: $@" }, status => 500) unless $ok;
+    $c->app->log->info("[VALIDATION] Datensatz \"$set->{name}\" kopiert nach \"$name\" ($n_items Briefe, $n_rev Bewertungen, $n_ai KI-Bewertungen).");
+    $c->render(json => { ok => 1, id => $new_id, name => $name, items => $n_items, reviews => $n_rev, ai_reviews => $n_ai });
+};
+
+# ---------------------------------------------------------
+# Zwei eingefrorene Referenzen vergleichen (z. B. Original und Kopie mit anderer Quelle)
+# ---------------------------------------------------------
+get '/BBB/validation/sets/:id/comparable' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $rows = $db->query(q{
+        SELECT s.id, s.name, s.frozen_at, s.frozen_by, s.reference_source, count(*) AS overlap
+        FROM validation_sets s
+        JOIN validation_items o ON o.set_id = s.id
+        JOIN validation_items m ON m.set_id = ? AND m.narrative_md5 = o.narrative_md5
+        WHERE s.id <> ? AND s.frozen_at IS NOT NULL
+        GROUP BY s.id ORDER BY s.name
+    }, $set->{id}, $set->{id})->hashes->to_array;
+    for my $r (@$rows) { $r->{reference} = _val_reference_info($r); $r->{overlap} += 0 }
+    $c->render(json => { set => { id => $set->{id}, name => $set->{name}, reference => _val_reference_info($set) }, sets => $rows });
+};
+
+get '/BBB/validation/sets/:id/compare_reference' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $sa  = _val_load_set($db, $c->param('id'))    or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $sb  = _val_load_set($db, $c->param('other')) or return $c->render(json => { error => 'Vergleichsdatensatz nicht gefunden.' }, status => 404);
+    return $c->render(json => { error => 'Beide Datensätze brauchen eine eingefrorene Referenz.' }, status => 409)
+        unless $sa->{frozen_at} && $sb->{frozen_at};
+    my %ib = map { $_->{narrative_md5} => $_ } @{ _val_load_items($db, $sb->{id}) };
+    my (@results, @letters, $only_a);
+    for my $ia (@{ _val_load_items($db, $sa->{id}) }) {
+        my $other = delete $ib{ $ia->{narrative_md5} };
+        unless ($other) { $only_a++; next }
+        my $ra  = $ia->{reference}    // { entries => [] };
+        my $rb  = $other->{reference} // { entries => [] };
+        my $res = _val_compare($c, $ra, $rb->{entries} // []);
+        push @results, $res;
+        my $n_diff = @{ $res->{fn} } + @{ $res->{fp} } + @{ $res->{partial} } + @{ $res->{attr_errors} };
+        push @letters, { position => $ia->{position}, pseudonym => $ia->{pseudonym}, agree => scalar @{ $res->{tp_keys} },
+                         n_diff => $n_diff, only_a => $res->{fn}, only_b => $res->{fp}, related => $res->{partial},
+                         attr => $res->{attr_errors} };
+    }
+    my $metrics = _val_metrics(\@results);
+    my $info_a  = _val_reference_info($sa);
+    my $info_b  = _val_reference_info($sb);
+
+    if (($c->param('format') // '') eq 'csv') {
+        my $cell = sub { my $v = shift // ''; $v =~ /[";\n]/ ? '"' . ($v =~ s/"/""/gr) . '"' : $v };
+        my @out = ('position;pseudonym;art;domain;code;label;side;date;detail');
+        for my $l (@letters) {
+            my @pre = ($l->{position}, $l->{pseudonym});
+            push @out, join(';',  map { $cell->($_) } @pre, "nur $info_a->{label}", @$_{qw(domain code label side date)}, '') for @{ $l->{only_a} };
+            push @out, join(';',  map { $cell->($_) } @pre, "nur $info_b->{label}", @$_{qw(domain code label side date)}, '') for @{ $l->{only_b} };
+            push @out, join(';',  map { $cell->($_) } @pre, 'verwandt', $_->{domain}, $_->{ref_code}, $_->{ref_label}, '', '',
+                                                     "$info_b->{label}: $_->{pred_code} $_->{pred_label}") for @{ $l->{related} };
+            for my $ae (@{ $l->{attr} }) {
+                my $d = join(', ', map { "$_: $info_a->{label} '$ae->{errors}{$_}{ref}', $info_b->{label} '$ae->{errors}{$_}{pred}'" } sort keys %{ $ae->{errors} });
+                push @out, join(';',  map { $cell->($_) } @pre, 'attribut', $ae->{domain}, $ae->{code}, $ae->{label}, '', '', $d);
+            }
+        }
+        (my $fa = $sa->{name}) =~ s/[^A-Za-z0-9_\-]+/_/g;
+        (my $fb = $sb->{name}) =~ s/[^A-Za-z0-9_\-]+/_/g;
+        $c->res->headers->content_type('text/csv; charset=utf-8');
+        $c->res->headers->content_disposition("attachment; filename=\"referenzvergleich_${fa}_${fb}.csv\"");
+        return $c->render(data => encode('UTF-8', join("\n", @out) . "\n"));
+    }
+    $c->render(json => { a => { id => $sa->{id} + 0, name => $sa->{name}, reference => $info_a },
+                         b => { id => $sb->{id} + 0, name => $sb->{name}, reference => $info_b },
+                         n_letters => scalar @letters, only_in_a => $only_a // 0, only_in_b => scalar keys %ib,
+                         metrics => $metrics, letters => [ sort { $b->{n_diff} <=> $a->{n_diff} || $a->{position} <=> $b->{position} } @letters ] });
 };
 
 post '/BBB/validation/sets/:id/lock' => sub {
@@ -11547,6 +11774,7 @@ del '/BBB/validation/sets/:id' => sub {
         $db->query('UPDATE validation_sets SET frozen_at = NULL WHERE id = ?', $set->{id});
         $db->query('DELETE FROM validation_reviews WHERE item_id IN (SELECT id FROM validation_items WHERE set_id = ?)', $set->{id});
         $db->query('DELETE FROM validation_ai_reviews WHERE item_id IN (SELECT id FROM validation_items WHERE set_id = ?)', $set->{id});
+        $db->query('DELETE FROM validation_ai_suggestions WHERE item_id IN (SELECT id FROM validation_items WHERE set_id = ?)', $set->{id});
         $db->query('DELETE FROM validation_items WHERE set_id = ?', $set->{id});
         $db->query('DELETE FROM validation_sets WHERE id = ?', $set->{id});
         $tx->commit;
@@ -11568,8 +11796,11 @@ get '/BBB/validation/sets/:id/export' => sub {
                            $set->{id})->expand->hashes->to_array;
     (my $fn = $set->{name}) =~ s/[^A-Za-z0-9_\-]+/_/g;
     $c->res->headers->content_disposition("attachment; filename=\"validierung_${fn}.json\"");
+    my $ai    = $db->query(q{SELECT a.item_id, a.model, a.prompt_version, a.judgments, a.missing, a.usage, a.error, a.created_at
+                             FROM validation_ai_reviews a JOIN validation_items i ON i.id = a.item_id WHERE i.set_id = ? ORDER BY a.id},
+                           $set->{id})->expand->hashes->to_array;
     $c->render(json => { format => 'ontotrial-validation-1', exported_at => POSIX::strftime('%Y-%m-%dT%H:%M:%S', localtime),
-                         set => $set, items => $items, reviews => $rev, runs => $runs });
+                         set => $set, items => $items, reviews => $rev, ai_reviews => $ai, runs => $runs });
 };
 
 # ---------------------------------------------------------
@@ -11583,12 +11814,12 @@ get '/BBB/validation/sets/:id/items' => sub {
     my $rows = $db->query(q{
         SELECT i.id, i.position, i.candidate_id, i.pseudonym, i.doc_source, i.reference_date, i.stratum, i.double_review,
                jsonb_array_length(i.entries) AS n_entries,
-               EXISTS (SELECT 1 FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.entry_key = '_done'
+               EXISTS (SELECT 1 FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.phase = 'final' AND r.entry_key = '_done'
                        AND (r.judgment->>'done')::boolean) AS my_done,
-               EXISTS (SELECT 1 FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.entry_key = '_checklist'
+               EXISTS (SELECT 1 FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.phase = 'final' AND r.entry_key = '_checklist'
                        AND (r.judgment->>'done')::boolean) AS my_checklist,
-               (SELECT count(*) FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.entry_key NOT LIKE '\_%' AND r.entry_key NOT LIKE 'missing:%') AS my_judged,
-               (SELECT count(DISTINCT r.reviewer) FROM validation_reviews r WHERE r.item_id = i.id AND r.entry_key = '_done'
+               (SELECT count(*) FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.phase = 'final' AND r.entry_key NOT LIKE '\_%' AND r.entry_key NOT LIKE 'missing:%') AS my_judged,
+               (SELECT count(DISTINCT r.reviewer) FROM validation_reviews r WHERE r.item_id = i.id AND r.phase = 'final' AND r.entry_key = '_done'
                 AND (r.judgment->>'done')::boolean) AS n_done
         FROM validation_items i WHERE i.set_id = ? ORDER BY i.position
     }, $me, $me, $me, $set->{id})->hashes->to_array;
@@ -11603,7 +11834,8 @@ get '/BBB/validation/items/:id' => sub {
         or return $c->render(json => { error => 'Brief nicht gefunden.' }, status => 404);
     $item->{entries} = _val_json($item->{entries});
     my $set = _val_load_set($db, $item->{set_id});
-    my $rows = $db->query('SELECT reviewer, entry_key, judgment::text AS judgment FROM validation_reviews WHERE item_id = ?', $item->{id})->hashes;
+    my $rows = $db->query(q{SELECT reviewer, entry_key, judgment::text AS judgment FROM validation_reviews WHERE item_id = ? AND phase = 'final'}, $item->{id})->hashes;
+    my $has_pre = $db->query(q{SELECT 1 FROM validation_reviews WHERE item_id = ? AND reviewer = ? AND phase = 'pre' LIMIT 1}, $item->{id}, $me)->array ? 1 : 0;
     my (%mine, %others);
     for my $r (@$rows) {
         my $j = _val_json($r->{judgment});
@@ -11611,13 +11843,25 @@ get '/BBB/validation/items/:id' => sub {
         else { $others{ $r->{reviewer} }{ $r->{entry_key} } = $j }
     }
     my $blind = $set->{purpose} eq 'study' && $me ne $VAL_CONSENSUS && !($mine{_checklist} && $mine{_checklist}{done});
+    $blind = 1 if ($set->{status} // '') eq 'preparing';
     my %out = (
         id => $item->{id}, set_id => $item->{set_id}, position => $item->{position}, pseudonym => $item->{pseudonym},
         doc_source => $item->{doc_source}, reference_date => $item->{reference_date}, double_review => $item->{double_review} ? 1 : 0,
-        purpose => $set->{purpose}, frozen => $set->{frozen_at} ? 1 : 0,
+        purpose => $set->{purpose}, frozen => $set->{frozen_at} ? 1 : 0, preparing => ($set->{status} // '') eq 'preparing' ? 1 : 0,
         narrative => $item->{narrative}, blind => $blind ? 1 : 0,
         entries => $blind ? [] : $item->{entries}, judgments => \%mine,
     );
+    # KI-Hinweise des Ensembles: bei Regressions-Datensätzen sofort, bei Studien erst nach dem
+    # eigenen Abschluss (Zweitblick), damit die Erstbewertung unbeeinflusst bleibt
+    my $sugg = $db->query(q{SELECT id, kind, entry_key, payload, confidence FROM validation_ai_suggestions WHERE item_id = ? ORDER BY kind, confidence DESC, id},
+                          $item->{id})->expand->hashes->to_array;
+    my $my_done = ($mine{_done} && $mine{_done}{done}) ? 1 : 0;
+    my $assist_visible = @$sugg && ($set->{purpose} ne 'study' || $my_done || $has_pre) ? 1 : 0;
+    my $ens = _val_ensemble_view($db, $item);
+    my $have = @$sugg || %{ $ens->{entries} };
+    $assist_visible = $have && ($set->{purpose} ne 'study' || $my_done || $has_pre) ? 1 : 0;
+    $out{assist} = $assist_visible ? { visible => 1, suggestions => [ grep { $_->{kind} eq 'missing' } @$sugg ], entries => $ens->{entries}, models => $ens->{models} }
+                 : { visible => 0, waiting => ($have && $set->{purpose} eq 'study') ? 1 : 0 };
     # Konsens sieht die Urteile aller Prüfer, normale Prüfer nur die eigenen
     $out{others} = \%others if $me eq $VAL_CONSENSUS;
     $c->render(json => \%out);
@@ -11632,20 +11876,30 @@ post '/BBB/validation/items/:id/review' => sub {
     return $c->render(json => { error => 'Prüfername fehlt.' }, status => 400) unless length $me;
     my $item = $db->query('SELECT id, set_id, entries FROM validation_items WHERE id = ?', $c->param('id'))->hash
         or return $c->render(json => { error => 'Brief nicht gefunden.' }, status => 404);
+    return if _val_preparing($c, _val_load_set($db, $item->{set_id}));
     my %valid = map { $_->{key} => 1 } @{ _val_json($item->{entries}) // [] };
     my @list = ref $p->{reviews} eq 'ARRAY' ? @{ $p->{reviews} } : ({ entry_key => $p->{entry_key}, judgment => $p->{judgment} });
     for my $r (@list) {
         my $k = $r->{entry_key} // '';
         return $c->render(json => { error => "Unbekannter Eintrag: $k" }, status => 400)
-            unless $valid{$k} || $k =~ /^missing:[A-Za-z0-9\-]{1,64}$/ || $k eq '_checklist' || $k eq '_done';
+            unless $valid{$k} || $k =~ /^missing:[A-Za-z0-9\-]{1,64}$/ || $k =~ /^ai:\d+$/ || $k eq '_checklist' || $k eq '_done';
         return $c->render(json => { error => 'Bewertung fehlt.' }, status => 400) unless ref $r->{judgment} eq 'HASH';
     }
     my $ok = eval {
         my $tx = $db->begin;
         for my $r (@list) {
             $db->query(q{INSERT INTO validation_reviews (item_id, reviewer, entry_key, judgment) VALUES (?, ?, ?, ?::jsonb)
-                         ON CONFLICT (item_id, reviewer, entry_key) DO UPDATE SET judgment = EXCLUDED.judgment, updated_at = now()},
+                         ON CONFLICT (item_id, reviewer, entry_key, phase) DO UPDATE SET judgment = EXCLUDED.judgment, updated_at = now()},
                        $item->{id}, $me, $r->{entry_key}, to_json($r->{judgment}));
+        }
+        # Studie: beim ersten Abschluss den Stand vor dem Zweitblick sichern
+        my ($done) = grep { $_->{entry_key} eq '_done' && to_bool($_->{judgment}{done}) } @list;
+        my $purpose = $db->query('SELECT purpose FROM validation_sets WHERE id = ?', $item->{set_id})->hash->{purpose};
+        if ($done && $purpose eq 'study'
+            && !$db->query(q{SELECT 1 FROM validation_reviews WHERE item_id = ? AND reviewer = ? AND phase = 'pre' LIMIT 1}, $item->{id}, $me)->array) {
+            $db->query(q{INSERT INTO validation_reviews (item_id, reviewer, entry_key, judgment, phase)
+                         SELECT item_id, reviewer, entry_key, judgment, 'pre' FROM validation_reviews
+                         WHERE item_id = ? AND reviewer = ? AND phase = 'final'}, $item->{id}, $me);
         }
         $tx->commit;
         1;
@@ -11680,12 +11934,23 @@ post '/BBB/validation/sets/:id/freeze' => sub {
     my $p   = $c->req->json // {};
     my $db  = $c->pg->db;
     my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    return if _val_preparing($c, $set);
     return $c->render(json => { error => 'Referenz ist bereits eingefroren.' }, status => 409) if $set->{frozen_at};
     return $c->render(json => { error => 'Zum Einfrieren den Namen des Datensatzes eingeben.' }, status => 400)
         unless _val_confirm_ok($set, $p->{confirm});
     my $items = _val_load_items($db, $set->{id});
     my $revs  = _val_reviews_by_item($db, $set->{id});
-    my $judge = ($p->{source} // '') eq 'judge';
+    my $judge = 0;   # eine KI-Judge-Referenz gibt es nicht mehr; Quellen: Ärzte oder Pipeline-Lauf
+    my $fromrun = ($p->{source} // '') eq 'run';
+    my ($run_pp, $run_model) = ({}, undef);
+    if ($fromrun) {
+        my $run = $db->query(q{SELECT id, mode, status, fingerprint FROM validation_runs WHERE id = ? AND set_id = ?}, $p->{run_id} // 0, $set->{id})->expand->hash;
+        return $c->render(json => { error => 'Lauf nicht gefunden.' }, status => 404) unless $run;
+        return $c->render(json => { error => 'Nur abgeschlossene Läufe mit Neu-Extraktion eignen sich als Referenz.' }, status => 400)
+            unless $run->{status} eq 'finished' && $run->{mode} eq 'reextract';
+        $run_model = ($run->{fingerprint} // {})->{model} // 'unbekannt';
+        $run_pp = { map { $_->{item_id} => $_->{phenopacket} } @{ $db->query('SELECT item_id, phenopacket FROM validation_run_items WHERE run_id = ? AND phenopacket IS NOT NULL', $run->{id})->expand->hashes } };
+    }
     my $ai    = {};
     if ($judge) {
         my $all = _val_ai_rows($db, $set->{id});
@@ -11697,13 +11962,21 @@ post '/BBB/validation/sets/:id/freeze' => sub {
     }
     my (@open, %refs, $source);
     for my $i (@$items) {
+        if ($fromrun) {
+            my $pp = $run_pp->{ $i->{id} };
+            unless ($pp) { push @open, { position => $i->{position}, status => 'run_missing' }; next; }
+            $refs{ $i->{id} } = { entries => [ map { { %$_, src => 'pipeline' } } @{ _val_entries($pp) } ], tolerated => [],
+                                  source => "Pipeline $run_model (Lauf $p->{run_id})", reviewers => [] };
+            $source = "pipeline:$run_model";
+            next;
+        }
         my $res = $judge ? (_val_ai_resolution($ai->{ $i->{id} }) // { status => 'judge_missing' })
                          : _val_resolve($i, $revs->{ $i->{id} } // []);
         if ($res->{status} ne 'ok') { push @open, { position => $i->{position}, status => $res->{status} }; next; }
         $refs{ $i->{id} } = _val_build_reference($i, $res);
         $source = $judge ? 'judge:' . $ai->{ $i->{id} }{model} : 'human';
     }
-    return $c->render(json => { error => scalar(@open) . ($judge ? ' Briefe haben noch keine fehlerfreie KI-Bewertung.'
+    return $c->render(json => { error => scalar(@open) . ($fromrun ? ' Briefe haben in diesem Lauf keine Extraktion.' : $judge ? ' Briefe haben noch keine fehlerfreie KI-Bewertung.'
                                                                  : ' Briefe sind noch nicht abschließend bewertet oder haben Abweichungen.'), open => \@open },
                       status => 409) if @open;
     my $tx = $db->begin;
@@ -11736,7 +12009,8 @@ post '/BBB/validation/sets/:id/runs' => sub {
     my $p   = $c->req->json // {};
     my $db  = $c->pg->db;
     my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
-    return $c->render(json => { error => 'Erst die Referenz einfrieren.' }, status => 409) unless $set->{frozen_at};
+    return if _val_preparing($c, $set);
+    # ohne eingefrorene Referenz: Lauf speichert nur die Extraktionen (z. B. als künftige Pipeline-Referenz)
     return $c->render(json => { error => 'Für diesen Datensatz läuft bereits ein Lauf.' }, status => 409)
         if $db->query(q{SELECT 1 FROM validation_runs WHERE set_id = ? AND status IN ('queued', 'running')}, $set->{id})->array;
     my $mode = ($p->{mode} // '') eq 'stored' ? 'stored' : 'reextract';
@@ -11744,9 +12018,10 @@ post '/BBB/validation/sets/:id/runs' => sub {
     my $model  = $mode eq 'reextract' && defined $p->{model} && length $p->{model} ? $p->{model} : undef;
     my $fp     = _val_fingerprint($c->app, $model);
     $fp->{mode} = $mode;
+    $fp->{reference} = _val_reference_info($set);
     my $run_id = $db->insert('validation_runs', { set_id => $set->{id}, mode => $mode, label => $p->{label} // '',
                                                   fingerprint => to_json($fp) }, { returning => 'id' })->hash->{id};
-    $c->minion->enqueue(validation_run_task => [{ run_id => $run_id, model => $model }], { attempts => 1 });
+    $c->minion->enqueue(validation_run_task => [{ run_id => $run_id, model => $model }], { attempts => 1, queue => 'validation', priority => -5 });
     $c->render(json => { ok => 1, run_id => $run_id, mode => $mode, model => $fp->{model} });
 };
 
@@ -11831,6 +12106,67 @@ sub _val_regression_compare {
              verdict => @worse ? 'regression' : 'ok', changes => \@changes };
 }
 
+# Neu-Extraktion eines frisch gezogenen Datensatzes mit der aktuellen Pipeline
+app->minion->add_task(validation_prepare_task => sub {
+    my ($job, $payload) = @_;
+    my $app   = $job->app;
+    my $db    = $app->pg->db;
+    my $set   = _val_load_set($db, $payload->{set_id}) or return $job->fail('Datensatz fehlt');
+    my $items = $db->query(q{SELECT id, candidate_id, position, narrative, reference_date, snapshot::text <> '{}' AS done
+                             FROM validation_items WHERE set_id = ? ORDER BY position}, $set->{id})->hashes->to_array;
+    my $task  = "validation_prepare_$set->{id}";
+    my ($k, $n, $ok, $failed, $n_inject) = (0, scalar @$items, 0, 0, 0);
+    my @failed_pos;
+    my $prev = (($set->{params} // {})->{extraction} // {});
+    my @failed_pos_prev = @{ $prev->{removed_positions} // [] };
+    for my $i (@$items) {
+        $k++;
+        if ($i->{done}) {                   # schon in einem früheren, abgebrochenen Lauf extrahiert
+            $ok++;
+            $job->note(progress => int(100 * $k / ($n || 1)), done => $ok, failed => $failed, current => $k, total => $n);
+            next;
+        }
+        $job->note(current => $k, total => $n, current_since => time);
+        my ($pp, $err);
+        for my $try (1 .. 2) {
+            ($pp, $err) = (undef, undef);
+            $app->generate_phenopacket_impl($i->{narrative}, $payload->{model}, undef, $i->{reference_date}, 0, undef)
+                ->then(sub { $pp = shift })->catch(sub { $err = shift })->wait;
+            last if ref $pp eq 'HASH';
+            $app->log->warn("[VALIDATION] Vorbereitung Brief $i->{position}, Versuch $try: " . ($err // 'kein Phenopacket'));
+        }
+        if (ref $pp eq 'HASH') {
+            my ($entries, $inj) = _val_inject($payload->{seed}, $i->{candidate_id}, _val_entries($pp), $payload->{inject} // 0);
+            $n_inject++ if @$inj;
+            $db->query('UPDATE validation_items SET snapshot = ?::jsonb, entries = ?::jsonb, injected = ?::jsonb WHERE id = ?',
+                       to_json($pp), to_json($entries), @$inj ? to_json($inj) : undef, $i->{id});
+            $ok++;
+        } else {
+            # nicht extrahierbare Briefe aus dem Datensatz entfernen
+            $db->query('DELETE FROM validation_items WHERE id = ?', $i->{id});
+            push @failed_pos, $i->{position};
+            $failed++;
+        }
+        my $pct = int(100 * $k / ($n || 1));
+        $job->note(progress => $pct, done => $ok, failed => $failed);
+        $app->notify_task_progress($task, 'running', $pct, "Brief $k von $n extrahiert");
+    }
+    my $params = _val_load_set($db, $set->{id})->{params} // {};
+    $params->{extraction} = { %{ $params->{extraction} // {} }, mode => 'reextract',
+                              fingerprint => _val_fingerprint($app, $payload->{model}),
+                              finished_at => POSIX::strftime('%Y-%m-%dT%H:%M:%S', localtime),
+                              n_ok => $ok, n_failed => $failed + @failed_pos_prev, removed_positions => [ @failed_pos_prev, @failed_pos ],
+                              injected => $n_inject };
+    $db->query(q{UPDATE validation_sets SET status = 'ready', params = ?::jsonb WHERE id = ?}, to_json($params), $set->{id});
+    $app->notify_task_progress($task, 'finished', 100, 'Datensatz vorbereitet');
+    if ($payload->{ensemble} and my @models = _val_ensemble_models()) {
+        $app->minion->enqueue(validation_ensemble_task => [{ set_id => $set->{id}, provider => 'ensemble', models => \@models,
+                                                            min_votes => @models >= 2 ? 2 : 1 }], { attempts => 1, queue => 'validation', priority => -5 });
+    }
+    $app->log->info("[VALIDATION] Datensatz \"$set->{name}\" vorbereitet: $ok Briefe extrahiert, $failed entfernt.");
+    $job->finish({ ok => $ok, failed => $failed });
+});
+
 app->minion->add_task(validation_run_task => sub {
     my ($job, $payload) = @_;
     my $app    = $job->app;
@@ -11853,10 +12189,10 @@ app->minion->add_task(validation_run_task => sub {
             elsif (md5_hex(encode('UTF-8', $row->{narrative_report} // '')) ne $i->{narrative_md5}) { $err = 'Brieftext im Bestand wurde geändert' }
             else { $pp = _ppd_parse_json($row->{pp}) or $err = 'Phenopacket nicht lesbar' }
         } else {
-            $app->generate_phenopacket_impl($i->{narrative}, $payload->{model}, undef, $i->{reference_date}, 0, $task)
+            $app->generate_phenopacket_impl($i->{narrative}, $payload->{model}, undef, $i->{reference_date}, 0, undef)
                 ->then(sub { $pp = shift })->catch(sub { $err = 'Pipeline-Fehler: ' . shift })->wait;
         }
-        my $result = $pp && !$err ? _val_compare($app, $i->{reference} // { entries => [] }, _val_entries($pp)) : undef;
+        my $result = $pp && !$err && $set->{frozen_at} ? _val_compare($app, $i->{reference} // { entries => [] }, _val_entries($pp)) : undef;
         $db->query(q{INSERT INTO validation_run_items (run_id, item_id, phenopacket, result, error) VALUES (?, ?, ?::jsonb, ?::jsonb, ?)
                      ON CONFLICT (run_id, item_id) DO UPDATE SET phenopacket = EXCLUDED.phenopacket, result = EXCLUDED.result, error = EXCLUDED.error},
                    $run_id, $i->{id}, $pp ? to_json($pp) : undef, $result ? to_json($result) : undef, $err);
@@ -11865,17 +12201,23 @@ app->minion->add_task(validation_run_task => sub {
         $app->notify_task_progress($task, 'running', $pct, "Validierung: Brief $k von $n");
     }
 
-    my $rows    = $db->query('SELECT ri.item_id, i.position, ri.result FROM validation_run_items ri JOIN validation_items i ON i.id = ri.item_id WHERE ri.run_id = ? ORDER BY i.position', $run_id)->expand->hashes->to_array;
+    my $rows    = $db->query('SELECT ri.item_id, i.position, ri.result, ri.phenopacket IS NOT NULL AS has_pp FROM validation_run_items ri JOIN validation_items i ON i.id = ri.item_id WHERE ri.run_id = ? ORDER BY i.position', $run_id)->expand->hashes->to_array;
     my @results = map { $_->{result} } grep { $_->{result} } @$rows;
-    my $metrics = _val_metrics(\@results);
+    my $metrics = $set->{frozen_at} ? _val_metrics(\@results) : { without_reference => 1 };
     $metrics->{n_items}  = $n;
-    $metrics->{n_failed} = $n - scalar @results;
+    $metrics->{n_failed} = $n - scalar(grep { $_->{has_pp} } @$rows);
     my $cmp;
-    if (my $base_id = $set->{baseline_run_id}) {
-        my $base = $db->query('SELECT metrics FROM validation_runs WHERE id = ?', $base_id)->expand->hash;
+    if ($set->{frozen_at} and my $base_id = $set->{baseline_run_id}) {
+        my $base = $db->query('SELECT metrics, fingerprint FROM validation_runs WHERE id = ?', $base_id)->expand->hash;
         my $bi   = $db->query('SELECT item_id, result FROM validation_run_items WHERE run_id = ?', $base_id)->expand->hashes->to_array;
         $cmp = _val_regression_compare($metrics, $base->{metrics} // {}, $rows, $bi) if $base;
-        $cmp->{baseline_run_id} = $base_id + 0 if $cmp;
+        if ($cmp) {
+            $cmp->{baseline_run_id} = $base_id + 0;
+            my $fp_now  = ref $run->{fingerprint} ? $run->{fingerprint} : (_val_json($run->{fingerprint}) // {});
+            my $ref_now = ($fp_now->{reference} // {})->{id} // '';
+            my $ref_was = ((($base->{fingerprint} // {})->{reference}) // {})->{id} // '';
+            $cmp->{reference_mismatch} = 1 if $ref_now ne $ref_was;
+        }
     }
     $db->update('validation_runs', { status => 'finished', progress => 100, metrics => to_json($metrics),
                                      comparison => $cmp ? to_json($cmp) : undef, finished_at => \'now()' }, { id => $run_id });
@@ -11950,7 +12292,9 @@ get '/BBB/validation/sets/:id/study' => sub {
     my $db  = $c->pg->db;
     my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
     my $items = _val_load_items($db, $set->{id});
-    my $revs  = _val_reviews_by_item($db, $set->{id});
+    # Hauptergebnis: Bewertungen vor dem Zweitblick (bei Regressions-Datensätzen identisch mit dem Endstand)
+    my $revs  = _val_reviews_by_item($db, $set->{id}, 'unassisted');
+    my $revs_final = _val_reviews_by_item($db, $set->{id}, 'final');
 
     my (@per_item, %kappa_pairs, %vig, $skipped);
     for my $i (@$items) {
@@ -12047,6 +12391,27 @@ get '/BBB/validation/sets/:id/study' => sub {
     }
     my %kappa = map { $_ => _val_kappa($kappa_pairs{$_}) } keys %kappa_pairs;
     my %vigil = map { $_ => { %{ $vig{$_} }, rate => _val_ratio($vig{$_}{detected} // 0, $vig{$_}{n}) } } keys %vig;
+    # Stand nach dem Zweitblick (Punktschätzer) und Nutzung der KI-Hinweise
+    my @per_item_final;
+    for my $i (@$items) {
+        my $res = _val_resolve($i, $revs_final->{ $i->{id} } // []);
+        push @per_item_final, _val_study_counts($i, $res) if $res->{status} eq 'ok';
+    }
+    my $assisted = $agg->(\@per_item_final);
+    my %assist = (shown => 0, accepted => 0, rejected => 0, accepted_missing => 0, accepted_flag => 0);
+    my %skind = map { $_->{id} => $_->{kind} } @{ $db->query(q{SELECT s.id, s.kind FROM validation_ai_suggestions s JOIN validation_items i ON i.id = s.item_id
+                                                                 WHERE i.set_id = ?}, $set->{id})->hashes };
+    $assist{suggestions} = scalar keys %skind;
+    for my $rows (values %$revs_final) {
+        for my $r (@$rows) {
+            next unless $r->{entry_key} =~ /^ai:(\d+)$/;
+            my $kind = $skind{$1} // '';
+            my $d = (_val_json($r->{judgment}) // {})->{decision} // '';
+            $assist{shown}++;
+            if ($d eq 'accepted') { $assist{accepted}++; $assist{"accepted_$kind"}++ if $kind }
+            elsif ($d eq 'rejected') { $assist{rejected}++ }
+        }
+    }
     my $ai = _val_ai_rows($db, $set->{id});
     my %judges = map { $_ => _val_judge_agreement($items, $revs, $ai->{$_}) } keys %$ai;
     my @jm = sort keys %$ai;
@@ -12067,7 +12432,8 @@ get '/BBB/validation/sets/:id/study' => sub {
                                   reference_source => $set->{reference_source} },
                          n_items => scalar @$items, n_evaluated => scalar @per_item, n_skipped => $skipped // 0,
                          metrics => $point, kappa => \%kappa, vigilance => \%vigil, bootstrap => $B,
-                         judges => \%judges, judges_between => $between });
+                         judges => \%judges, judges_between => $between,
+                         assisted => $assisted, assist => \%assist });
 };
 
 get '/BBB/validation/sets/:id/judgments.csv' => sub {
@@ -12075,17 +12441,18 @@ get '/BBB/validation/sets/:id/judgments.csv' => sub {
     my $db  = $c->pg->db;
     my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
     my $items = _val_load_items($db, $set->{id});
-    my $revs  = _val_reviews_by_item($db, $set->{id});
+    my $revs  = _val_reviews_by_item($db, $set->{id}, 'all');
     my $cell  = sub { my $v = shift // ''; $v =~ /[";\n]/ ? '"' . ($v =~ s/"/""/gr) . '"' : $v };
     my @cols  = qw(verdict concept status side side_correct date date_correct value value_correct comment);
-    my @out   = (join(';', qw(set position item_id pseudonym stratum double_review reviewer row_type entry_key domain code label
+    my @out   = (join(';', qw(set position item_id pseudonym stratum double_review reviewer phase row_type entry_key domain code label
                               side date excluded value injected), @cols, 'checklist_cat', 'checklist_match'));
     for my $i (@$items) {
         my %e   = map { $_->{key} => $_ } @{ $i->{entries} };
         my %inj = map { $_->{key} => $_->{type} } @{ $i->{injected} // [] };
         for my $r (sort { $a->{reviewer} cmp $b->{reviewer} || $a->{entry_key} cmp $b->{entry_key} } @{ $revs->{ $i->{id} } // [] }) {
             my $j    = _val_json($r->{judgment}) // {};
-            my @base = ($set->{name}, $i->{position}, $i->{id}, $i->{pseudonym}, $i->{stratum}, $i->{double_review} ? 1 : 0, $r->{reviewer});
+            my @base = ($set->{name}, $i->{position}, $i->{id}, $i->{pseudonym}, $i->{stratum}, $i->{double_review} ? 1 : 0, $r->{reviewer},
+                        $r->{phase} eq 'pre' ? 'vor_zweitblick' : 'final');
             if ($r->{entry_key} eq '_checklist') {
                 for my $l (@{ $j->{lines} // [] }) {
                     push @out, join(';', map { $cell->($_) } @base, 'checkliste', '', '', '', $l->{text}, $l->{side}, $l->{date}, '', $l->{value},
@@ -12094,6 +12461,10 @@ get '/BBB/validation/sets/:id/judgments.csv' => sub {
                 next;
             }
             next if $r->{entry_key} eq '_done';
+            if ($r->{entry_key} =~ /^ai:(\d+)$/) {
+                push @out, join(';', map { $cell->($_) } @base, 'ki_entscheidung', $r->{entry_key}, ('') x 7, '', ('') x @cols, '', $j->{decision} // '');
+                next;
+            }
             my $x    = $r->{entry_key} =~ /^missing:/ ? $j : ($e{ $r->{entry_key} } // {});
             my $type = $r->{entry_key} =~ /^missing:/ ? ($j->{deleted} ? 'ergaenzt_geloescht' : 'ergaenzt') : 'eintrag';
             push @out, join(';', map { $cell->($_) } @base, $type, $r->{entry_key}, @$x{qw(domain code label side date)}, $x->{excluded} ? 1 : 0,
@@ -12109,43 +12480,21 @@ get '/BBB/validation/sets/:id/judgments.csv' => sub {
 
 
 # ---------------------------------------------------------
-# KI-Judge: automatische Bewertung durch ein Claude-Modell
+# Bewertungsmodelle des KI-Ensembles (nur lokale Modelle, Briefe bleiben im Haus)
 # ---------------------------------------------------------
-# Der Judge bewertet jeden extrahierten Eintrag nach denselben Regeln wie die
-# Ärzte (Bewertungshandbuch) und nennt fehlende Einträge. Seine Urteile liegen
-# getrennt von den ärztlichen Bewertungen in validation_ai_reviews und dienen
-#   - als KI-Referenz, solange (noch) keine ärztliche Referenz existiert,
-#   - als zusätzlicher Bewerter, der in der Studie gegen die Ärzte gemessen wird.
+# Jedes Ensemble-Modell bewertet jeden extrahierten Eintrag nach den Regeln des
+# Bewertungshandbuchs, mit wörtlichem Beleg aus dem Brief, und nennt fehlende
+# Einträge. Die Urteile liegen je Modell in validation_ai_reviews.
 #
-# Zwei Anbieter, einzeln oder beide (dann werden sie auch gegeneinander verglichen):
-#   anthropic  Claude über die externe API (Briefe verlassen die Klinik)
-#   local      eigenes Modell, z. B. GLM-5, über eine OpenAI-kompatible API (vLLM)
-#              oder Ollama; die Briefe bleiben im Haus
-#
-# Konfiguration (Environment), Claude:
-#   ANTHROPIC_API_KEY              API-Schlüssel (ohne ihn ist der Claude-Judge aus)
-#   ONTOTRIAL_JUDGE_MODEL          Default claude-opus-5-5
-#   ONTOTRIAL_JUDGE_URL            Default https://api.anthropic.com/v1/messages
-#   ONTOTRIAL_JUDGE_MAX_TOKENS     Default 16000
-#   ONTOTRIAL_JUDGE_TEMPERATURE    leer = Modell-Default
-#   ONTOTRIAL_JUDGE_PII_GUARD      1 (Default) = Briefe mit Geburtsdatum oder
-#                                  Name mit Anrede werden nicht gesendet
-#   ONTOTRIAL_JUDGE_PII_REGEX      zusätzliche eigene Sperr-Regel
-# Lokale Judges (Auswahl im Validierungsfenster):
-#   ONTOTRIAL_JUDGE_LOCAL_MODELS   kommagetrennte Liste, z. B. "gpt-oss-120b,glm-5";
-#                                  ohne sie: ONTOTRIAL_JUDGE_LOCAL_MODEL und das Pipeline-Modell (VLLM_MODEL)
+# Konfiguration (Environment):
+#   ONTOTRIAL_JUDGE_LOCAL_MODELS   kommagetrennte Liste, z. B. "gpt-oss-120b,glm-52";
+#                                  ohne sie: das Pipeline-Modell (VLLM_MODEL)
 #   ONTOTRIAL_JUDGE_URL_<MODELL>   eigener Endpunkt je Modell, Name in Großbuchstaben, Sonderzeichen als _
-#   ONTOTRIAL_JUDGE_KEY_<MODELL>   eigener API-Schlüssel je Modell (z. B. ONTOTRIAL_JUDGE_KEY_GLM_5)
-#                                  ohne beides: Endpunkt und Schlüssel der Pipeline (VLLM_ENDPOINT, VLLM_API_KEY)
-#   ONTOTRIAL_JUDGE_LOCAL_MODEL    älteres Einzelmodell; ONTOTRIAL_JUDGE_LOCAL_URL und
-#   ONTOTRIAL_JUDGE_LOCAL_URL      ONTOTRIAL_JUDGE_LOCAL_KEY gelten nur für dieses Modell
-#   ONTOTRIAL_JUDGE_LOCAL_KEY
-#   ONTOTRIAL_JUDGE_REASONING_EFFORT  Default medium (für gpt-oss; andere Modelle ignorieren es);
-#                                  bei abgeschnittener Antwort wird einmal mit low wiederholt
-#   ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS  Default 32000 (Platz für den Denkprozess)
-#   ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE Default: Modell-Standard (0 führt bei gpt-oss leicht zu Schleifen)
+#   ONTOTRIAL_JUDGE_KEY_<MODELL>   eigener API-Schlüssel je Modell; ohne beides: Pipeline (VLLM_ENDPOINT, VLLM_API_KEY)
+#   ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS  Default 32000
+#   ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE Default: Modell-Standard
+#   ONTOTRIAL_JUDGE_REASONING_EFFORT  Default medium; bei abgeschnittener Antwort einmal low
 #   ONTOTRIAL_JUDGE_LOCAL_THINKING    0 = Denkmodus über chat_template_kwargs abschalten
-#   ONTOTRIAL_JUDGE_LOCAL_PII_GUARD   Default 0 (Briefe bleiben im Haus)
 # ---------------------------------------------------------
 
 our $VAL_JUDGE_SYSTEM = <<'TXT';
@@ -12187,10 +12536,13 @@ augenrelevante Befunde, Augenoperationen und -eingriffe, Augenmedikation, Visus,
 (höchstens 30). Gib einen Code nur an, wenn du ihn sicher kennst (ICD-10-GM, OPS, ATC, LOINC, HPO), sonst einen leeren Code.
 Verneinte Befunde nur, wenn sie klinisch relevant sind.
 
+Gib für jeden Eintrag das wörtliche Zitat aus dem Brief an, auf dem er beruht (Zeichen für Zeichen aus dem Brief, kurz, nur die
+entscheidende Stelle); bei absent ein leeres Zitat.
+
 Begründe jedes Urteil in höchstens einem kurzen Satz.
 TXT
 
-our $VAL_JUDGE_PROMPT_VERSION = substr(md5_hex(encode('UTF-8', $VAL_JUDGE_SYSTEM)), 0, 10);
+our $VAL_JUDGE_USER_TEMPLATE = "Briefdatum: {{reference_date}}\n\n<brief>\n{{letter}}\n</brief>\n\nExtrahierte Einträge ({{n_entries}}):\n{{entries}}\n\nBewerte jeden Eintrag (id = E-Nummer) und nenne fehlende Einträge.";
 
 sub _val_judge_schema {
     my $enum = sub { { type => 'string', enum => [@_] } };
@@ -12210,9 +12562,10 @@ sub _val_judge_schema {
                     date_correct  => { type => 'string' },
                     value         => $enum->(qw(ok wrong na)),
                     value_correct => { type => 'string' },
+                    quote         => { type => 'string' },
                     reason        => { type => 'string' },
                 },
-                required => [qw(id concept status side side_correct date date_correct value value_correct reason)],
+                required => [qw(id concept status side side_correct date date_correct value value_correct quote reason)],
                 additionalProperties => \0,
             } },
             missing => { type => 'array', items => {
@@ -12237,8 +12590,19 @@ sub _val_judge_schema {
     };
 }
 
+# Judge-Prompt: llm_prompts 'validation_judge' (system_prompt, user_template mit
+# {{reference_date}}, {{letter}}, {{n_entries}}, {{entries}}); eingebauter Text nur als Rückfall
+sub _val_judge_prompt {
+    my ($app) = @_;
+    my $rec = eval { $app->get_llm_prompt('validation_judge') };
+    my $sys = ($rec && length($rec->{system_prompt} // '')) ? $rec->{system_prompt} : $VAL_JUDGE_SYSTEM;
+    my $tpl = ($rec && length($rec->{user_template} // '')) ? $rec->{user_template} : $VAL_JUDGE_USER_TEMPLATE;
+    app->log->warn('[JUDGE] Prompt validation_judge nicht in llm_prompts, eingebauter Text wird verwendet') unless $rec;
+    return ($sys, $tpl, substr(md5_hex(encode('UTF-8', "$sys\x{1}$tpl")), 0, 10));
+}
+
 sub _val_judge_user_message {
-    my ($item) = @_;
+    my ($item, $tpl) = @_;
     my %dom  = (disease => 'Diagnose', phenotype => 'Befund', procedure => 'Eingriff', treatment => 'Medikation', measurement => 'Messwert');
     my %side = (R => 'RA', L => 'LA', B => 'beidseits', '' => 'keine');
     my @lines;
@@ -12251,23 +12615,12 @@ sub _val_judge_user_message {
                              $e->{label} // '', $side{ $e->{side} // '' } // $e->{side}, length($e->{date} // '') ? $e->{date} : 'keins',
                              $e->{excluded} ? 'verneint' : 'vorhanden', $val);
     }
-    return "Briefdatum: " . ($item->{reference_date} // 'unbekannt') . "\n\n<brief>\n" . ($item->{narrative} // '') . "\n</brief>\n\n" .
-           "Extrahierte Einträge (" . scalar(@lines) . "):\n" . (@lines ? join("\n", @lines) : '(keine)') . "\n\n" .
-           "Bewerte jeden Eintrag (id = E-Nummer) und nenne fehlende Einträge.";
+    my %v = (reference_date => $item->{reference_date} // 'unbekannt', letter => $item->{narrative} // '',
+             n_entries => scalar(@lines), entries => @lines ? join("\n", @lines) : '(keine)');
+    (my $msg = $tpl // $VAL_JUDGE_USER_TEMPLATE) =~ s/\{\{(\w+)\}\}/exists $v{$1} ? $v{$1} : "{{$1}}"/ge;
+    return $msg;
 }
 
-sub _val_pii_hit {
-    my $t = shift // '';
-    return undef if ($ENV{ONTOTRIAL_JUDGE_PII_GUARD} // '1') eq '0';
-    if (my $re = $ENV{ONTOTRIAL_JUDGE_PII_REGEX}) {
-        return 'eigene Sperr-Regel' if eval { $t =~ /$re/ };
-    }
-    return 'Geburtsdatum' if $t =~ /\bgeb(?:oren|\.)\s*(?:am\s*)?\d{1,2}\.\s*\d{1,2}\.\s*\d{2,4}/i;
-    return 'Name mit Anrede' if $t =~ /\b(?:Herrn?|Frau)\s+(?!Kolleg|Dr\b|Dr\.|Prof|Doktor|Doctor)[A-ZÄÖÜ][a-zäöüß]{2,}/;
-    return undef;
-}
-
-sub _val_judge_model { return $ENV{ONTOTRIAL_JUDGE_MODEL} || 'claude-opus-5-5' }
 
 sub _val_local_models {
     my @m;
@@ -12284,8 +12637,6 @@ sub _val_local_models {
 sub _val_judge_providers {
     return [
         (map { { id => "local:$_", label => "$_ (lokal)", model => $_, external => 0, configured => 1 } } _val_local_models()),
-        { id => 'anthropic', label => _val_judge_model() . ' (extern)', model => _val_judge_model(), external => 1,
-          configured => $ENV{ANTHROPIC_API_KEY} ? 1 : 0 },
     ];
 }
 
@@ -12297,9 +12648,10 @@ sub _val_judge_provider {
     return $p;
 }
 
-sub _val_judge_call_local {
-    my ($item, $model) = @_;
-    die "Kein lokales Judge-Modell angegeben\n" unless $model;
+# OpenAI-kompatibler oder Ollama-Aufruf mit erzwungenem JSON-Schema
+sub _val_local_json_call {
+    my ($model, $sysp, $user, $schema, $schema_name, $required_key, $effort) = @_;
+    die "Kein lokales Modell angegeben\n" unless $model;
     my $tag    = uc($model =~ s/[^A-Za-z0-9]+/_/gr);
     my $legacy = ($ENV{ONTOTRIAL_JUDGE_LOCAL_MODEL} // '') eq $model;
     my $cfg    = resolve_llm_config($model);
@@ -12312,13 +12664,13 @@ sub _val_judge_call_local {
     # Kein Greedy-Decoding als Standard: gpt-oss neigt bei Temperatur 0 zu Endlosschleifen
     my $temp   = $ENV{ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE} // '';
     my $maxtok = ($ENV{ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS} || 32000) + 0;
-    my @msgs   = ({ role => 'system', content => $VAL_JUDGE_SYSTEM }, { role => 'user', content => _val_judge_user_message($item) });
+    my @msgs   = ({ role => 'system', content => $sysp }, { role => 'user', content => $user });
     my $body = $ollama
-        ? { model => $model, messages => \@msgs, format => _val_judge_schema(), stream => Mojo::JSON->false,
+        ? { model => $model, messages => \@msgs, format => $schema, stream => Mojo::JSON->false,
             options => { (length $temp ? (temperature => $temp + 0) : ()), num_predict => $maxtok, num_ctx => 65536 } }
         : { model => $model, messages => \@msgs, max_tokens => $maxtok, (length $temp ? (temperature => $temp + 0) : ()),
-            reasoning_effort => $ENV{ONTOTRIAL_JUDGE_REASONING_EFFORT} || 'medium',
-            response_format => { type => 'json_schema', json_schema => { name => 'validation_judgment', strict => \1, schema => _val_judge_schema() } } };
+            reasoning_effort => $effort || $ENV{ONTOTRIAL_JUDGE_REASONING_EFFORT} || 'medium',
+            response_format => { type => 'json_schema', json_schema => { name => $schema_name, strict => \1, schema => $schema } } };
     $body->{chat_template_kwargs} = { enable_thinking => Mojo::JSON->false }
         if !$ollama && ($ENV{ONTOTRIAL_JUDGE_LOCAL_THINKING} // '1') eq '0';
 
@@ -12362,52 +12714,20 @@ sub _val_judge_call_local {
         }
         my $out = clean_and_parse_json($content);
         if (ref $out ne 'HASH' && $content =~ /(\{.*\})/s) { $out = clean_and_parse_json($1) }
-        die "Antwort des lokalen Modells ist kein gültiges JSON\n" unless ref $out eq 'HASH' && ref $out->{entries} eq 'ARRAY';
+        die "Antwort des lokalen Modells ist kein gültiges JSON\n" unless ref $out eq 'HASH' && ref $out->{$required_key} eq 'ARRAY';
         return ($out, \%usage, $model);
     }
     die "Lokales Modell $model nicht erreichbar ($last)\n";
 }
 
-sub _val_judge_call {
-    my ($item, $prov) = @_;
-    return _val_judge_call_local($item, $prov->{model}) unless $prov->{external};
-    my $key = $ENV{ANTHROPIC_API_KEY} or die "ANTHROPIC_API_KEY ist nicht gesetzt\n";
-    my $model = _val_judge_model();
-    my $body = {
-        model      => $model,
-        max_tokens => ($ENV{ONTOTRIAL_JUDGE_MAX_TOKENS} || 16000) + 0,
-        system     => $VAL_JUDGE_SYSTEM,
-        messages   => [ { role => 'user', content => _val_judge_user_message($item) } ],
-        output_config => { format => { type => 'json_schema', schema => _val_judge_schema() } },
-    };
-    my $temp = $ENV{ONTOTRIAL_JUDGE_TEMPERATURE} // '';
-    $body->{temperature} = $temp + 0 if length $temp;
+sub _val_judge_call_local {
+    my ($item, $model, $sysp, $tpl) = @_;
+    return _val_local_json_call($model, $sysp, _val_judge_user_message($item, $tpl), _val_judge_schema(), 'validation_judgment', 'entries', undef);
+}
 
-    my $ua = Mojo::UserAgent->new(connect_timeout => 30, inactivity_timeout => 900, request_timeout => 900);
-    $ua->proxy->detect;
-    my $url = $ENV{ONTOTRIAL_JUDGE_URL} || 'https://api.anthropic.com/v1/messages';
-    my $last = '';
-    for my $try (1 .. 5) {
-        my $tx  = $ua->post($url => { 'x-api-key' => $key, 'anthropic-version' => '2023-06-01' } => json => $body);
-        my $res = $tx->res;
-        if (my $err = $tx->error) {
-            $last = $err->{code} ? "HTTP $err->{code}: " . substr($res->body // '', 0, 300) : "Verbindung: $err->{message}";
-            my $code = $err->{code} // 0;
-            die "API-Fehler $last\n" if $code && $code != 429 && $code < 500;
-            my $wait = $res->headers->header('retry-after');
-            sleep(($wait && $wait =~ /^\d+$/) ? $wait : 10 * $try);
-            next;
-        }
-        my $j = $res->json // {};
-        my $stop = $j->{stop_reason} // '';
-        die "Antwort abgeschnitten (max_tokens zu klein)\n" if $stop eq 'max_tokens';
-        die "Modell hat die Bewertung abgelehnt\n" if $stop eq 'refusal';
-        my ($text) = map { $_->{text} } grep { ($_->{type} // '') eq 'text' } @{ $j->{content} // [] };
-        my $out = eval { decode_json(encode('UTF-8', $text // '')) };
-        die "Antwort ist kein gültiges JSON\n" unless ref $out eq 'HASH';
-        return ($out, $j->{usage} // {}, $j->{model} // $model);
-    }
-    die "API nicht erreichbar ($last)\n";
+sub _val_judge_call {
+    my ($item, $prov, $sysp, $tpl) = @_;
+    return _val_judge_call_local($item, $prov->{model}, $sysp, $tpl);
 }
 
 my %VAL_ONT = (disease => 'icd10', phenotype => 'hpo', procedure => 'ops', treatment => 'atc', measurement => 'loinc');
@@ -12440,6 +12760,7 @@ sub _val_ai_convert {
         $x{date_correct}  = $a->{date_correct} // '';
         $x{value_correct} = $a->{value_correct} // '';
         $x{comment}       = $a->{reason} // '';
+        $x{quote}         = _val_quote_ok($item->{narrative}, $a->{quote}) ? $a->{quote} : '';
         if ($x{side_correct} eq 'NONE') {
             $x{side_correct} = '';
             $x{side} = 'superfluous' if $x{side} eq 'wrong' || $x{side} eq 'missing';
@@ -12481,105 +12802,400 @@ sub _val_ai_resolution {
              judgments => $ai->{judgments}, missing => $ai->{missing} // [] };
 }
 
-get '/BBB/validation/sets/:id/judge' => sub {
+
+# ---------------------------------------------------------
+# KI-Ensemble: Vorschläge mit hohem Recall (fehlende Einträge) und Fehlerhinweise
+# ---------------------------------------------------------
+# Je Brief und Modell: (1) Judge-Urteil (vorhandenes wird wiederverwendet), (2) Recall-Durchgang
+# abschnittsweise, (3) Extraktionen aus Pipeline-Läufen des Datensatzes. Alle Kandidaten für
+# fehlende Einträge werden über die Mapping-Pipeline kodiert, gruppiert und von jedem Modell
+# am Brieftext geprüft; ein Vorschlag braucht ein wörtliches Zitat, das im Brief steht, und
+# mindestens min_votes bestätigende Modelle. Fehlerhinweise entstehen, wenn mindestens
+# min_votes Judges denselben Eintrag als fehlerhaft bewerten.
+
+our $VAL_RECALL_SYSTEM = <<'TXT';
+Du bist ein erfahrener Augenarzt. Du erhältst einen Abschnitt eines augenärztlichen Arztbriefs und die Liste der Einträge, die bereits
+aus dem ganzen Brief extrahiert wurden. Finde alles in diesem Abschnitt, was in der Liste fehlt: Augendiagnosen, augenrelevante Befunde,
+Augenoperationen und -eingriffe, Augenmedikation, Visus, Augendruck und andere augenärztliche Messwerte, außerdem verneinte Befunde,
+wenn sie klinisch relevant sind („kein Anhalt für …“).
+
+Gehe den Abschnitt Satz für Satz durch. Lieber ein Kandidat zu viel als einer zu wenig; jeder Kandidat wird anschließend geprüft.
+Ein Sachverhalt, der in der Liste schon steht, ist kein Kandidat, auch wenn er anders formuliert ist.
+Für jeden Kandidaten: Domäne, Bezeichnung (deutsch, fachlich, ohne Seitenangabe), Augenseite (R, L, B oder leer), Datum so genau wie
+im Brief (sonst leer), Wert und Einheit bei Messwerten (sonst leer), ob verneint, und das wörtliche Zitat aus dem Abschnitt, auf dem er
+beruht. Das Zitat muss Zeichen für Zeichen im Abschnitt stehen. Gib keine Codes an.
+TXT
+
+our $VAL_RECALL_TEMPLATE = "Briefdatum: {{reference_date}}\n\n<abschnitt>\n{{section}}\n</abschnitt>\n\nBereits extrahierte Einträge ({{n_entries}}):\n{{entries}}\n\nNenne alle fehlenden Einträge aus diesem Abschnitt.";
+
+our $VAL_VERIFY_SYSTEM = <<'TXT';
+Du bist ein erfahrener Augenarzt und prüfst Vorschläge für Einträge, die in der Kodierung eines augenärztlichen Arztbriefs fehlen sollen.
+Prüfe jeden Vorschlag ausschließlich am Brieftext. present ist true, wenn der Sachverhalt so im Brief steht und den Patienten betrifft;
+false, wenn er nicht im Brief steht, nur als Verdacht, Differenzialdiagnose oder geplante Maßnahme genannt ist oder eine andere Person
+betrifft. Gib bei present das wörtliche Zitat an, das ihn belegt (Zeichen für Zeichen aus dem Brief), dazu Augenseite (R, L, B oder leer),
+Datum so genau wie im Brief (sonst leer) und ob er verneint ist. Begründe in höchstens einem kurzen Satz.
+TXT
+
+our $VAL_VERIFY_TEMPLATE = "Briefdatum: {{reference_date}}\n\n<brief>\n{{letter}}\n</brief>\n\nVorschläge ({{n_candidates}}):\n{{candidates}}\n\nPrüfe jeden Vorschlag (id = V-Nummer).";
+
+sub _val_prompt_pair {
+    my ($app, $name, $sys_default, $tpl_default) = @_;
+    my $rec = eval { $app->get_llm_prompt($name) };
+    my $sys = ($rec && length($rec->{system_prompt} // '')) ? $rec->{system_prompt} : $sys_default;
+    my $tpl = ($rec && length($rec->{user_template} // '')) ? $rec->{user_template} : $tpl_default;
+    return ($sys, $tpl, substr(md5_hex(encode('UTF-8', "$sys\x{1}$tpl")), 0, 10));
+}
+
+sub _val_fill {
+    my ($tpl, %v) = @_;
+    $tpl =~ s/\{\{(\w+)\}\}/exists $v{$1} ? ($v{$1} \/\/ '') : "{{$1}}"/ge;
+    return $tpl;
+}
+
+sub _val_recall_schema {
+    my $enum = sub { { type => 'string', enum => [@_] } };
+    return { type => 'object', additionalProperties => \0, required => ['items'],
+             properties => { items => { type => 'array', items => {
+                 type => 'object', additionalProperties => \0,
+                 required => [qw(domain label side date value unit excluded quote)],
+                 properties => { domain => $enum->(@VAL_DOMAINS), label => { type => 'string' }, side => $enum->('', 'R', 'L', 'B'),
+                                 date => { type => 'string' }, value => { type => 'string' }, unit => { type => 'string' },
+                                 excluded => { type => 'boolean' }, quote => { type => 'string' } } } } } };
+}
+
+sub _val_verify_schema {
+    my $enum = sub { { type => 'string', enum => [@_] } };
+    return { type => 'object', additionalProperties => \0, required => ['results'],
+             properties => { results => { type => 'array', items => {
+                 type => 'object', additionalProperties => \0,
+                 required => [qw(id present quote side date excluded reason)],
+                 properties => { id => { type => 'string' }, present => { type => 'boolean' }, quote => { type => 'string' },
+                                 side => $enum->('', 'R', 'L', 'B'), date => { type => 'string' }, excluded => { type => 'boolean' },
+                                 reason => { type => 'string' } } } } } };
+}
+
+# Zitat muss (nach Normalisierung von Leerraum, Groß-/Kleinschreibung, Anführungszeichen) im Text stehen;
+# Auslassungen „…“ trennen Teilzitate, die einzeln vorkommen müssen
+sub _val_norm_text {
+    my $t = lc(shift // '');
+    $t =~ s/[„“”«»]/"/g;
+    $t =~ s/[‚‘’]/'/g;
+    $t =~ s/[–—]/-/g;
+    $t =~ s/\s+/ /g;
+    $t =~ s/^\s+|\s+$//g;
+    return $t;
+}
+
+sub _val_quote_ok {
+    my ($text, $quote) = @_;
+    my $t = _val_norm_text($text);
+    my @parts = grep { length >= 3 } map { _val_norm_text($_) } split /\x{2026}|\.\.\./, ($quote // '');
+    return 0 unless @parts;
+    for my $p (@parts) { return 0 if index($t, $p) < 0 }
+    return 1;
+}
+
+# Bezeichnung über die Mapping-Pipeline kodieren (Intercepts, Vektorsuche, Reranking)
+sub _val_map_term {
+    my ($app, $domain, $label) = @_;
+    return undef unless defined $label && length $label;
+    my %ont = (disease => 'icd10', phenotype => 'hpo', procedure => 'ops', treatment => 'atc', measurement => 'loinc');
+    my $o = $ont{$domain} or return undef;
+    my $res;
+    eval {
+        if (my $hit = $app->check_database_intercept($o, $label)) {
+            return if $hit->{suppress} || !$hit->{id};
+            $res = { id => $hit->{id}, label => $hit->{label} };
+            return;
+        }
+        my $p = $o eq 'icd10' ? $app->map_to_icd10_async($label, undef, 'de')
+              : $o eq 'ops'   ? $app->map_to_ops_async($label, 'de')
+              : $o eq 'atc'   ? $app->map_to_atc_async($label, 'de')
+              : $o eq 'loinc' ? $app->map_to_loinc_async($label, 'de')
+              :                 $app->map_to_hpo_async($label, 0, 'de');
+        $p->then(sub { my $r = shift; $res = { id => $r->{id}, label => $r->{label} } if $r && $r->{id} })->wait;
+        1;
+    };
+    return $res;
+}
+
+sub _val_entry_line {
+    my ($n, $e, $prefix) = @_;
+    my %dom  = (disease => 'Diagnose', phenotype => 'Befund', procedure => 'Eingriff', treatment => 'Medikation', measurement => 'Messwert');
+    my %side = (R => 'RA', L => 'LA', B => 'beidseits', '' => 'keine');
+    return sprintf('%s%d | %s | %s%s | Seite: %s | Datum: %s | %s%s', $prefix, $n, $dom{ $e->{domain} } // $e->{domain},
+                   length($e->{code} // '') ? "$e->{code} " : '', $e->{label} // '', $side{ $e->{side} // '' } // $e->{side},
+                   length($e->{date} // '') ? $e->{date} : 'keins', $e->{excluded} ? 'verneint' : 'vorhanden',
+                   length($e->{value} // '') ? " | Wert: $e->{value}" . (length($e->{unit} // '') ? " $e->{unit}" : '') : '');
+}
+
+sub _val_ensemble_models {
+    my @local = map { $_->{model} } grep { !$_->{external} && $_->{configured} } @{ _val_judge_providers() };
+    if (my $want = $ENV{ONTOTRIAL_ENSEMBLE_MODELS}) {
+        my %ok = map { $_ => 1 } @local;
+        return grep { $ok{$_} } split /\s*,\s*/, $want;
+    }
+    return @local;
+}
+
+get '/BBB/validation/sets/:id/ensemble' => sub {
     my $c   = shift;
     my $db  = $c->pg->db;
     my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
-    my $models = $db->query(q{
-        SELECT a.model, count(*) FILTER (WHERE a.error IS NULL) AS n_ok, count(*) FILTER (WHERE a.error IS NOT NULL) AS n_errors,
-               coalesce(sum((a.usage->>'input_tokens')::bigint), 0) AS tokens_in, coalesce(sum((a.usage->>'output_tokens')::bigint), 0) AS tokens_out,
-               max(a.created_at) AS last_at
-        FROM validation_ai_reviews a JOIN validation_items i ON i.id = a.item_id WHERE i.set_id = ?
-        GROUP BY a.model ORDER BY a.model
-    }, $set->{id})->hashes->to_array;
-    for my $m (@$models) {
-        $m->{$_} += 0 for qw(n_ok n_errors tokens_in tokens_out);
-        $m->{errors} = $db->query(q{SELECT i.position, regexp_replace(a.error, '\s+', ' ', 'g') AS error FROM validation_ai_reviews a
-                                    JOIN validation_items i ON i.id = a.item_id
-                                    WHERE i.set_id = ? AND a.model = ? AND a.error IS NOT NULL ORDER BY a.created_at DESC LIMIT 3},
-                                  $set->{id}, $m->{model})->hashes->to_array;
-    }
-    # laufende und wartende Judge-Jobs mit Fortschritt
-    my (@running, @jobs);
     my %alive = map { $_->{id} => 1 } @{ $c->minion->backend->list_workers(0, 1000)->{workers} // [] };
-    my $jobs = $c->minion->jobs({ tasks => ['validation_judge_task'], states => [qw(inactive active)] });
-    while (my $job = $jobs->next) {
-        my $a = $job->{args}[0] // {};
-        next unless ($a->{set_id} // 0) == $set->{id};
-        my $prov = $a->{provider} // 'anthropic';
-        my $n = $job->{notes} // {};
-        push @running, $prov;
-        push @jobs, { id => $job->{id}, provider => $prov, state => $job->{state}, progress => $n->{progress} // 0,
-                      done => $n->{done} // 0, failed => $n->{failed} // 0, cancel => $n->{cancel} ? 1 : 0,
-                      current => $n->{current}, current_s => $n->{current_since} ? int(time - $n->{current_since}) : undef,
-                      waiting => int(time - ($job->{created} // time)), running_s => $job->{started} ? int(time - $job->{started}) : undef,
-                      worker_alive => ($job->{worker} ? ($alive{ $job->{worker} } ? 1 : 0) : undef) };
-    }
-    my $n_items = $db->query('SELECT count(*) AS n FROM validation_items WHERE set_id = ?', $set->{id})->hash->{n};
-    $c->render(json => { providers => _val_judge_providers(), prompt_version => $VAL_JUDGE_PROMPT_VERSION, n_items => $n_items + 0,
-                         running => \@running, jobs => \@jobs, workers => scalar(keys %alive), reference_source => $set->{reference_source}, models => $models });
+    my $job;
+    my $jobs = $c->minion->jobs({ tasks => ['validation_ensemble_task'], states => [qw(inactive active)] });
+    while (my $j = $jobs->next) { $job = $j if ($j->{args}[0]{set_id} // 0) == $set->{id} }
+    my $counts = $db->query(q{SELECT s.kind, count(*) AS n, max(s.created_at) AS last_at FROM validation_ai_suggestions s
+                              JOIN validation_items i ON i.id = s.item_id WHERE i.set_id = ? GROUP BY s.kind}, $set->{id})->hashes->to_array;
+    my $n = $job ? ($job->{notes} // {}) : {};
+    $c->render(json => { models => [ _val_ensemble_models() ], running => $job ? 1 : 0,
+                         job => $job ? { id => $job->{id}, state => $job->{state}, progress => $n->{progress} // 0, current => $n->{current},
+                                         total => $n->{total}, step => $n->{step}, current_s => $n->{current_since} ? int(time - $n->{current_since}) : undef,
+                                         worker_alive => $job->{worker} ? ($alive{ $job->{worker} } ? 1 : 0) : undef } : undef,
+                         suggestions => { map { $_->{kind} => $_->{n} + 0 } @$counts },
+                         last_at => (sort map { $_->{last_at} // '' } @$counts)[-1] });
 };
 
-post '/BBB/validation/sets/:id/judge' => sub {
+post '/BBB/validation/sets/:id/ensemble' => sub {
     my $c   = shift;
     my $p   = $c->req->json // {};
     my $db  = $c->pg->db;
     my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
-    my $prov = _val_judge_provider($p->{provider} // 'anthropic')
-        or return $c->render(json => { error => 'Unbekannter Judge-Anbieter.' }, status => 400);
-    return $c->render(json => { error => "$prov->{label} ist nicht konfiguriert." }, status => 409) unless $prov->{configured};
-    return $c->render(json => { error => 'Zum Senden der Briefe an die externe API "EXTERN" bestätigen.' }, status => 400)
-        if $prov->{external} && ($p->{confirm} // '') ne 'EXTERN';
-    my $jobs = $c->minion->jobs({ tasks => ['validation_judge_task'], states => [qw(inactive active)] });
-    while (my $job = $jobs->next) {
-        my $a = $job->{args}[0] // {};
-        return $c->render(json => { error => "Für diesen Datensatz läuft $prov->{label} bereits." }, status => 409)
-            if ($a->{set_id} // 0) == $set->{id} && ($a->{provider} // 'anthropic') eq $prov->{id};
-    }
-    my $id = $c->minion->enqueue(validation_judge_task => [{ set_id => $set->{id}, provider => $prov->{id},
-                                                             overwrite => to_bool($p->{overwrite}) ? 1 : 0 }], { attempts => 1 });
-    $c->app->log->info("[VALIDATION] KI-Judge für \"$set->{name}\" gestartet (Job $id, $prov->{label}, Modell $prov->{model}).");
-    $c->render(json => { ok => 1, job => $id, provider => $prov->{id}, model => $prov->{model} });
-};
-
-# Fehlerhafte KI-Bewertungen eines Datensatzes löschen (z. B. alte Verbindungsfehler).
-# Gültige Bewertungen bleiben; Modelle mit laufendem Job werden übersprungen.
-post '/BBB/validation/sets/:id/judge/clear_errors' => sub {
-    my $c   = shift;
-    my $p   = $c->req->json // {};
-    my $db  = $c->pg->db;
-    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
-    my %busy;
-    my $jobs = $c->minion->jobs({ tasks => ['validation_judge_task'], states => [qw(inactive active)] });
+    return if _val_preparing($c, $set);
+    my @models = _val_ensemble_models();
+    return $c->render(json => { error => 'Kein lokales Modell für das Ensemble konfiguriert (ONTOTRIAL_JUDGE_LOCAL_MODELS).' }, status => 409) unless @models;
+    my $jobs = $c->minion->jobs({ tasks => ['validation_ensemble_task'], states => [qw(inactive active)] });
     while (my $j = $jobs->next) {
-        my $a = $j->{args}[0] // {};
-        next unless ($a->{set_id} // 0) == $set->{id};
-        my $prov = _val_judge_provider($a->{provider} // 'anthropic');
-        $busy{ $prov->{model} } = 1 if $prov;
+        return $c->render(json => { error => 'Für diesen Datensatz läuft bereits ein KI-Ensemble.' }, status => 409)
+            if ($j->{args}[0]{set_id} // 0) == $set->{id};
     }
-    my @busy = sort keys %busy;
-    my $n = $db->query(q{DELETE FROM validation_ai_reviews a USING validation_items i
-                         WHERE a.item_id = i.id AND i.set_id = ? AND a.error IS NOT NULL
-                           AND (?::text IS NULL OR a.model = ?) AND NOT (a.model = ANY(?))},
-                       $set->{id}, $p->{model}, $p->{model}, \@busy)->rows;
-    $c->render(json => { ok => 1, deleted => $n + 0, skipped_models => \@busy });
+    my $min = int($p->{min_votes} // (@models >= 2 ? 2 : 1));
+    $min = scalar @models if $min > @models;
+    my $id = $c->minion->enqueue(validation_ensemble_task => [{ set_id => $set->{id}, provider => 'ensemble', models => \@models, min_votes => $min }],
+                                 { attempts => 1, queue => 'validation', priority => -5 });
+    $c->render(json => { ok => 1, job => $id, models => \@models, min_votes => $min });
 };
+
+app->minion->add_task(validation_ensemble_task => sub {
+    my ($job, $payload) = @_;
+    my $app    = $job->app;
+    my $db     = $app->pg->db;
+    my $set    = _val_load_set($db, $payload->{set_id}) or return $job->fail('Datensatz fehlt');
+    my @models = @{ $payload->{models} // [] } or return $job->fail('Keine Modelle');
+    my $min    = $payload->{min_votes} // 2;
+    my $items  = _val_load_items($db, $set->{id});
+    my $task   = "validation_ensemble_$set->{id}";
+    my $chunk  = ($ENV{ONTOTRIAL_ENSEMBLE_CHUNK_CHARS} || 1800) + 0;
+    my $effort = $ENV{ONTOTRIAL_ENSEMBLE_REASONING_EFFORT} || 'low';
+    my ($jsys, $jtpl, $jver) = _val_judge_prompt($app);
+    my ($rsys, $rtpl)        = _val_prompt_pair($app, 'validation_recall', $VAL_RECALL_SYSTEM, $VAL_RECALL_TEMPLATE);
+    my ($vsys, $vtpl)        = _val_prompt_pair($app, 'validation_verify', $VAL_VERIFY_SYSTEM, $VAL_VERIFY_TEMPLATE);
+
+    # Extraktionen der jeweils letzten Pipeline-Läufe je Modell als zusätzliche Quelle
+    my %run_pp;
+    for my $r (@{ $db->query(q{SELECT id, fingerprint FROM validation_runs WHERE set_id = ? AND mode = 'reextract' AND status = 'finished' ORDER BY id},
+                             $set->{id})->expand->hashes }) {
+        my $m = ($r->{fingerprint} // {})->{model} // "Lauf $r->{id}";
+        $run_pp{$m} = { map { $_->{item_id} => $_->{phenopacket} }
+                        @{ $db->query('SELECT item_id, phenopacket FROM validation_run_items WHERE run_id = ? AND phenopacket IS NOT NULL', $r->{id})->expand->hashes } };
+    }
+
+    my ($k, $n, $n_missing, $n_flags) = (0, scalar @$items, 0, 0);
+    for my $i (@$items) {
+        $k++;
+        last if ($job->info->{notes} // {})->{cancel};
+        my $t0 = time;
+        my $note = sub { $job->note(current => $k, total => $n, step => shift, current_since => $t0, progress => int(100 * ($k - 1) / ($n || 1))) };
+        my $entries = $i->{entries} // [];
+        my %in_snapshot = map { _val_code($_->{code}) => 1 } @$entries;
+        my $lines = join("\n", map { _val_entry_line($_ + 1, $entries->[$_], 'E') } 0 .. $#$entries) || '(keine)';
+        my (@cands, %flags);
+
+        for my $m (@models) {
+            # 1. Judge-Urteil des Modells (vorhandenes ohne Fehler wird übernommen)
+            $note->("Judge $m");
+            my $ai = $db->query('SELECT judgments, missing, error FROM validation_ai_reviews WHERE item_id = ? AND model = ?', $i->{id}, $m)->expand->hash;
+            unless ($ai && !$ai->{error}) {
+                my ($out, $usage) = eval { _val_judge_call($i, { model => $m, external => 0 }, $jsys, $jtpl) };
+                if ($out) {
+                    my ($judg, $miss) = _val_ai_convert($app, $i, $out);
+                    $db->query(q{INSERT INTO validation_ai_reviews (item_id, model, prompt_version, judgments, missing, raw, usage, error)
+                                 VALUES (?, ?, ?, ?::jsonb, ?::jsonb, ?::jsonb, ?::jsonb, NULL)
+                                 ON CONFLICT (item_id, model) DO UPDATE SET prompt_version = EXCLUDED.prompt_version, judgments = EXCLUDED.judgments,
+                                   missing = EXCLUDED.missing, raw = EXCLUDED.raw, usage = EXCLUDED.usage, error = NULL, created_at = now()},
+                               $i->{id}, $m, $jver, to_json($judg), to_json($miss), to_json($out), to_json($usage // {}));
+                    $ai = { judgments => $judg, missing => $miss };
+                } else {
+                    $app->log->warn("[ENSEMBLE] Judge $m Brief $i->{position}: " . ($@ =~ s/\s+$//r));
+                    $ai = undef;
+                }
+            }
+            if ($ai) {
+                for my $key (keys %{ $ai->{judgments} // {} }) {
+                    my $j = $ai->{judgments}{$key};
+                    push @{ $flags{$key} }, { model => $m, judgment => $j } if ($j->{verdict} // '') eq 'error';
+                }
+                push @cands, map { { %$_, source => "Judge $m" } } @{ $ai->{missing} // [] };
+            }
+            # 2. Recall-Durchgang abschnittsweise
+            my @chunks = split_into_clinical_section_chunks($i->{narrative} // '', $chunk);
+            my $ci = 0;
+            for my $sec (@chunks) {
+                $ci++;
+                $note->("Recall $m, Abschnitt $ci/" . scalar @chunks);
+                my $user = _val_fill($rtpl, reference_date => $i->{reference_date} // 'unbekannt', section => $sec,
+                                     n_entries => scalar @$entries, entries => $lines);
+                my ($out) = eval { _val_local_json_call($m, $rsys, $user, _val_recall_schema(), 'validation_recall', 'items', $effort) };
+                unless ($out) { $app->log->warn("[ENSEMBLE] Recall $m Brief $i->{position}: " . ($@ =~ s/\s+$//r)); next }
+                for my $x (@{ $out->{items} // [] }) {
+                    next unless length($x->{label} // '') && _val_quote_ok($i->{narrative}, $x->{quote});
+                    push @cands, { domain => $x->{domain}, label => $x->{label}, side => $x->{side} // '', date => _val_date($x->{date}),
+                                   value => $x->{value} // '', unit => $x->{unit} // '', excluded => $x->{excluded} ? 1 : 0,
+                                   quote => $x->{quote}, source => "Recall $m" };
+                }
+            }
+        }
+        # 3. Pipeline-Läufe
+        for my $rm (sort keys %run_pp) {
+            my $pp = $run_pp{$rm}{ $i->{id} } or next;
+            push @cands, map { { domain => $_->{domain}, code => $_->{code}, label => $_->{label}, side => $_->{side}, date => $_->{date},
+                                 value => $_->{value} // '', unit => $_->{unit} // '', excluded => $_->{excluded}, source => "Pipeline $rm" } } @{ _val_entries($pp) };
+        }
+
+        # 4. kodieren, gruppieren, bereits Extrahiertes entfernen
+        $note->('Kandidaten kodieren');
+        my (%group, @order);
+        for my $cnd (@cands) {
+            next unless $VAL_ONT{ $cnd->{domain} // '' };
+            unless (length($cnd->{code} // '')) {
+                my $hit = _val_map_term($app, $cnd->{domain}, $cnd->{label});
+                $cnd->{code} = $hit ? $hit->{id} : '';
+                $cnd->{code_label} = $hit ? $hit->{label} : '';
+            }
+            my $code = _val_code($cnd->{code});
+            next if length $code && $in_snapshot{$code};
+            my $gk = length $code ? "$cnd->{domain}|$code|" . ($cnd->{side} // '') : "$cnd->{domain}|" . lc($cnd->{label}) . '|' . ($cnd->{side} // '');
+            unless ($group{$gk}) { $group{$gk} = { %$cnd, sources => [] }; push @order, $gk }
+            my $g = $group{$gk};
+            push @{ $g->{sources} }, $cnd->{source} unless grep { $_ eq $cnd->{source} } @{ $g->{sources} };
+            $g->{quote} //= $cnd->{quote};
+        }
+        @order = @order[0 .. 39] if @order > 40;
+
+        # 5. Prüfung durch jedes Modell
+        my %votes;
+        if (@order) {
+            my $clines = join("\n", map { _val_entry_line($_ + 1, $group{ $order[$_] }, 'V') } 0 .. $#order);
+            for my $m (@models) {
+                $note->("Prüfung $m");
+                my $user = _val_fill($vtpl, reference_date => $i->{reference_date} // 'unbekannt', letter => $i->{narrative} // '',
+                                     n_candidates => scalar @order, candidates => $clines);
+                my ($out) = eval { _val_local_json_call($m, $vsys, $user, _val_verify_schema(), 'validation_verify', 'results', $effort) };
+                unless ($out) { $app->log->warn("[ENSEMBLE] Prüfung $m Brief $i->{position}: " . ($@ =~ s/\s+$//r)); next }
+                for my $r (@{ $out->{results} // [] }) {
+                    my ($idx) = ($r->{id} // '') =~ /(\d+)/ or next;
+                    my $gk = $order[$idx - 1] or next;
+                    next unless $r->{present} && _val_quote_ok($i->{narrative}, $r->{quote});
+                    push @{ $votes{$gk} }, { model => $m, quote => $r->{quote}, side => $r->{side} // '', date => _val_date($r->{date}),
+                                             excluded => $r->{excluded} ? 1 : 0, reason => $r->{reason} // '' };
+                }
+            }
+        }
+        $db->query('DELETE FROM validation_ai_suggestions WHERE item_id = ?', $i->{id});
+        for my $gk (@order) {
+            my $v = $votes{$gk} // [];
+            next unless @$v >= $min;
+            my $g = $group{$gk};
+            my %side; $side{ $_->{side} }++ for @$v;
+            my ($best_side) = sort { $side{$b} <=> $side{$a} } keys %side;
+            $db->query(q{INSERT INTO validation_ai_suggestions (item_id, ensemble_job, kind, payload, confidence) VALUES (?, ?, 'missing', ?::jsonb, ?)},
+                       $i->{id}, $job->id, to_json({ domain => $g->{domain}, code => $g->{code}, label => $g->{code_label} || $g->{label},
+                                                     label_letter => $g->{label}, side => $best_side // $g->{side} // '', date => $v->[0]{date} || $g->{date} || '',
+                                                     value => $g->{value} // '', unit => $g->{unit} // '', excluded => $v->[0]{excluded},
+                                                     quote => $v->[0]{quote}, sources => $g->{sources}, votes => scalar @$v,
+                                                     n_verifiers => scalar @models, reasons => [ map { "$_->{model}: $_->{reason}" } @$v ] }),
+                       @$v / @models);
+            $n_missing++;
+        }
+        my %ekey = map { $_->{key} => $_ } @$entries;
+        for my $key (keys %flags) {
+            my $f = $flags{$key};
+            next unless @$f >= $min && $ekey{$key};
+            my $e = $ekey{$key};
+            my $j = $f->[0]{judgment};
+            my @prob;
+            push @prob, OVT_concept($j->{concept}) if ($j->{concept} // 'ok') ne 'ok';
+            push @prob, OVT_status($j->{status})   if ($j->{status} // 'ok') ne 'ok';
+            push @prob, 'Seite ' . OVT_attr($j->{side}) . (length($j->{side_correct} // '') ? " (richtig: $j->{side_correct})" : '') if ($j->{side} // 'ok') !~ /^(?:ok|na)$/;
+            push @prob, 'Datum ' . OVT_attr($j->{date}) . (length($j->{date_correct} // '') ? " (richtig: $j->{date_correct})" : '') if ($j->{date} // 'ok') !~ /^(?:ok|na)$/;
+            push @prob, 'Wert falsch' . (length($j->{value_correct} // '') ? " (richtig: $j->{value_correct})" : '') if ($j->{value} // 'ok') eq 'wrong';
+            $db->query(q{INSERT INTO validation_ai_suggestions (item_id, ensemble_job, kind, entry_key, payload, confidence) VALUES (?, ?, 'flag', ?, ?::jsonb, ?)},
+                       $i->{id}, $job->id, $key, to_json({ label => $e->{label}, code => $e->{code}, domain => $e->{domain}, problem => join('; ', @prob),
+                                                           judgment => $j, votes => scalar @$f, n_judges => scalar @models,
+                                                           reasons => [ map { "$_->{model}: " . ($_->{judgment}{comment} // '') } @$f ] }),
+                       @$f / @models);
+            $n_flags++;
+        }
+        $job->note(progress => int(100 * $k / ($n || 1)), done_items => $k, missing => $n_missing, flags => $n_flags);
+        $app->notify_task_progress($task, 'running', int(100 * $k / ($n || 1)), "Brief $k von $n");
+        $app->log->info(sprintf('[ENSEMBLE] Brief %d/%d in %ds: %d Kandidaten, %d Vorschläge bisher, %d Hinweise bisher',
+                                $k, $n, time - $t0, scalar @order, $n_missing, $n_flags));
+    }
+    $app->notify_task_progress($task, 'finished', 100, 'KI-Ensemble abgeschlossen');
+    $job->finish({ missing => $n_missing, flags => $n_flags });
+});
+
+# Zusammengeführtes Urteil der Ensemble-Modelle je Eintrag: Mehrheit, Stimmen, Beleg
+sub _val_ensemble_view {
+    my ($db, $item) = @_;
+    my $rows = $db->query('SELECT model, judgments FROM validation_ai_reviews WHERE item_id = ? AND error IS NULL ORDER BY model', $item->{id})->expand->hashes->to_array;
+    my (%e, @models);
+    push @models, $_->{model} for @$rows;
+    for my $entry (@{ _val_json($item->{entries}) // [] }) {
+        my ($ok, $err, @errj, $quote) = (0, 0);
+        for my $r (@$rows) {
+            my $j = ($r->{judgments} // {})->{ $entry->{key} } or next;
+            $quote //= $j->{quote} if length($j->{quote} // '');
+            if (($j->{verdict} // '') eq 'correct') { $ok++ } else { $err++; push @errj, { %$j, model => $r->{model} } }
+        }
+        next unless $ok + $err;
+        my $verdict = $ok > $err ? 'correct' : $err > $ok ? 'error' : 'split';
+        my $j = $verdict eq 'correct' ? { verdict => 'correct', concept => 'ok', status => 'ok', side => 'ok', date => 'ok', value => 'ok' } : ($errj[0] // {});
+        my @prob;
+        if ($verdict ne 'correct' && %$j) {
+            push @prob, OVT_concept($j->{concept}) if ($j->{concept} // 'ok') ne 'ok';
+            push @prob, OVT_status($j->{status})   if ($j->{status} // 'ok') ne 'ok';
+            push @prob, 'Seite ' . OVT_attr($j->{side}) . (length($j->{side_correct} // '') ? " (richtig: $j->{side_correct})" : '') if ($j->{side} // 'ok') !~ /^(?:ok|na)$/;
+            push @prob, 'Datum ' . OVT_attr($j->{date}) . (length($j->{date_correct} // '') ? " (richtig: $j->{date_correct})" : '') if ($j->{date} // 'ok') !~ /^(?:ok|na)$/;
+            push @prob, 'Wert falsch' . (length($j->{value_correct} // '') ? " (richtig: $j->{value_correct})" : '') if ($j->{value} // 'ok') eq 'wrong';
+        }
+        my %jj = %$j; delete $jj{model}; delete $jj{quote};
+        $e{ $entry->{key} } = { verdict => $verdict, ok => $ok, err => $err, n => $ok + $err, quote => $quote // '',
+                                judgment => \%jj, problem => join('; ', @prob), reasons => [ map { "$_->{model}: " . ($_->{comment} // '') } @errj ] };
+    }
+    return { entries => \%e, models => \@models };
+}
+
+sub OVT_concept { my %t = (broader => 'zu allgemein', narrower => 'zu spezifisch', wrong => 'falsches Konzept', absent => 'nicht im Brief', wrong_subject => 'falscher Bezug'); $t{ $_[0] // '' } // $_[0] }
+sub OVT_status  { my %t = (negation => 'Verneinung falsch', suspected => 'Verdacht als gesichert', planned => 'Geplantes als erfolgt'); $t{ $_[0] // '' } // $_[0] }
+sub OVT_attr    { my %t = (wrong => 'falsch', missing => 'fehlt', superfluous => 'überflüssig'); $t{ $_[0] // '' } // $_[0] }
+
 
 # Laufende oder wartende Judge-Läufe eines Datensatzes beenden. Wartende Jobs
 # werden entfernt; aktive beenden sich nach dem Brief, an dem sie gerade
 # arbeiten. Aktive Jobs ohne lebenden Worker werden sofort als fehlgeschlagen markiert.
-post '/BBB/validation/sets/:id/judge/stop' => sub {
+post '/BBB/validation/sets/:id/ensemble/stop' => sub {
     my $c   = shift;
     my $p   = $c->req->json // {};
     my $set = _val_load_set($c->pg->db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
     my $minion = $c->minion;
     my %alive = map { $_->{id} => 1 } @{ $minion->backend->list_workers(0, 1000)->{workers} // [] };
     my ($removed, $signalled, $failed) = (0, 0, 0);
-    my $jobs = $minion->jobs({ tasks => ['validation_judge_task'], states => [qw(inactive active)] });
+    my $jobs = $minion->jobs({ tasks => ['validation_ensemble_task'], states => [qw(inactive active)] });
     while (my $info = $jobs->next) {
         my $a = $info->{args}[0] // {};
         next unless ($a->{set_id} // 0) == $set->{id};
-        next if $p->{provider} && ($a->{provider} // 'anthropic') ne $p->{provider};
         my $job = $minion->job($info->{id}) or next;
         if ($info->{state} eq 'inactive') { $removed++ if $job->remove; next }
         if ($info->{worker} && !$alive{ $info->{worker} }) { $failed++ if $job->fail('abgebrochen (Worker nicht mehr aktiv)'); next }
@@ -12588,50 +13204,6 @@ post '/BBB/validation/sets/:id/judge/stop' => sub {
     $c->render(json => { ok => 1, removed => $removed, stopping => $signalled, failed => $failed });
 };
 
-app->minion->add_task(validation_judge_task => sub {
-    my ($job, $payload) = @_;
-    my $app   = $job->app;
-    my $db    = $app->pg->db;
-    my $set   = _val_load_set($db, $payload->{set_id}) or return $job->fail('Datensatz fehlt');
-    my $items = _val_load_items($db, $set->{id});
-    my $prov  = _val_judge_provider($payload->{provider} // 'anthropic') or return $job->fail('Unbekannter Anbieter');
-    my $have  = _val_ai_rows($db, $set->{id})->{ $prov->{model} } // {};
-    my $guard = $prov->{external} ? 1 : (($ENV{ONTOTRIAL_JUDGE_LOCAL_PII_GUARD} // '0') ne '0');
-    my $task  = "validation_judge_$set->{id}";
-    my ($k, $n, $done, $failed, $skipped) = (0, scalar @$items, 0, 0, 0);
-
-    my $cancelled = 0;
-    for my $i (@$items) {
-        $k++;
-        if (($job->info->{notes} // {})->{cancel}) { $cancelled = 1; last }
-        if ($have->{ $i->{id} } && !$have->{ $i->{id} }{error} && !$payload->{overwrite}) { $skipped++; next }
-        my ($out, $usage, $model, $err);
-        my $t0 = time;
-        $job->note(current => $k, current_since => $t0);
-        if (my $why = $guard ? _val_pii_hit($i->{narrative}) : undef) {
-            $err = "nicht gesendet: Brief enthält möglicherweise identifizierende Angaben ($why)";
-        } else {
-            ($out, $usage, $model) = eval { _val_judge_call($i, $prov) };
-            $err = $@ =~ s/\s+$//r if $@;
-        }
-        my ($judg, $missing, $unjudged) = $out ? _val_ai_convert($app, $i, $out) : ({}, [], 0);
-        $err //= "$unjudged Einträge ohne Urteil" if $out && $unjudged;
-        $db->query(q{INSERT INTO validation_ai_reviews (item_id, model, prompt_version, judgments, missing, raw, usage, error)
-                     VALUES (?, ?, ?, ?::jsonb, ?::jsonb, ?::jsonb, ?::jsonb, ?)
-                     ON CONFLICT (item_id, model) DO UPDATE SET prompt_version = EXCLUDED.prompt_version,
-                       judgments = EXCLUDED.judgments, missing = EXCLUDED.missing, raw = EXCLUDED.raw, usage = EXCLUDED.usage,
-                       error = EXCLUDED.error, created_at = now()},
-                   $i->{id}, $prov->{model}, $VAL_JUDGE_PROMPT_VERSION, to_json($judg), to_json($missing),
-                   $out ? to_json($out) : undef, to_json($usage // {}), $err);
-        $err ? $failed++ : $done++;
-        $app->log->info(sprintf('[JUDGE] %s Brief %d/%d in %ds: %s', $prov->{model}, $k, $n, time - $t0, $err // 'ok'));
-        my $pct = int(100 * $k / ($n || 1));
-        $job->note(progress => $pct, done => $done, failed => $failed);
-        $app->notify_task_progress($task, 'running', $pct, "KI-Judge ($prov->{model}): Brief $k von $n");
-    }
-    $app->notify_task_progress($task, 'finished', 100, $cancelled ? 'KI-Judge abgebrochen' : 'KI-Judge abgeschlossen');
-    $job->finish({ done => $done, failed => $failed, skipped => $skipped, cancelled => $cancelled });
-});
 
 # Vergleich KI-Judge gegen die aufgelöste ärztliche Bewertung
 sub _val_judge_agreement {

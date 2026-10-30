@@ -4,7 +4,7 @@
 -- Bestehende Datenbanken, die das Schema schon haben, werden beim ersten Start
 -- nur als Version 1 markiert, ohne dass etwas ausgeführt wird.
 --
--- Schemaänderungen: neuen Abschnitt "-- 4 up" (und "-- 4 down") unten anfügen,
+-- Schemaänderungen: neuen Abschnitt "-- 8 up" (und "-- 8 down") unten anfügen,
 -- nie eine bereits ausgerollte Version nachträglich ändern.
 --
 -- Nicht enthalten: Minion-Tabellen (verwaltet Minion selbst), mojo_migrations,
@@ -987,3 +987,251 @@ BEGIN
     END IF;
     RETURN OLD;
 END $$ LANGUAGE plpgsql;
+
+-- 4 up
+-- Datensätze können beim Ziehen mit der aktuellen Pipeline neu extrahiert werden.
+-- Solange das läuft (status = 'preparing'), dürfen Extraktion und Einträge der
+-- Briefe noch geschrieben und nicht extrahierbare Briefe entfernt werden.
+ALTER TABLE validation_sets ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'ready';
+CREATE OR REPLACE FUNCTION validation_item_guard() RETURNS trigger AS $$
+DECLARE s validation_sets%ROWTYPE;
+BEGIN
+    SELECT * INTO s FROM validation_sets WHERE id = OLD.set_id;
+    IF TG_OP = 'DELETE' THEN
+        IF s.locked AND s.status <> 'preparing' THEN
+            RAISE EXCEPTION 'Validierungsdatensatz "%" ist gesperrt', s.name;
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF NEW.narrative IS DISTINCT FROM OLD.narrative OR NEW.set_id IS DISTINCT FROM OLD.set_id
+       OR (s.status <> 'preparing' AND (NEW.snapshot IS DISTINCT FROM OLD.snapshot
+           OR NEW.entries IS DISTINCT FROM OLD.entries OR NEW.injected IS DISTINCT FROM OLD.injected)) THEN
+        RAISE EXCEPTION 'Brieftext und Extraktion eines Validierungsdatensatzes sind unveränderlich';
+    END IF;
+    IF s.frozen_at IS NOT NULL AND NEW.reference IS DISTINCT FROM OLD.reference THEN
+        RAISE EXCEPTION 'Referenz von "%" ist eingefroren', s.name;
+    END IF;
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+-- 4 down
+CREATE OR REPLACE FUNCTION validation_item_guard() RETURNS trigger AS $$
+DECLARE s validation_sets%ROWTYPE;
+BEGIN
+    SELECT * INTO s FROM validation_sets WHERE id = OLD.set_id;
+    IF TG_OP = 'DELETE' THEN
+        IF s.locked THEN
+            RAISE EXCEPTION 'Validierungsdatensatz "%" ist gesperrt', s.name;
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF NEW.narrative IS DISTINCT FROM OLD.narrative OR NEW.snapshot IS DISTINCT FROM OLD.snapshot
+       OR NEW.entries IS DISTINCT FROM OLD.entries OR NEW.injected IS DISTINCT FROM OLD.injected
+       OR NEW.set_id IS DISTINCT FROM OLD.set_id THEN
+        RAISE EXCEPTION 'Brieftext und Extraktion eines Validierungsdatensatzes sind unveränderlich';
+    END IF;
+    IF s.frozen_at IS NOT NULL AND NEW.reference IS DISTINCT FROM OLD.reference THEN
+        RAISE EXCEPTION 'Referenz von "%" ist eingefroren', s.name;
+    END IF;
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+ALTER TABLE validation_sets DROP COLUMN IF EXISTS status;
+
+-- 5 up
+-- Alle Prompt-Texte in der Datenbank: KI-Judge der Validierung und die festen Textrahmen
+-- der Extraktion. Inhalt identisch mit den bisher eingebauten Texten; vorhandene
+-- Einträge gleichen Namens bleiben unverändert.
+INSERT INTO llm_prompts (name, description, system_prompt, user_template, active)
+VALUES ('validation_judge', $p$KI-Judge der Validierung: bewertet extrahierte Einträge eines Briefs nach dem Bewertungshandbuch. Platzhalter im user_template: {{reference_date}}, {{letter}}, {{n_entries}}, {{entries}}$p$, $p$Du bist ein erfahrener Augenarzt und prüfst die automatische Kodierung eines deutschen augenärztlichen Arztbriefs.
+Du erhältst den Brieftext und eine nummerierte Liste extrahierter Einträge (E1, E2, …). Jeder Eintrag hat eine
+Domäne (Diagnose ICD-10-GM, Befund HPO, Eingriff OPS, Medikation ATC, Messwert LOINC), einen Code mit Bezeichnung,
+eine Augenseite (RA, LA, beidseits oder keine), ein Datum, gegebenenfalls einen Messwert und den Status vorhanden/verneint.
+
+Bewerte jeden Eintrag ausschließlich am Brieftext. Ergänze kein klinisches Wissen und prüfe nicht, ob der Brief medizinisch stimmt.
+
+Konzept:
+- ok: der Code trifft den im Brief genannten Sachverhalt auf der Ebene, die der Brief hergibt
+- broader: richtige Oberklasse, der Brief stützt einen spezifischeren Code
+- narrower: der Code enthält ein Detail, das der Brief nicht trägt
+- wrong: der Code bezeichnet einen anderen Sachverhalt
+- absent: der Sachverhalt steht nicht im Brief
+- wrong_subject: der Sachverhalt betrifft nicht den Patienten (Familienanamnese, Spender, andere Person)
+Status:
+- ok: vorhanden/verneint stimmt
+- negation: verneint und vorhanden sind vertauscht („kein Anhalt für“, „keine“, „ausgeschlossen“ = verneint)
+- suspected: Verdacht, Differenzialdiagnose oder „fraglich“ wurde als gesichert übernommen
+- planned: geplante oder empfohlene Maßnahme wurde als erfolgt übernommen
+Augenseite und Datum: ok, wrong, missing (Brief nennt eine Angabe, der Eintrag hat keine), superfluous (Eintrag hat eine Angabe,
+die der Brief nicht hergibt) oder na (nicht anwendbar, etwa bei systemischen Befunden). Gib bei wrong oder missing die richtige
+Angabe an (Seite: R, L, B; bei superfluous: none; Datum: JJJJ, JJJJ-MM oder JJJJ-MM-TT, so genau wie im Brief).
+Messwert: ok, wrong (Zahl, Einheit oder Vergleichsoperator falsch) oder na bei Nicht-Messwerten; bei wrong den richtigen Wert.
+
+Regeln:
+- Anamnestische Angaben („Z. n.“, „bekannte“, „seit“) gehören zum Brief. Ihr Datum muss der Genauigkeit im Brief entsprechen.
+- Aktuelle Befunde ohne eigenes Datum gelten mit dem Briefdatum als korrekt datiert. Ein anamnestisches Ereignis ohne Datum
+  darf nicht das Briefdatum tragen (dann Datum superfluous).
+- Angaben wie „Tensio 18/21 mmHg“ werden als RA/LA gelesen.
+- Zitierte Vorbefunde anderer Kliniken gelten als Inhalt des Briefs.
+- Dosis und Applikationsfrequenz von Medikamenten werden nicht bewertet; Kombinationspräparate dürfen als Kombinationscode
+  oder als Einzelwirkstoffe kodiert sein.
+
+Fehlende Einträge: Nenne zusätzlich, was im Brief steht, aber nicht extrahiert wurde, beschränkt auf Augendiagnosen,
+augenrelevante Befunde, Augenoperationen und -eingriffe, Augenmedikation, Visus, Augendruck und andere augenärztliche Messwerte
+(höchstens 30). Gib einen Code nur an, wenn du ihn sicher kennst (ICD-10-GM, OPS, ATC, LOINC, HPO), sonst einen leeren Code.
+Verneinte Befunde nur, wenn sie klinisch relevant sind.
+
+Begründe jedes Urteil in höchstens einem kurzen Satz.$p$, $p$Briefdatum: {{reference_date}}
+
+<brief>
+{{letter}}
+</brief>
+
+Extrahierte Einträge ({{n_entries}}):
+{{entries}}
+
+Bewerte jeden Eintrag (id = E-Nummer) und nenne fehlende Einträge.$p$, true)
+ON CONFLICT (name) DO NOTHING;
+INSERT INTO llm_prompts (name, description, system_prompt, user_template, active)
+VALUES ('frame_extraction_input', $p$Rahmen der Nutzernachricht bei der strukturierten Extraktion. Platzhalter: {{text}} (Abschnitt bzw. Text mit Voranalyse), {{prompt}} (user_template von atomic_criteria_extraction)$p$, $p$$p$, $p$INPUT CLINICAL TEXT:
+---
+{{text}}
+---
+Prompt: {{prompt}}$p$, true)
+ON CONFLICT (name) DO NOTHING;
+INSERT INTO llm_prompts (name, description, system_prompt, user_template, active)
+VALUES ('frame_reasoning_input', $p$Rahmen der Nutzernachricht im Deep Mode, Schritt 1 (freie Analyse). Platzhalter: {{text}}, {{instruction}} (user_template von atomic_criteria_reasoning)$p$, $p$$p$, $p$KLINISCHER BEFUND:
+------------------------
+{{text}}
+------------------------
+{{instruction}}
+
+Erstelle nun Schritt für Schritt deine klinische Überlegung und gib die Markdown-Tabelle aus:$p$, true)
+ON CONFLICT (name) DO NOTHING;
+INSERT INTO llm_prompts (name, description, system_prompt, user_template, active)
+VALUES ('frame_deep_mode_input', $p$Eingabe der strukturierten Extraktion im Deep Mode, Schritt 2. Platzhalter: {{text}} (Originalabschnitt), {{reasoning}} (Ergebnis von Schritt 1)$p$, $p$$p$, $p$ORIGINAL CLINICAL TEXT:
+------------------------
+{{text}}
+
+CLINICAL REASONING, RULES ALIGNMENT & PRE-EXTRACTION TABLE:
+------------------------
+{{reasoning}}
+$p$, true)
+ON CONFLICT (name) DO NOTHING;
+
+-- 5 down
+DELETE FROM llm_prompts WHERE name IN ('validation_judge', 'frame_extraction_input', 'frame_reasoning_input', 'frame_deep_mode_input');
+
+-- 6 up
+-- KI-Ensemble und Zweitblick: Vorschläge des Ensembles je Brief, Phase der Bewertung
+-- ('pre' = Stand vor dem Zweitblick bei Studien, 'final' = aktueller Stand), Prompts
+-- für Recall-Durchgang und Prüfung.
+CREATE TABLE IF NOT EXISTS validation_ai_suggestions (
+    id            serial PRIMARY KEY,
+    item_id       int NOT NULL REFERENCES validation_items(id),
+    ensemble_job  bigint,
+    kind          text NOT NULL CHECK (kind IN ('missing', 'flag')),
+    entry_key     text,
+    payload       jsonb NOT NULL,
+    confidence    real,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS validation_ai_suggestions_item ON validation_ai_suggestions (item_id);
+ALTER TABLE validation_reviews ADD COLUMN IF NOT EXISTS phase text NOT NULL DEFAULT 'final';
+ALTER TABLE validation_reviews DROP CONSTRAINT IF EXISTS validation_reviews_item_id_reviewer_entry_key_key;
+ALTER TABLE validation_reviews DROP CONSTRAINT IF EXISTS validation_reviews_item_reviewer_key_phase;
+ALTER TABLE validation_reviews ADD CONSTRAINT validation_reviews_item_reviewer_key_phase UNIQUE (item_id, reviewer, entry_key, phase);
+INSERT INTO llm_prompts (name, description, system_prompt, user_template, active)
+VALUES ('validation_recall', $p$KI-Ensemble: Recall-Durchgang je Abschnitt. Platzhalter: {{reference_date}}, {{section}}, {{n_entries}}, {{entries}}$p$, $p$Du bist ein erfahrener Augenarzt. Du erhältst einen Abschnitt eines augenärztlichen Arztbriefs und die Liste der Einträge, die bereits
+aus dem ganzen Brief extrahiert wurden. Finde alles in diesem Abschnitt, was in der Liste fehlt: Augendiagnosen, augenrelevante Befunde,
+Augenoperationen und -eingriffe, Augenmedikation, Visus, Augendruck und andere augenärztliche Messwerte, außerdem verneinte Befunde,
+wenn sie klinisch relevant sind („kein Anhalt für …“).
+
+Gehe den Abschnitt Satz für Satz durch. Lieber ein Kandidat zu viel als einer zu wenig; jeder Kandidat wird anschließend geprüft.
+Ein Sachverhalt, der in der Liste schon steht, ist kein Kandidat, auch wenn er anders formuliert ist.
+Für jeden Kandidaten: Domäne, Bezeichnung (deutsch, fachlich, ohne Seitenangabe), Augenseite (R, L, B oder leer), Datum so genau wie
+im Brief (sonst leer), Wert und Einheit bei Messwerten (sonst leer), ob verneint, und das wörtliche Zitat aus dem Abschnitt, auf dem er
+beruht. Das Zitat muss Zeichen für Zeichen im Abschnitt stehen. Gib keine Codes an.$p$, $p$Briefdatum: {{reference_date}}
+
+<abschnitt>
+{{section}}
+</abschnitt>
+
+Bereits extrahierte Einträge ({{n_entries}}):
+{{entries}}
+
+Nenne alle fehlenden Einträge aus diesem Abschnitt.$p$, true)
+ON CONFLICT (name) DO NOTHING;
+INSERT INTO llm_prompts (name, description, system_prompt, user_template, active)
+VALUES ('validation_verify', $p$KI-Ensemble: Prüfung der Vorschläge am Brieftext. Platzhalter: {{reference_date}}, {{letter}}, {{n_candidates}}, {{candidates}}$p$, $p$Du bist ein erfahrener Augenarzt und prüfst Vorschläge für Einträge, die in der Kodierung eines augenärztlichen Arztbriefs fehlen sollen.
+Prüfe jeden Vorschlag ausschließlich am Brieftext. present ist true, wenn der Sachverhalt so im Brief steht und den Patienten betrifft;
+false, wenn er nicht im Brief steht, nur als Verdacht, Differenzialdiagnose oder geplante Maßnahme genannt ist oder eine andere Person
+betrifft. Gib bei present das wörtliche Zitat an, das ihn belegt (Zeichen für Zeichen aus dem Brief), dazu Augenseite (R, L, B oder leer),
+Datum so genau wie im Brief (sonst leer) und ob er verneint ist. Begründe in höchstens einem kurzen Satz.$p$, $p$Briefdatum: {{reference_date}}
+
+<brief>
+{{letter}}
+</brief>
+
+Vorschläge ({{n_candidates}}):
+{{candidates}}
+
+Prüfe jeden Vorschlag (id = V-Nummer).$p$, true)
+ON CONFLICT (name) DO NOTHING;
+
+-- 6 down
+DELETE FROM llm_prompts WHERE name IN ('validation_recall', 'validation_verify');
+ALTER TABLE validation_reviews DROP CONSTRAINT IF EXISTS validation_reviews_item_reviewer_key_phase;
+DELETE FROM validation_reviews WHERE phase <> 'final';
+ALTER TABLE validation_reviews ADD CONSTRAINT validation_reviews_item_id_reviewer_entry_key_key UNIQUE (item_id, reviewer, entry_key);
+ALTER TABLE validation_reviews DROP COLUMN IF EXISTS phase;
+DROP TABLE IF EXISTS validation_ai_suggestions;
+
+-- 7 up
+-- Ensemble-Bewertung mit wörtlichem Beleg je Eintrag (für die Hervorhebung im Brief).
+-- Der Prompt wird nur ersetzt, wenn er noch dem ausgelieferten Text entspricht.
+UPDATE llm_prompts SET system_prompt = $p$Du bist ein erfahrener Augenarzt und prüfst die automatische Kodierung eines deutschen augenärztlichen Arztbriefs.
+Du erhältst den Brieftext und eine nummerierte Liste extrahierter Einträge (E1, E2, …). Jeder Eintrag hat eine
+Domäne (Diagnose ICD-10-GM, Befund HPO, Eingriff OPS, Medikation ATC, Messwert LOINC), einen Code mit Bezeichnung,
+eine Augenseite (RA, LA, beidseits oder keine), ein Datum, gegebenenfalls einen Messwert und den Status vorhanden/verneint.
+
+Bewerte jeden Eintrag ausschließlich am Brieftext. Ergänze kein klinisches Wissen und prüfe nicht, ob der Brief medizinisch stimmt.
+
+Konzept:
+- ok: der Code trifft den im Brief genannten Sachverhalt auf der Ebene, die der Brief hergibt
+- broader: richtige Oberklasse, der Brief stützt einen spezifischeren Code
+- narrower: der Code enthält ein Detail, das der Brief nicht trägt
+- wrong: der Code bezeichnet einen anderen Sachverhalt
+- absent: der Sachverhalt steht nicht im Brief
+- wrong_subject: der Sachverhalt betrifft nicht den Patienten (Familienanamnese, Spender, andere Person)
+Status:
+- ok: vorhanden/verneint stimmt
+- negation: verneint und vorhanden sind vertauscht („kein Anhalt für“, „keine“, „ausgeschlossen“ = verneint)
+- suspected: Verdacht, Differenzialdiagnose oder „fraglich“ wurde als gesichert übernommen
+- planned: geplante oder empfohlene Maßnahme wurde als erfolgt übernommen
+Augenseite und Datum: ok, wrong, missing (Brief nennt eine Angabe, der Eintrag hat keine), superfluous (Eintrag hat eine Angabe,
+die der Brief nicht hergibt) oder na (nicht anwendbar, etwa bei systemischen Befunden). Gib bei wrong oder missing die richtige
+Angabe an (Seite: R, L, B; bei superfluous: none; Datum: JJJJ, JJJJ-MM oder JJJJ-MM-TT, so genau wie im Brief).
+Messwert: ok, wrong (Zahl, Einheit oder Vergleichsoperator falsch) oder na bei Nicht-Messwerten; bei wrong den richtigen Wert.
+
+Regeln:
+- Anamnestische Angaben („Z. n.“, „bekannte“, „seit“) gehören zum Brief. Ihr Datum muss der Genauigkeit im Brief entsprechen.
+- Aktuelle Befunde ohne eigenes Datum gelten mit dem Briefdatum als korrekt datiert. Ein anamnestisches Ereignis ohne Datum
+  darf nicht das Briefdatum tragen (dann Datum superfluous).
+- Angaben wie „Tensio 18/21 mmHg“ werden als RA/LA gelesen.
+- Zitierte Vorbefunde anderer Kliniken gelten als Inhalt des Briefs.
+- Dosis und Applikationsfrequenz von Medikamenten werden nicht bewertet; Kombinationspräparate dürfen als Kombinationscode
+  oder als Einzelwirkstoffe kodiert sein.
+
+Fehlende Einträge: Nenne zusätzlich, was im Brief steht, aber nicht extrahiert wurde, beschränkt auf Augendiagnosen,
+augenrelevante Befunde, Augenoperationen und -eingriffe, Augenmedikation, Visus, Augendruck und andere augenärztliche Messwerte
+(höchstens 30). Gib einen Code nur an, wenn du ihn sicher kennst (ICD-10-GM, OPS, ATC, LOINC, HPO), sonst einen leeren Code.
+Verneinte Befunde nur, wenn sie klinisch relevant sind.
+
+Gib für jeden Eintrag das wörtliche Zitat aus dem Brief an, auf dem er beruht (Zeichen für Zeichen aus dem Brief, kurz, nur die
+entscheidende Stelle); bei absent ein leeres Zitat.
+
+Begründe jedes Urteil in höchstens einem kurzen Satz.$p$, description = 'Bewertung je Eintrag durch die Modelle des KI-Ensembles, mit Beleg. Platzhalter im user_template: {{reference_date}}, {{letter}}, {{n_entries}}, {{entries}}', updated_at = now()
+WHERE name = 'validation_judge' AND md5(system_prompt) = '2442d4a1f3ba8510a245bf11897cd710';
+
+-- 7 down
+SELECT 1;
