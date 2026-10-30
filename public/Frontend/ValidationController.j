@@ -176,7 +176,8 @@ function OVFindQuote(text, quote)
     catch (e) { return nil; }
 }
 
-function OVLetterHTML(text, marks)
+// marks: [{ key, quote, cls, title }]; überlappende Belege verweisen auf die erste Fundstelle (alias)
+function OVLetterHTML(text, marks, alias)
 {
     var ranges = [];
     for (var i = 0; i < marks.length; i++)
@@ -184,19 +185,24 @@ function OVLetterHTML(text, marks)
         var r = OVFindQuote(text, marks[i].quote);
         if (!r)
             continue;
-        var overlap = NO;
+        var hit = nil;
         for (var k = 0; k < ranges.length; k++)
             if (r[0] < ranges[k].end && r[1] > ranges[k].start)
-                overlap = YES;
-        if (!overlap)
-            ranges.push({ start: r[0], end: r[1], cls: marks[i].cls + (marks[i].cur ? " cur" : ""), title: marks[i].title, cur: marks[i].cur });
+                hit = ranges[k];
+        if (hit)
+        {
+            alias[marks[i].key] = hit.key;
+            continue;
+        }
+        ranges.push({ start: r[0], end: r[1], cls: marks[i].cls, title: marks[i].title, key: marks[i].key });
+        alias[marks[i].key] = marks[i].key;
     }
     ranges.sort(function(a, b) { return a.start - b.start; });
     var out = "", pos = 0;
     for (var j = 0; j < ranges.length; j++)
     {
         out += OVEscapeHTML(text.substring(pos, ranges[j].start));
-        out += "<mark class='" + ranges[j].cls + "'" + (ranges[j].cur ? " id='cur'" : "") + " title='" + OVEscapeHTML(ranges[j].title || "") + "'>" +
+        out += "<mark class='" + ranges[j].cls + "' data-k='" + OVEscapeHTML(ranges[j].key) + "' title='" + OVEscapeHTML(ranges[j].title || "") + "'>" +
                OVEscapeHTML(text.substring(ranges[j].start, ranges[j].end)) + "</mark>";
         pos = ranges[j].end;
     }
@@ -204,8 +210,7 @@ function OVLetterHTML(text, marks)
     return "<html><head><meta charset='utf-8'><style>" +
            "body{font:13px -apple-system,'Helvetica Neue',Arial,sans-serif;line-height:1.45;white-space:pre-wrap;margin:6px 8px;color:#1d1d1f;background:#fff}" +
            "mark{border-radius:3px;padding:0 1px;color:inherit}.ok{background:#dcf2dc}.err{background:#ffd9b3}.miss{background:#d8e8ff}" +
-           ".cur{background:#ffe066;box-shadow:0 0 0 2px #e0a800}</style></head><body>" + out +
-           "<script>var c=document.getElementById('cur');if(c){c.scrollIntoView({block:'center'});}</script></body></html>";
+           "mark.cur{background:#ffe066;box-shadow:0 0 0 2px #e0a800}</style></head><body>" + out + "</body></html>";
 }
 
 function OVTable(frame, cols, owner, tableClass)
@@ -418,11 +423,15 @@ function OVAlert(aMessage, anInfo)
     CPWindow        _newPanel;
     CPWindow        _cmpPanel;
     id              _letterWeb;
+    CPString        _letterHTML;
+    id              _letterAlias;
+    CPTableView     _lastSelTable;
     id              _ens;
     id              _suggs;
     id              _mrows;
     BOOL            _ensVisible;
     id              _itemCache;
+    id              _itemsLoadingId;
     CPButton        _restButton;
     CPCheckBox      _nsEnsemble;
     BOOL            _ensembleActive;
@@ -757,7 +766,7 @@ function OVAlert(aMessage, anInfo)
                             });
                         }];
                     }
-                    var msg = pr.state === "inactive" ? "wartet auf den Minion-Worker" :
+                    var msg = pr.state === "inactive" ? "wartet auf einen Worker für die Warteschlange „validation“ (perl backend.pl minion worker -q validation -j 1)" :
                               (pr.current ? "Brief " + pr.current + " von " + (pr.total || r.n_items) + (pr.current_s !== undefined && pr.current_s !== null ? " (" + pr.current_s + " s)" : "") : "läuft") +
                               (pr.failed ? ", " + pr.failed + " nicht extrahierbar" : "");
                     [self _hudTask:hid name:"Datensatz vorbereiten: " + setName state:"active" message:msg progress:pr.progress || 0];
@@ -1031,13 +1040,27 @@ function OVAlert(aMessage, anInfo)
             [self _updateSetInfo];
         }
         [_itemsTable reloadData];
-        var done = 0;
+        var done = 0, kept = NO, firstOpen = -1;
         for (var i = 0; i < _items.length; i++)
         {
             if (_items[i].my_done)
                 done++;
+            else if (firstOpen < 0)
+                firstOpen = i;
             if (keepId && _items[i].id === keepId)
+            {
                 [_itemsTable selectRowIndexes:[CPIndexSet indexSetWithIndex:i] byExtendingSelection:NO];
+                kept = YES;
+            }
+        }
+        // beim Öffnen oder Wechsel des Datensatzes gleich den ersten offenen Brief zeigen
+        if (!kept && _items.length)
+        {
+            var idx = firstOpen >= 0 ? firstOpen : 0;
+            [_itemsTable deselectAll:nil];
+            [_itemsTable selectRowIndexes:[CPIndexSet indexSetWithIndex:idx] byExtendingSelection:NO];
+            [_itemsTable scrollRowToVisible:idx];
+            [self loadItem:_items[idx].id];
         }
         [_progressLabel setStringValue:([self reviewer].length ?
             "Von " + [self reviewer] + " abgeschlossen: " + done + " von " + _items.length :
@@ -1065,9 +1088,13 @@ function OVAlert(aMessage, anInfo)
 {
     if (!_itemCache)
         _itemCache = {};
+    if (_itemsLoadingId === anItemId)
+        return;      // wird bereits geladen (Auswahl und direkter Aufruf gleichzeitig)
+    _itemsLoadingId = anItemId;
     var me = [self reviewer], cached = _itemCache[anItemId];
     var apply = function(res)
     {
+        _itemsLoadingId = nil;
         _item = res;
         _judgments = res.judgments || {};
         _missing = [];
@@ -1089,6 +1116,7 @@ function OVAlert(aMessage, anInfo)
     {
         if (!res || res.error)
         {
+            _itemsLoadingId = nil;
             OVAlert("Brief konnte nicht geladen werden: " + (res && res.error ? res.error : "keine Antwort"));
             return;
         }
@@ -1892,7 +1920,7 @@ function OVAlert(aMessage, anInfo)
         if (res.running && res.job)
         {
             var jb = res.job;
-            var msg = jb.state === "inactive" ? "wartet auf den Minion-Worker" :
+            var msg = jb.state === "inactive" ? "wartet auf einen Worker für die Warteschlange „validation“ (perl backend.pl minion worker -q validation -j 1)" :
                       (jb.worker_alive === 0 ? "hängt (Worker beendet)" :
                        "Brief " + (jb.current || "?") + " von " + (jb.total || "?") + (jb.step ? ", " + jb.step : "") + (jb.current_s !== null && jb.current_s !== undefined ? " (" + jb.current_s + " s)" : ""));
             L.push("KI-Ensemble: läuft, " + jb.progress + " % – " + msg);
@@ -1972,7 +2000,7 @@ function OVAlert(aMessage, anInfo)
             {
                 _runsActive = YES;
                 [self _hudTask:hid name:"Regressionslauf " + r.id state:"active"
-                       message:(r.status === "queued" ? "wartet auf den Minion-Worker" : "Brief für Brief") progress:r.progress || 0];
+                       message:(r.status === "queued" ? "wartet auf einen Worker für die Warteschlange „validation“ (perl backend.pl minion worker -q validation -j 1)" : "Brief für Brief") progress:r.progress || 0];
             }
             else if (_hudTasks[hid])
                 [self _hudTask:hid name:"" state:(r.status === "finished" ? "finished" : "failed")
@@ -2118,40 +2146,70 @@ function OVAlert(aMessage, anInfo)
         [_letterView setString:text];
         return;
     }
-    var marks = [], cur = nil;
-    var selE = [_entriesTable selectedRow], selM = [_missingTable selectedRow];
+    var marks = [];
     var entries = (_ensVisible && _item.entries) ? _item.entries : [];
     for (var i = 0; i < entries.length; i++)
     {
         var en = _ens[entries[i].key];
-        if (!en || !en.quote)
-            continue;
-        var m = { quote: en.quote, cls: (en.verdict === "correct" ? "ok" : "err"), title: entries[i].label || "" };
-        if (i === selE && [[_window firstResponder] isEqual:_entriesTable])
-            cur = m;
-        else
-            marks.push(m);
+        if (en && en.quote)
+            marks.push({ key: "e:" + entries[i].key, quote: en.quote, cls: (en.verdict === "correct" ? "ok" : "err"), title: entries[i].label || "" });
     }
     for (var k = 0; k < (_mrows || []).length; k++)
+        if (_mrows[k].quote)
+            marks.push({ key: "m:" + k, quote: _mrows[k].quote, cls: "miss", title: _mrows[k].label || "" });
+    var alias = {};
+    var html = OVLetterHTML(text, marks, alias);
+    _letterAlias = alias;
+    if (html !== _letterHTML)
     {
-        var r = _mrows[k];
-        if (!r.quote)
-            continue;
-        var mm = { quote: r.quote, cls: "miss", title: r.label || "" };
-        if (k === selM && [[_window firstResponder] isEqual:_missingTable])
-            cur = mm;
+        // nur neu laden, wenn sich Brief oder Belege geändert haben; Auswahl läuft über das DOM
+        _letterHTML = html;
+        if ([_letterWeb respondsToSelector:@selector(loadHTMLString:baseURL:)])
+            [_letterWeb loadHTMLString:html baseURL:nil];
         else
-            marks.push(mm);
+            [_letterWeb loadHTMLString:html];
     }
-    if (!cur && selE >= 0 && entries[selE] && _ens[entries[selE].key] && _ens[entries[selE].key].quote)
-        cur = { quote: _ens[entries[selE].key].quote, cls: "ok", title: entries[selE].label };
-    if (cur)
-        cur.cur = YES;
-    var html = OVLetterHTML(text, cur ? [cur].concat(marks) : marks);
-    if ([_letterWeb respondsToSelector:@selector(loadHTMLString:baseURL:)])
-        [_letterWeb loadHTMLString:html baseURL:nil];
-    else
-        [_letterWeb loadHTMLString:html];
+    [self _highlightSelection:0];
+}
+
+// ausgewählten Eintrag im Brief gelb hervorheben und dorthin scrollen, ohne neu zu laden
+- (void)_highlightSelection:(int)attempt
+{
+    if (!_letterWeb || !_item)
+        return;
+    var key = nil;
+    if (_lastSelTable === _missingTable && [_missingTable selectedRow] >= 0)
+        key = "m:" + [_missingTable selectedRow];
+    else if ([_entriesTable selectedRow] >= 0 && _item.entries && _item.entries[[_entriesTable selectedRow]])
+        key = "e:" + _item.entries[[_entriesTable selectedRow]].key;
+    var doc = nil;
+    try
+    {
+        var win = [_letterWeb respondsToSelector:@selector(DOMWindow)] ? [_letterWeb DOMWindow] : nil;
+        doc = win ? win.document : nil;
+    }
+    catch (e) { doc = nil; }
+    if (!doc || !doc.body || doc.readyState === "loading" || (_letterHTML && _letterHTML.indexOf("<mark") >= 0 && !doc.querySelector("mark")))
+    {
+        if (attempt < 20)
+            window.setTimeout(function() { [self _highlightSelection:attempt + 1]; }, 80);
+        return;
+    }
+    var old = doc.querySelectorAll("mark.cur");
+    for (var i = 0; i < old.length; i++)
+        old[i].className = old[i].className.replace(/\s*\bcur\b/g, "");
+    var target = key && _letterAlias ? _letterAlias[key] : nil;
+    if (!target)
+        return;
+    var marks = doc.querySelectorAll("mark");
+    for (var k = 0; k < marks.length; k++)
+        if (marks[k].getAttribute("data-k") === target)
+        {
+            marks[k].className += " cur";
+            if (marks[k].scrollIntoView)
+                marks[k].scrollIntoView({ block: "center" });
+            break;
+        }
 }
 
 - (void)_buildMissingRows
@@ -2941,7 +2999,10 @@ function OVAlert(aMessage, anInfo)
     else if (table === _runsTable)
         [self _showRunDetail];
     else if (table === _entriesTable || table === _missingTable)
-        [self _renderLetter];
+    {
+        _lastSelTable = table;
+        [self _highlightSelection:0];
+    }
 }
 
 @end

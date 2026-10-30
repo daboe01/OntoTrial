@@ -35,6 +35,7 @@ use POSIX qw(strftime);
 use DateTime;
 use Time::HiRes qw(gettimeofday tv_interval);
 use Digest::MD5 qw(md5_hex);
+use File::Path ();
 use List::Util ();
 use Carp ();
 
@@ -1872,7 +1873,8 @@ helper llm_json_call_async => sub {
             response_format => { type => 'json_schema', json_schema => { name => $schema_name, strict => \1, schema => $schema } },
           };
 
-    return $ua_fast->post_p($cfg->{endpoint} => $cfg->{headers} => json => $payload)->then(sub {
+    llm_apply_extra($payload, $cfg->{model}) unless $cfg->{is_ollama};
+    return llm_post_p($ua_fast, $cfg->{endpoint}, $cfg->{headers}, $payload)->then(sub {
         my $tx = shift;
         return undef unless $tx->result && $tx->result->is_success;
         my $raw = $cfg->{is_ollama}
@@ -4690,6 +4692,97 @@ sub calculate_absolute_date {
 # =========================================================
 # CENTRALIZED LLM ROUTER & CONFIG RESOLVER
 # =========================================================
+# Zusätzliche Parameter je Modell aus der .env, z. B.
+#   ONTOTRIAL_LLM_EXTRA_GLM_53={"reasoning_effort":"low"}
+# Name: Modellname in Großbuchstaben, alle anderen Zeichen als _. Nur für OpenAI-kompatible
+# Endpunkte (vLLM). Ohne Eintrag bleibt die Anfrage unverändert.
+my (%LLM_EXTRA_CACHE, %LLM_EXTRA_LOGGED);
+sub llm_extra_params {
+    my ($model) = @_;
+    return {} unless defined $model && length $model;
+    (my $tag = uc $model) =~ s/[^A-Z0-9]+/_/g;
+    my $raw = $ENV{"ONTOTRIAL_LLM_EXTRA_$tag"};
+    return {} unless defined $raw && length $raw;
+    return $LLM_EXTRA_CACHE{$raw} //= do {
+        my $h = eval { Mojo::JSON::decode_json($raw) };
+        if (ref $h eq 'HASH') {
+            app->log->info("[LLM] Zusatzparameter für $model aus ONTOTRIAL_LLM_EXTRA_$tag: $raw") unless $LLM_EXTRA_LOGGED{$tag}++;
+            $h;
+        } else {
+            app->log->warn("[LLM] ONTOTRIAL_LLM_EXTRA_$tag ist kein gültiges JSON-Objekt und wird ignoriert") unless $LLM_EXTRA_LOGGED{$tag}++;
+            {};
+        }
+    };
+}
+
+sub llm_apply_extra {
+    my ($payload, $model) = @_;
+    my $x = llm_extra_params($model);
+    $payload->{$_} = $x->{$_} for keys %$x;
+    llm_dump_payload($payload, $model);
+    return $payload;
+}
+
+# Gestreamte Antwort (Server-Sent Events) zu einer gewöhnlichen Chat-Completion zusammensetzen.
+# Wird nur benutzt, wenn eine Anfrage "stream": true trägt, z. B. über ONTOTRIAL_LLM_EXTRA_<MODELL>
+# für Server, die ein Modell nur gestreamt zuverlässig ausliefern.
+sub llm_sse_to_json {
+    my ($tx) = @_;
+    my $res = $tx->res;
+    return $tx unless $res && $res->is_success;
+    my $body = $res->body // '';
+    return $tx unless $body =~ /^data:/m;
+    my ($content, $reasoning, $finish, $usage, $id, $model) = ('', '', undef, undef, undef, undef);
+    for my $line (split /\r?\n/, $body) {
+        next unless $line =~ /^data:\s*(.+)$/;
+        my $d = $1;
+        last if $d eq '[DONE]';
+        my $j = eval { Mojo::JSON::decode_json($d) } or next;   # $d sind UTF-8-Bytes
+        $id //= $j->{id}; $model //= $j->{model};
+        $usage = $j->{usage} if $j->{usage};
+        my $c = ref $j->{choices} eq 'ARRAY' ? $j->{choices}[0] : undef or next;
+        my $delta = $c->{delta} // {};
+        $content   .= $delta->{content} // '';
+        $reasoning .= $delta->{reasoning} // $delta->{reasoning_content} // '';
+        $finish = $c->{finish_reason} if defined $c->{finish_reason};
+    }
+    my $out = { id => $id, object => 'chat.completion', model => $model, usage => $usage,
+                choices => [ { index => 0, finish_reason => $finish,
+                               message => { role => 'assistant', content => $content, (length $reasoning ? (reasoning => $reasoning) : ()) } } ] };
+    $res->body(Mojo::JSON::encode_json($out));
+    $res->headers->content_type('application/json');
+    delete $res->{json};
+    return $tx;
+}
+
+sub llm_post_p {
+    my ($ua, $url, $headers, $payload) = @_;
+    my $p = $ua->post_p($url => $headers => json => $payload);
+    return $payload->{stream} ? $p->then(sub { llm_sse_to_json(shift) }) : $p;
+}
+
+# Diagnose: mit ONTOTRIAL_LLM_DUMP_DIR wird jede Anfrage (nur OpenAI-kompatible Endpunkte) als
+# JSON-Datei abgelegt, um sie mit curl nachzuspielen. Optional nur bestimmte Modelle:
+# ONTOTRIAL_LLM_DUMP_MODELS=qwen38-27b,glm-53. Ohne die Variable passiert nichts.
+my $LLM_DUMP_N = 0;
+sub llm_dump_payload {
+    my ($payload, $model) = @_;
+    my $dir = $ENV{ONTOTRIAL_LLM_DUMP_DIR} or return;
+    if (my $only = $ENV{ONTOTRIAL_LLM_DUMP_MODELS}) {
+        return unless grep { $_ eq ($model // '') } split /\s*,\s*/, $only;
+    }
+    eval {
+        File::Path::make_path($dir) unless -d $dir;
+        (my $m = $model // 'model') =~ s/[^A-Za-z0-9.\-]+/_/g;
+        my $f = sprintf('%s/%s_%s_%d_%03d.json', $dir, POSIX::strftime('%Y%m%d-%H%M%S', localtime), $m, $$, ++$LLM_DUMP_N);
+        open my $fh, '>:raw', $f or die "$f: $!";
+        print $fh Mojo::JSON::encode_json($payload);
+        close $fh;
+        app->log->info("[LLM] Anfrage gespeichert: $f");
+        1;
+    } or app->log->warn("[LLM] Anfrage nicht gespeichert: $@");
+}
+
 sub resolve_llm_config {
     my ($client_model) = @_;
 
@@ -4769,7 +4862,8 @@ helper generate_reasoning_trace_async => sub {
         };
     }
 
-    return $ua->post_p($active_endpoint => $headers => json => $api_payload)->then(sub {
+    llm_apply_extra($api_payload, $active_model) unless $is_local_provider;
+    return llm_post_p($ua, $active_endpoint, $headers, $api_payload)->then(sub {
         my $tx = shift;
         if ($tx->result && $tx->result->is_success) {
             my $content = $is_local_provider
@@ -4866,10 +4960,11 @@ helper extract_structured_data_async => sub {
     my $user_len  = length($text);
     my $timestamp = POSIX::strftime("%Y-%m-%d %H:%M:%S", localtime);
 
+    llm_apply_extra($api_payload, $active_model) unless $is_local_provider;
     $self->app->log->info("[$req_id] [OUTBOUND LLM REQUEST] Dispatching to $active_model at $active_endpoint (Input: ${user_len} chars, SysPrompt: ${sys_len} chars)");
     print "\n=== [$req_id] [OUTBOUND LLM REQUEST ($active_model)] ===\nTime: $timestamp\nEndpoint: $active_endpoint\nSystem Prompt length: $sys_len chars\nUser Input length: $user_len chars\n===============================================\n";
 
-    return $ua->post_p($active_endpoint => $headers => json => $api_payload)->then(sub {
+    return llm_post_p($ua, $active_endpoint, $headers, $api_payload)->then(sub {
         my $tx_call = shift;
         my $elapsed = sprintf("%.3f", Time::HiRes::tv_interval($t0));
 
@@ -8103,7 +8198,8 @@ sub run_cohort_agent_loop {
         tools       => \@pheno_chat_tools
     };
 
-    return $ua->post_p($llm_cfg->{endpoint} => $llm_cfg->{headers} => json => $api_payload)->then(sub {
+    llm_apply_extra($api_payload, $llm_cfg->{model}) unless $llm_cfg->{is_ollama};
+    return llm_post_p($ua, $llm_cfg->{endpoint}, $llm_cfg->{headers}, $api_payload)->then(sub {
         my $tx = shift;
         unless ($tx->result && $tx->result->is_success) {
             die "LLM API Fehler: " . ($tx->error ? $tx->error->{message} : "Unbekannt");
@@ -12524,8 +12620,10 @@ Messwert: ok, wrong (Zahl, Einheit oder Vergleichsoperator falsch) oder na bei N
 
 Regeln:
 - Anamnestische Angaben („Z. n.“, „bekannte“, „seit“) gehören zum Brief. Ihr Datum muss der Genauigkeit im Brief entsprechen.
-- Aktuelle Befunde ohne eigenes Datum gelten mit dem Briefdatum als korrekt datiert. Ein anamnestisches Ereignis ohne Datum
-  darf nicht das Briefdatum tragen (dann Datum superfluous).
+- Aktuelle Befunde ohne eigenes Datum gelten mit dem Briefdatum als korrekt datiert. Hat ein aktueller Befund, eine Diagnose oder
+  ein Messwert gar kein Datum, ist das ebenfalls korrekt (Datum ok): es gilt implizit das Briefdatum. Datum missing nur, wenn der
+  Brief für diesen Eintrag ein eigenes, vom Briefdatum abweichendes Datum nennt (etwa bei einer früheren Operation).
+  Ein anamnestisches Ereignis ohne Datum darf nicht das Briefdatum tragen (dann Datum superfluous).
 - Angaben wie „Tensio 18/21 mmHg“ werden als RA/LA gelesen.
 - Zitierte Vorbefunde anderer Kliniken gelten als Inhalt des Briefs.
 - Dosis und Applikationsfrequenz von Medikamenten werden nicht bewertet; Kombinationspräparate dürfen als Kombinationscode
@@ -12676,10 +12774,12 @@ sub _val_local_json_call {
 
     my $ua = Mojo::UserAgent->new(connect_timeout => 30, inactivity_timeout => 1800, request_timeout => 1800);
     $ua->proxy->detect;
+    llm_apply_extra($body, $model) unless $ollama;
     my $last = '';
     my $downgraded = 0;
     for my $try (1 .. 4) {
         my $tx  = $ua->post($url => \%hdr => json => $body);
+        llm_sse_to_json($tx) if $body->{stream} && !$ollama;
         my $res = $tx->res;
         if (my $err = $tx->error) {
             $last = $err->{code} ? "HTTP $err->{code}: " . substr($res->body // '', 0, 300) : "Verbindung: $err->{message}";
@@ -12930,12 +13030,12 @@ sub _val_entry_line {
 }
 
 sub _val_ensemble_models {
-    my @local = map { $_->{model} } grep { !$_->{external} && $_->{configured} } @{ _val_judge_providers() };
+    # ONTOTRIAL_ENSEMBLE_MODELS genügt allein; sonst alle lokalen Modelle (ONTOTRIAL_JUDGE_LOCAL_MODELS bzw. Pipeline-Modell)
     if (my $want = $ENV{ONTOTRIAL_ENSEMBLE_MODELS}) {
-        my %ok = map { $_ => 1 } @local;
-        return grep { $ok{$_} } split /\s*,\s*/, $want;
+        my %seen;
+        return grep { length && !$seen{$_}++ } split /\s*,\s*/, $want;
     }
-    return @local;
+    return map { $_->{model} } grep { !$_->{external} && $_->{configured} } @{ _val_judge_providers() };
 }
 
 get '/BBB/validation/sets/:id/ensemble' => sub {
@@ -12954,7 +13054,7 @@ get '/BBB/validation/sets/:id/ensemble' => sub {
                                          total => $n->{total}, step => $n->{step}, current_s => $n->{current_since} ? int(time - $n->{current_since}) : undef,
                                          worker_alive => $job->{worker} ? ($alive{ $job->{worker} } ? 1 : 0) : undef } : undef,
                          suggestions => { map { $_->{kind} => $_->{n} + 0 } @$counts },
-                         last_at => (sort map { $_->{last_at} // '' } @$counts)[-1] });
+                         last_at => do { my @t = sort grep { length } map { $_->{last_at} // '' } @$counts; @t ? $t[-1] : undef } });
 };
 
 post '/BBB/validation/sets/:id/ensemble' => sub {
@@ -13146,6 +13246,20 @@ app->minion->add_task(validation_ensemble_task => sub {
     $job->finish({ missing => $n_missing, flags => $n_flags });
 });
 
+# „Datum fehlt“, wenn das richtige Datum nur das Briefdatum ist, ist kein Fehler: aktuelle Befunde
+# ohne Datum gelten implizit zum Briefdatum. Ergibt sich danach kein anderer Fehler, ist der Eintrag korrekt.
+sub _val_relax_date {
+    my ($j, $ref) = @_;
+    return $j unless ($j->{date} // '') eq 'missing';
+    my $dc = $j->{date_correct} // '';
+    $ref //= '';
+    return $j unless !length($dc) || (length($ref) && (index($ref, $dc) == 0 || index($dc, $ref) == 0));
+    my %x = (%$j, date => 'ok', date_correct => '');
+    my $ok = ($x{concept} // 'ok') eq 'ok' && ($x{status} // 'ok') eq 'ok' && ($x{side} // 'ok') =~ /^(?:ok|na)$/ && ($x{value} // 'ok') =~ /^(?:ok|na)$/;
+    $x{verdict} = 'correct' if $ok;
+    return \%x;
+}
+
 # Zusammengeführtes Urteil der Ensemble-Modelle je Eintrag: Mehrheit, Stimmen, Beleg
 sub _val_ensemble_view {
     my ($db, $item) = @_;
@@ -13156,6 +13270,7 @@ sub _val_ensemble_view {
         my ($ok, $err, @errj, $quote) = (0, 0);
         for my $r (@$rows) {
             my $j = ($r->{judgments} // {})->{ $entry->{key} } or next;
+            $j = _val_relax_date($j, $item->{reference_date});
             $quote //= $j->{quote} if length($j->{quote} // '');
             if (($j->{verdict} // '') eq 'correct') { $ok++ } else { $err++; push @errj, { %$j, model => $r->{model} } }
         }
