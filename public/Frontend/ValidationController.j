@@ -35,8 +35,8 @@ var OVSideTitles   = { R: "RA", L: "LA", B: "bds.", "": "", "?": "?" };
 
 var OVConceptOpts = [["ok", "korrekt"], ["broader", "zu allgemein"], ["narrower", "zu spezifisch"],
                      ["wrong", "falsches Konzept"], ["absent", "nicht im Brief"], ["wrong_subject", "falscher Bezug"]];
-var OVStatusOpts  = [["ok", "korrekt"], ["negation", "Verneinung falsch"], ["suspected", "Verdacht als gesichert"],
-                     ["planned", "Geplantes als erfolgt"]];
+// "Verdacht als gesichert" gibt es nicht mehr: die Kodierung kennt keinen Verdachtsstatus
+var OVStatusOpts  = [["ok", "korrekt"], ["negation", "Verneinung falsch"], ["planned", "Geplantes als erfolgt"]];
 var OVAttrOpts    = [["ok", "korrekt"], ["wrong", "falsch"], ["missing", "fehlt"], ["superfluous", "überflüssig"],
                      ["na", "nicht anwendbar"]];
 var OVValueOpts   = [["ok", "korrekt"], ["wrong", "falsch"], ["na", "nicht anwendbar"]];
@@ -155,12 +155,6 @@ function OVM(view, mask)
     return view;
 }
 
-// Briefansicht als HTML mit hinterlegten Belegen
-function OVEscapeHTML(t)
-{
-    return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
 // erste Fundstelle eines Zitats im Text (Leerraum und Groß-/Kleinschreibung tolerant)
 function OVFindQuote(text, quote)
 {
@@ -176,8 +170,8 @@ function OVFindQuote(text, quote)
     catch (e) { return nil; }
 }
 
-// marks: [{ key, quote, cls, title }]; überlappende Belege verweisen auf die erste Fundstelle (alias)
-function OVLetterHTML(text, marks, alias)
+// Fundstellen der Belege im Brief; überlappende Belege verweisen auf die erste Fundstelle (alias)
+function OVMarkRanges(text, marks, alias)
 {
     var ranges = [];
     for (var i = 0; i < marks.length; i++)
@@ -194,23 +188,35 @@ function OVLetterHTML(text, marks, alias)
             alias[marks[i].key] = hit.key;
             continue;
         }
-        ranges.push({ start: r[0], end: r[1], cls: marks[i].cls, title: marks[i].title, key: marks[i].key });
+        ranges.push({ start: r[0], end: r[1], cls: marks[i].cls, key: marks[i].key });
         alias[marks[i].key] = marks[i].key;
     }
-    ranges.sort(function(a, b) { return a.start - b.start; });
-    var out = "", pos = 0;
-    for (var j = 0; j < ranges.length; j++)
+    return ranges;
+}
+
+function OVDuration(s)
+{
+    s = Math.round(Number(s) || 0);
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    return h > 0 ? h + " h " + (m < 10 ? "0" : "") + m + " min" : m + " min " + (s % 60) + " s";
+}
+
+function OVValueText(v, unit)
+{
+    if (v === undefined || v === null || String(v) === "")
+        return "";
+    return String(v) + (unit ? " " + unit : "");
+}
+
+function OVMarkColor(cls)
+{
+    switch (cls)
     {
-        out += OVEscapeHTML(text.substring(pos, ranges[j].start));
-        out += "<mark class='" + ranges[j].cls + "' data-k='" + OVEscapeHTML(ranges[j].key) + "' title='" + OVEscapeHTML(ranges[j].title || "") + "'>" +
-               OVEscapeHTML(text.substring(ranges[j].start, ranges[j].end)) + "</mark>";
-        pos = ranges[j].end;
+        case "ok":   return [CPColor colorWithRed:0.86 green:0.95 blue:0.86 alpha:1.0];
+        case "err":  return [CPColor colorWithRed:1.0 green:0.85 blue:0.70 alpha:1.0];
+        case "miss": return [CPColor colorWithRed:0.85 green:0.91 blue:1.0 alpha:1.0];
+        default:     return [CPColor colorWithRed:1.0 green:0.88 blue:0.40 alpha:1.0];   // ausgewählt
     }
-    out += OVEscapeHTML(text.substring(pos));
-    return "<html><head><meta charset='utf-8'><style>" +
-           "body{font:13px -apple-system,'Helvetica Neue',Arial,sans-serif;line-height:1.45;white-space:pre-wrap;margin:6px 8px;color:#1d1d1f;background:#fff}" +
-           "mark{border-radius:3px;padding:0 1px;color:inherit}.ok{background:#dcf2dc}.err{background:#ffd9b3}.miss{background:#d8e8ff}" +
-           "mark.cur{background:#ffe066;box-shadow:0 0 0 2px #e0a800}</style></head><body>" + out + "</body></html>";
 }
 
 function OVTable(frame, cols, owner, tableClass)
@@ -368,6 +374,7 @@ function OVAlert(aMessage, anInfo)
     id              _app;
     CPWindow        _window;
     CPPopUpButton   _setPopUp;
+    CPTabView       _tabView;
     CPTextField     _reviewerField;
     CPTextField     _setInfoLabel;
     id              _sets;
@@ -422,9 +429,10 @@ function OVAlert(aMessage, anInfo)
     // Neuer Datensatz
     CPWindow        _newPanel;
     CPWindow        _cmpPanel;
-    id              _letterWeb;
-    CPString        _letterHTML;
+    id              _letterRanges;
     id              _letterAlias;
+    id              _letterShownId;
+    id              _curMark;
     CPTableView     _lastSelTable;
     id              _ens;
     id              _suggs;
@@ -433,6 +441,11 @@ function OVAlert(aMessage, anInfo)
     id              _itemCache;
     id              _itemsLoadingId;
     CPButton        _restButton;
+    CPSplitView     _entriesSplit;
+    CPTextField     _letterSearch;
+    CPTextField     _letterSearchInfo;
+    id              _searchHits;
+    int             _searchIndex;
     CPCheckBox      _nsEnsemble;
     BOOL            _ensembleActive;
     CPString        _ensembleText;
@@ -614,6 +627,7 @@ function OVAlert(aMessage, anInfo)
 
     var tabView = OVM([[CPTabView alloc] initWithFrame:CGRectMake(10, 46, 1280, 744)], CPViewWidthSizable | CPViewHeightSizable);
     [tabView setDelegate:self];
+    _tabView = tabView;
     [tabView addTabViewItem:[self _tabWithId:"review" label:"Prüfen" view:[self _buildReviewView]]];
     [tabView addTabViewItem:[self _tabWithId:"regression" label:"Referenz & Regression" view:[self _buildRegressionView]]];
     [tabView addTabViewItem:[self _tabWithId:"study" label:"Studie" view:[self _buildStudyView]]];
@@ -704,6 +718,10 @@ function OVAlert(aMessage, anInfo)
     [_runDetailView setString:@""];
     _runs = [];
     [_runsTable reloadData];
+    // steht der Reiter „Referenz & Regression“ offen, Stand und Läufe des neuen Datensatzes laden
+    var tab = _tabView ? [_tabView selectedTabViewItem] : nil;
+    if (tab && [tab identifier] === "regression")
+        [self refreshRegressionTab:nil];
 }
 
 - (void)_updateSetInfo
@@ -766,7 +784,7 @@ function OVAlert(aMessage, anInfo)
                             });
                         }];
                     }
-                    var msg = pr.state === "inactive" ? "wartet auf einen Worker für die Warteschlange „validation“ (perl backend.pl minion worker -q validation -j 1)" :
+                    var msg = pr.state === "inactive" ? "wartet auf einen Worker für die Warteschlange „validation“ (perl backend.pl minion worker -q validation -j 4)" :
                               (pr.current ? "Brief " + pr.current + " von " + (pr.total || r.n_items) + (pr.current_s !== undefined && pr.current_s !== null ? " (" + pr.current_s + " s)" : "") : "läuft") +
                               (pr.failed ? ", " + pr.failed + " nicht extrahierbar" : "");
                     [self _hudTask:hid name:"Datensatz vorbereiten: " + setName state:"active" message:msg progress:pr.progress || 0];
@@ -941,21 +959,27 @@ function OVAlert(aMessage, anInfo)
     _progressLabel = OVM(OTLabel(CGRectMake(5, 650, 230, 40), "", NO), CPViewMinYMargin);
     [v addSubview:_progressLabel];
 
-    _letterHeader = OVM(OTLabel(CGRectMake(245, 5, 430, 18), "", YES), CPViewWidthSizable);
+    _letterHeader = OVM(OTLabel(CGRectMake(245, 5, 230, 18), "", YES), CPViewWidthSizable);
     [v addSubview:_letterHeader];
+    _letterSearch = OVM([CPTextField textFieldWithStringValue:"" placeholder:"Im Brief suchen …" width:150], CPViewMinXMargin);
+    [_letterSearch setFrame:CGRectMake(480, 1, 150, 24)];
+    [_letterSearch setTarget:self];
+    [_letterSearch setAction:@selector(searchInLetter:)];
+    [_letterSearch setDelegate:self];
+    [v addSubview:_letterSearch];
+    _letterSearchInfo = OVM(OTLabel(CGRectMake(634, 5, 41, 18), "", NO), CPViewMinXMargin);
+    [v addSubview:_letterSearchInfo];
     var lt = OVTextArea(CGRectMake(245, 26, 430, 674), NO);
     _letterView = lt.text;
-    // Briefansicht mit hinterlegten Belegen (HTML); ohne CPWebView reiner Text
-    var WebClass = (typeof CPWebView !== "undefined") ? CPWebView : nil;
-    if (WebClass)
-    {
-        _letterWeb = OVM([[WebClass alloc] initWithFrame:CGRectMake(245, 26, 430, 674)], CPViewWidthSizable | CPViewHeightSizable);
-        if ([_letterWeb respondsToSelector:@selector(setScrollMode:)] && typeof CPWebViewScrollNative !== "undefined")
-            [_letterWeb setScrollMode:CPWebViewScrollNative];
-        [v addSubview:_letterWeb];
-    }
-    else
-        [v addSubview:OVM(lt.scroll, CPViewWidthSizable | CPViewHeightSizable)];
+    // Briefansicht: CPTextView mit farbig hinterlegten Belegen
+    [_letterView setRichText:YES];
+    [_letterView setHorizontallyResizable:NO];
+    [_letterView setVerticallyResizable:YES];
+    [_letterView setMinSize:CGSizeMake(0, 0)];
+    [_letterView setMaxSize:CGSizeMake(100000, 100000)];
+    [[_letterView textContainer] setWidthTracksTextView:YES];
+    [_letterView setFont:[CPFont systemFontOfSize:13.0]];
+    [v addSubview:OVM(lt.scroll, CPViewWidthSizable | CPViewHeightSizable)];
 
     // rechte Spalte
     var x = 685, w = 580;
@@ -981,34 +1005,51 @@ function OVAlert(aMessage, anInfo)
 
     _entriesBox = OVM([[CPView alloc] initWithFrame:CGRectMake(x, 190, w, 470)], CPViewMinXMargin | CPViewHeightSizable);
     [_entriesBox addSubview:OTLabel(CGRectMake(0, 0, w, 18), "Teil B – Extrahierte Einträge", YES)];
-    var et = OVTable(CGRectMake(0, 20, w, 240), [["domain", "Domäne", 75], ["label", "Bezeichnung", 160], ["code", "Code", 85],
-                                                 ["side", "Seite", 38], ["date", "Datum", 72], ["value", "Wert", 50],
-                                                 ["ens", "Ensemble", 200], ["judgment", "Urteil", 160], ["others", "Andere Prüfer", 200]], self, OVKeyTableView);
+    // Einträge oben, fehlende Einträge unten; der Trenner dazwischen lässt sich ziehen
+    var split = OVM([[CPSplitView alloc] initWithFrame:CGRectMake(0, 20, w, 450)], CPViewWidthSizable | CPViewHeightSizable);
+    [split setVertical:NO];
+    var top = [[CPView alloc] initWithFrame:CGRectMake(0, 0, w, 280)];
+    var bottom = [[CPView alloc] initWithFrame:CGRectMake(0, 0, w, 160)];
+
+    var et = OVTable(CGRectMake(0, 0, w, 214), [["domain", "Domäne", 75], ["label", "Bezeichnung", 160], ["code", "Code", 85],
+                                                ["side", "Seite", 38], ["date", "Datum", 72], ["value", "Wert", 50],
+                                                ["judgment", "Urteil", 130], ["ens", "Ensemble", 220], ["others", "Andere Prüfer", 200]], self, OVKeyTableView);
     _entriesTable = et.table;
     [_entriesTable setKeyTarget:self];
     [_entriesTable setTarget:self];
     [_entriesTable setDoubleAction:@selector(showErrorPanel:)];
-    [_entriesBox addSubview:OVM(et.scroll, CPViewHeightSizable)];
-    var by = 266, bm = CPViewMinYMargin;
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(0, by, 110, 26), "Bestätigen ⏎", self, @selector(confirmEnsemble:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(115, by, 80, 26), "Korrekt", self, @selector(markCorrect:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(200, by, 85, 26), "Fehler …", self, @selector(showErrorPanel:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(290, by, 80, 26), "Dublette", self, @selector(markDuplicate:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(375, by, 70, 26), "Unklar", self, @selector(markUnclear:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(450, by, 130, 26), "Zurücksetzen", self, @selector(clearJudgment:)), bm)];
+    [top addSubview:OVM(et.scroll, CPViewWidthSizable | CPViewHeightSizable)];
+    var by = 220, bm = CPViewMinYMargin;
+    [top addSubview:OVM(OTButton(CGRectMake(0, by, 110, 26), "Bestätigen ⏎", self, @selector(confirmEnsemble:)), bm)];
+    [top addSubview:OVM(OTButton(CGRectMake(115, by, 80, 26), "Korrekt", self, @selector(markCorrect:)), bm)];
+    [top addSubview:OVM(OTButton(CGRectMake(200, by, 85, 26), "Fehler …", self, @selector(showErrorPanel:)), bm)];
+    [top addSubview:OVM(OTButton(CGRectMake(290, by, 80, 26), "Dublette", self, @selector(markDuplicate:)), bm)];
+    [top addSubview:OVM(OTButton(CGRectMake(375, by, 70, 26), "Unklar", self, @selector(markUnclear:)), bm)];
+    [top addSubview:OVM(OTButton(CGRectMake(450, by, 130, 26), "Zurücksetzen", self, @selector(clearJudgment:)), bm)];
     _restButton = OVM(OTButton(CGRectMake(0, by + 30, 250, 26), "Übrige korrekt", self, @selector(markRestCorrect:)), bm);
-    [_entriesBox addSubview:_restButton];
-    [_entriesBox addSubview:OVM(OTLabel(CGRectMake(260, by + 34, 320, 18), "Tasten: ⏎ bestätigen · K korrekt · F Fehler · D Dublette · ↑↓", NO), bm)];
+    [top addSubview:_restButton];
+    [top addSubview:OVM(OTLabel(CGRectMake(260, by + 34, 320, 18), "Tasten: ⏎ bestätigen · K korrekt · F Fehler · D Dublette · ↑↓", NO), bm)];
 
-    [_entriesBox addSubview:OVM(OTLabel(CGRectMake(0, by + 64, w, 18), "Im Brief vorhanden, aber nicht extrahiert", YES), bm)];
-    var mt = OVTable(CGRectMake(0, by + 84, w, 80), [["mstate", "Status", 80], ["domain", "Domäne", 75], ["label", "Bezeichnung", 170],
-                                                     ["code", "Code", 95], ["side", "Seite", 40], ["date", "Datum", 75], ["votes", "Stimmen", 55]], self);
+    [bottom addSubview:OVM(OTLabel(CGRectMake(0, 6, w, 18), "Im Brief vorhanden, aber nicht extrahiert", YES), CPViewWidthSizable)];
+    var mt = OVTable(CGRectMake(0, 26, w, 98), [["mstate", "Status", 80], ["domain", "Domäne", 75], ["label", "Bezeichnung", 170],
+                                                ["code", "Code", 95], ["side", "Seite", 40], ["date", "Datum", 75], ["value", "Wert", 70],
+                                                ["excl", "verneint", 55], ["votes", "Stimmen", 55]], self);
     _missingTable = mt.table;
-    [_entriesBox addSubview:OVM(mt.scroll, bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(0, by + 170, 160, 26), "Vorschlag übernehmen", self, @selector(acceptSuggestion:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(165, by + 170, 80, 26), "Ablehnen", self, @selector(rejectSuggestion:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(250, by + 170, 150, 26), "Eigenen ergänzen …", self, @selector(addMissing:)), bm)];
-    [_entriesBox addSubview:OVM(OTButton(CGRectMake(405, by + 170, 80, 26), "Entfernen", self, @selector(removeMissing:)), bm)];
+    [bottom addSubview:OVM(mt.scroll, CPViewWidthSizable | CPViewHeightSizable)];
+    [bottom addSubview:OVM(OTButton(CGRectMake(0, 130, 160, 26), "Vorschlag übernehmen", self, @selector(acceptSuggestion:)), bm)];
+    [bottom addSubview:OVM(OTButton(CGRectMake(165, 130, 80, 26), "Ablehnen", self, @selector(rejectSuggestion:)), bm)];
+    [bottom addSubview:OVM(OTButton(CGRectMake(250, 130, 150, 26), "Eigenen ergänzen …", self, @selector(addMissing:)), bm)];
+    [bottom addSubview:OVM(OTButton(CGRectMake(405, 130, 80, 26), "Entfernen", self, @selector(removeMissing:)), bm)];
+
+    [split addSubview:top];
+    [split addSubview:bottom];
+    [split setDelegate:self];
+    [_entriesBox addSubview:split];
+    _entriesSplit = split;
+    // gespeicherte Position des Trenners wiederherstellen
+    var savedPos = nil;
+    try { savedPos = parseFloat(window.localStorage.getItem("ontotrial.validation.split")); } catch (e) {}
+    window.setTimeout(function() { [split setPosition:(savedPos > 120 ? savedPos : 280) ofDividerAtIndex:0]; }, 0);
     [v addSubview:_entriesBox];
 
     _doneButton = OVM(OTButton(CGRectMake(x, 672, 180, 28), "Brief abschließen", self, @selector(toggleDone:)), CPViewMinXMargin | CPViewMinYMargin);
@@ -1133,8 +1174,7 @@ function OVAlert(aMessage, anInfo)
     {
         [_letterHeader setStringValue:@""];
         [_letterView setString:@""];
-        if (_letterWeb)
-            [_letterWeb setHidden:YES];
+        _letterShownId = nil;
         [_entriesBox setHidden:YES];
         [_checklistBox setHidden:YES];
         [_blindLabel setHidden:YES];
@@ -1145,10 +1185,7 @@ function OVAlert(aMessage, anInfo)
     [_letterHeader setStringValue:"Brief " + it.position + " · " + (it.pseudonym || "") + " · " +
                                   (it.reference_date || "") + " · " + (it.doc_source || "") +
                                   (it.double_review ? " · doppelt geprüft" : "")];
-    [_letterView setString:it.narrative || ""];
-    [_letterView scrollPoint:CGPointMake(0, 0)];
-    if (_letterWeb)
-        [_letterWeb setHidden:NO];
+
 
     // ohne Checkliste (Regressions-Datensatz) rücken die Einträge nach oben
     var eb = [_entriesBox frame], top = isStudy ? 190 : 5;
@@ -1236,6 +1273,7 @@ function OVAlert(aMessage, anInfo)
     [self _save:[{ entry_key: anEntry.key, judgment: aJudgment }] then:function() { [self _refreshItemRow]; }];
     if (shouldAdvance && row + 1 < _item.entries.length)
         [_entriesTable selectRowIndexes:[CPIndexSet indexSetWithIndex:row + 1] byExtendingSelection:NO];
+        [_entriesTable scrollRowToVisible:row + 1];
 }
 
 - (void)markCorrect:(id)sender
@@ -1682,7 +1720,18 @@ function OVAlert(aMessage, anInfo)
 {
     var row = [_missingTable selectedRow];
     var r = (row >= 0 && _mrows && row < _mrows.length) ? _mrows[row] : nil;
-    if (!r || r.kind !== "own" || ![self _requireReviewer])
+    if (!r)
+    {
+        OVAlert("Bitte zuerst eine Zeile in der Liste auswählen.");
+        return;
+    }
+    if (r.kind === "sugg")
+    {
+        // ein noch offener Vorschlag wird beim Entfernen abgelehnt
+        [self _decide:r.sugg decision:"rejected" extra:[]];
+        return;
+    }
+    if (![self _requireReviewer])
         return;
     var idx = -1;
     for (var i = 0; i < _missing.length; i++)
@@ -1772,6 +1821,7 @@ function OVAlert(aMessage, anInfo)
     [self _saveChecklist];
     if (row + 1 < _checklist.lines.length)
         [_checklistTable selectRowIndexes:[CPIndexSet indexSetWithIndex:row + 1] byExtendingSelection:NO];
+        [_checklistTable scrollRowToVisible:row + 1];
 }
 
 - (void)matchFound:(id)sender   { [self _setMatch:"found"]; }
@@ -1808,7 +1858,8 @@ function OVAlert(aMessage, anInfo)
     var rt = OVTable(CGRectMake(5, 212, 1260, 190), [["id", "Lauf", 45], ["started", "Gestartet", 135], ["mode", "Quelle", 120],
                                                     ["status", "Status", 95], ["f1", "F1", 65], ["precision", "Precision", 75],
                                                     ["recall", "Recall", 65], ["delta", "ΔF1 zur Basis", 95], ["verdict", "Ergebnis", 105],
-                                                    ["model", "Modell", 120], ["reference", "Referenz", 170], ["fingerprint", "Pipeline-Stand", 100], ["label", "Bezeichnung", 220]], self);
+                                                    ["model", "Modell", 140], ["duration", "Laufzeit", 80], ["perletter", "s/Brief (Median)", 105],
+                                                    ["reference", "Referenz", 170], ["fingerprint", "Pipeline-Stand", 100], ["label", "Bezeichnung", 220]], self);
     _runsTable = rt.table;
     [v addSubview:OVM(rt.scroll, CPViewWidthSizable)];
 
@@ -1832,6 +1883,8 @@ function OVAlert(aMessage, anInfo)
     var setId = _currentSet.id;
     OTGetJSON("/BBB/validation/sets/" + setId + "/status", 120.0, function(res, error)
     {
+        if (!_currentSet || _currentSet.id !== setId)
+            return;                                   // inzwischen anderer Datensatz gewählt
         if (!res || res.error)
         {
             _statusText = "Stand nicht abrufbar: " + (res && res.error ? res.error : "keine Antwort");
@@ -1920,7 +1973,7 @@ function OVAlert(aMessage, anInfo)
         if (res.running && res.job)
         {
             var jb = res.job;
-            var msg = jb.state === "inactive" ? "wartet auf einen Worker für die Warteschlange „validation“ (perl backend.pl minion worker -q validation -j 1)" :
+            var msg = jb.state === "inactive" ? "wartet auf einen Worker für die Warteschlange „validation“ (perl backend.pl minion worker -q validation -j 4)" :
                       (jb.worker_alive === 0 ? "hängt (Worker beendet)" :
                        "Brief " + (jb.current || "?") + " von " + (jb.total || "?") + (jb.step ? ", " + jb.step : "") + (jb.current_s !== null && jb.current_s !== undefined ? " (" + jb.current_s + " s)" : ""));
             L.push("KI-Ensemble: läuft, " + jb.progress + " % – " + msg);
@@ -1988,9 +2041,22 @@ function OVAlert(aMessage, anInfo)
 {
     if (!_currentSet)
         return;
-    OTGetJSON("/BBB/validation/sets/" + _currentSet.id + "/runs", 60.0, function(res, error)
+    var runsSetId = _currentSet.id;
+    OTGetJSON("/BBB/validation/sets/" + runsSetId + "/runs", 60.0, function(res, error)
     {
-        _runs = (res && res.length !== undefined) ? res : [];
+        if (!_currentSet || _currentSet.id !== runsSetId)
+            return;                                   // Antwort zu einem vorher gewählten Datensatz
+        if (!res || res.length === undefined)
+        {
+            // nicht still leer anzeigen: Läufe sind gespeichert, nur das Laden ist gescheitert
+            _runs = [];
+            [_runsTable reloadData];
+            [_runDetailView setString:"Die Läufe konnten nicht geladen werden: " + ((res && res.error) || error || "keine Antwort vom Server") +
+                                  "\n\nHäufigste Ursache nach einem Update: Die neue migrations/ontotrial.sql fehlt, die Datenbank hat noch das alte Schema. " +
+                                  "Datei kopieren und den Webserver neu starten; die Läufe selbst sind nicht verloren."];
+            return;
+        }
+        _runs = res;
         [_runsTable reloadData];
         _runsActive = NO;
         for (var i = 0; i < _runs.length; i++)
@@ -2000,7 +2066,7 @@ function OVAlert(aMessage, anInfo)
             {
                 _runsActive = YES;
                 [self _hudTask:hid name:"Regressionslauf " + r.id state:"active"
-                       message:(r.status === "queued" ? "wartet auf einen Worker für die Warteschlange „validation“ (perl backend.pl minion worker -q validation -j 1)" : "Brief für Brief") progress:r.progress || 0];
+                       message:(r.status === "queued" ? "wartet auf einen Worker für die Warteschlange „validation“ (perl backend.pl minion worker -q validation -j 4)" : "Brief für Brief") progress:r.progress || 0];
             }
             else if (_hudTasks[hid])
                 [self _hudTask:hid name:"" state:(r.status === "finished" ? "finished" : "failed")
@@ -2127,9 +2193,50 @@ function OVAlert(aMessage, anInfo)
 
 - (void)rejectSuggestion:(id)sender
 {
-    var s = [self _selectedSuggestion];
-    if (s)
-        [self _decide:s decision:"rejected" extra:[]];
+    var row = [_missingTable selectedRow];
+    var r = (row >= 0 && _mrows && row < _mrows.length) ? _mrows[row] : nil;
+    if (!r)
+    {
+        OVAlert("Bitte zuerst einen Vorschlag in der Liste auswählen.");
+        return;
+    }
+    if (r.kind === "sugg")
+    {
+        [self _decide:r.sugg decision:"rejected" extra:[]];
+        return;
+    }
+    // bereits übernommener Vorschlag: Übernahme zurücknehmen und als abgelehnt vermerken
+    var m = nil, idx = -1;
+    for (var i = 0; i < _missing.length; i++)
+        if (_missing[i].key === r.key)
+        {
+            m = _missing[i];
+            idx = i;
+        }
+    if (!m || !m.data.suggestion_id)
+    {
+        OVAlert("Das ist ein selbst ergänzter Eintrag.", "Zum Löschen „Entfernen“ verwenden.");
+        return;
+    }
+    var sugg = nil;
+    for (var k = 0; k < (_suggs || []).length; k++)
+        if (_suggs[k].id === m.data.suggestion_id)
+            sugg = _suggs[k];
+    m.data.deleted = 1;
+    _missing.splice(idx, 1);
+    delete _judgments[m.key];
+    var extra = [{ entry_key: m.key, judgment: m.data }];
+    if (sugg)
+        [self _decide:sugg decision:"rejected" extra:extra];
+    else
+    {
+        var d = { decision: "rejected", at: new Date().toISOString() };
+        _judgments["ai:" + m.data.suggestion_id] = d;
+        [self _buildMissingRows];
+        [_missingTable reloadData];
+        [self _renderLetter];
+        [self _save:extra.concat([{ entry_key: "ai:" + m.data.suggestion_id, judgment: d }]) then:nil];
+    }
 }
 
 
@@ -2141,10 +2248,13 @@ function OVAlert(aMessage, anInfo)
     if (!_item)
         return;
     var text = _item.narrative || "";
-    if (!_letterWeb)
+    if (_letterShownId !== _item.id || [_letterView string] !== text)
     {
         [_letterView setString:text];
-        return;
+        [_letterView scrollPoint:CGPointMake(0, 0)];
+        if (_letterShownId !== _item.id)
+            _searchIndex = -1;
+        _letterShownId = _item.id;
     }
     var marks = [];
     var entries = (_ensVisible && _item.entries) ? _item.entries : [];
@@ -2152,63 +2262,56 @@ function OVAlert(aMessage, anInfo)
     {
         var en = _ens[entries[i].key];
         if (en && en.quote)
-            marks.push({ key: "e:" + entries[i].key, quote: en.quote, cls: (en.verdict === "correct" ? "ok" : "err"), title: entries[i].label || "" });
+            marks.push({ key: "e:" + entries[i].key, quote: en.quote, cls: (en.verdict === "correct" ? "ok" : "err") });
     }
     for (var k = 0; k < (_mrows || []).length; k++)
         if (_mrows[k].quote)
-            marks.push({ key: "m:" + k, quote: _mrows[k].quote, cls: "miss", title: _mrows[k].label || "" });
+            marks.push({ key: "m:" + k, quote: _mrows[k].quote, cls: "miss" });
     var alias = {};
-    var html = OVLetterHTML(text, marks, alias);
+    _letterRanges = OVMarkRanges(text, marks, alias);
     _letterAlias = alias;
-    if (html !== _letterHTML)
+    _curMark = nil;
+    var storage = [_letterView textStorage];
+    var all = CPMakeRange(0, [storage length]);
+    [storage removeAttribute:CPBackgroundColorAttributeName range:all];
+    for (var r = 0; r < _letterRanges.length; r++)
     {
-        // nur neu laden, wenn sich Brief oder Belege geändert haben; Auswahl läuft über das DOM
-        _letterHTML = html;
-        if ([_letterWeb respondsToSelector:@selector(loadHTMLString:baseURL:)])
-            [_letterWeb loadHTMLString:html baseURL:nil];
-        else
-            [_letterWeb loadHTMLString:html];
+        var m = _letterRanges[r];
+        if (m.end <= [storage length])
+            [storage addAttribute:CPBackgroundColorAttributeName value:OVMarkColor(m.cls) range:CPMakeRange(m.start, m.end - m.start)];
     }
+    [self _applySearchHits:NO];
     [self _highlightSelection:0];
 }
 
-// ausgewählten Eintrag im Brief gelb hervorheben und dorthin scrollen, ohne neu zu laden
+// ausgewählten Eintrag gelb hinterlegen und dorthin scrollen
 - (void)_highlightSelection:(int)attempt
 {
-    if (!_letterWeb || !_item)
+    if (!_item || !_letterRanges)
         return;
+    var storage = [_letterView textStorage];
+    if (_curMark && _curMark.end <= [storage length])
+        [storage addAttribute:CPBackgroundColorAttributeName value:OVMarkColor(_curMark.cls) range:CPMakeRange(_curMark.start, _curMark.end - _curMark.start)];
+    _curMark = nil;
     var key = nil;
     if (_lastSelTable === _missingTable && [_missingTable selectedRow] >= 0)
         key = "m:" + [_missingTable selectedRow];
     else if ([_entriesTable selectedRow] >= 0 && _item.entries && _item.entries[[_entriesTable selectedRow]])
         key = "e:" + _item.entries[[_entriesTable selectedRow]].key;
-    var doc = nil;
-    try
-    {
-        var win = [_letterWeb respondsToSelector:@selector(DOMWindow)] ? [_letterWeb DOMWindow] : nil;
-        doc = win ? win.document : nil;
-    }
-    catch (e) { doc = nil; }
-    if (!doc || !doc.body || doc.readyState === "loading" || (_letterHTML && _letterHTML.indexOf("<mark") >= 0 && !doc.querySelector("mark")))
-    {
-        if (attempt < 20)
-            window.setTimeout(function() { [self _highlightSelection:attempt + 1]; }, 80);
-        return;
-    }
-    var old = doc.querySelectorAll("mark.cur");
-    for (var i = 0; i < old.length; i++)
-        old[i].className = old[i].className.replace(/\s*\bcur\b/g, "");
     var target = key && _letterAlias ? _letterAlias[key] : nil;
     if (!target)
         return;
-    var marks = doc.querySelectorAll("mark");
-    for (var k = 0; k < marks.length; k++)
-        if (marks[k].getAttribute("data-k") === target)
+    for (var i = 0; i < _letterRanges.length; i++)
+        if (_letterRanges[i].key === target)
         {
-            marks[k].className += " cur";
-            if (marks[k].scrollIntoView)
-                marks[k].scrollIntoView({ block: "center" });
-            break;
+            var m = _letterRanges[i];
+            if (m.end > [storage length])
+                return;
+            var range = CPMakeRange(m.start, m.end - m.start);
+            [storage addAttribute:CPBackgroundColorAttributeName value:OVMarkColor("cur") range:range];
+            [_letterView scrollRangeToVisible:range];
+            _curMark = m;
+            return;
         }
 }
 
@@ -2219,7 +2322,8 @@ function OVAlert(aMessage, anInfo)
     {
         var d = _missing[i].data;
         _mrows.push({ kind: "own", key: _missing[i].key, state: d.source === "ai" ? "übernommen" : "eigener", domain: d.domain, label: d.label,
-                      code: d.code, side: d.side, date: d.date, value: d.value, quote: d.quote || "", votes: d.votes || "" });
+                      code: d.code, side: d.side, date: d.date, value: OVValueText(d.value, d.unit), excl: d.excluded ? "ja" : "",
+                      quote: d.quote || "", votes: d.votes || "" });
     }
     if (_ensVisible)
         for (var k = 0; k < (_suggs || []).length; k++)
@@ -2228,7 +2332,8 @@ function OVAlert(aMessage, anInfo)
             if (dec && dec.decision === "accepted")
                 continue;   // steht schon als übernommener Eintrag oben
             _mrows.push({ kind: "sugg", sugg: s, state: dec ? "abgelehnt" : "Vorschlag", domain: p.domain, label: p.label, code: p.code,
-                          side: p.side, date: p.date, value: p.value, quote: p.quote || "", votes: (p.votes || 0) + "/" + (p.n_verifiers || "?") });
+                          side: p.side, date: p.date, value: OVValueText(p.value, p.unit), excl: p.excluded ? "ja" : "",
+                          quote: p.quote || "", votes: (p.votes || 0) + "/" + (p.n_verifiers || "?") });
         }
 }
 
@@ -2275,6 +2380,101 @@ function OVAlert(aMessage, anInfo)
             [self loadEnsembleStatus];
         });
     }];
+}
+
+- (float)splitView:(CPSplitView)aSplitView constrainMinCoordinate:(float)proposedMin ofSubviewAt:(int)index
+{
+    return aSplitView === _entriesSplit ? 140.0 : proposedMin;     // Einträge: Tabelle plus zwei Knopfzeilen
+}
+
+- (float)splitView:(CPSplitView)aSplitView constrainMaxCoordinate:(float)proposedMax ofSubviewAt:(int)index
+{
+    return aSplitView === _entriesSplit ? [aSplitView frame].size.height - 110.0 : proposedMax;   // Vorschläge: mindestens drei Zeilen
+}
+
+- (void)splitViewDidResizeSubviews:(CPNotification)aNotification
+{
+    if ([aNotification object] !== _entriesSplit)
+        return;
+    var top = [[_entriesSplit subviews] objectAtIndex:0];
+    try { window.localStorage.setItem("ontotrial.validation.split", String([top frame].size.height)); } catch (e) {}
+}
+
+// Ausgewählten Code im Ontologie-Browser des Hauptfensters nachschlagen
+- (void)_showCodeInOntologyBrowser
+{
+    var code = nil;
+    if (_lastSelTable === _missingTable)
+    {
+        var r = _mrows ? _mrows[[_missingTable selectedRow]] : nil;
+        code = r ? r.code : nil;
+    }
+    else if (_item && _item.entries)
+    {
+        var e = _item.entries[[_entriesTable selectedRow]];
+        code = e ? e.code : nil;
+    }
+    if (code && _app && [_app respondsToSelector:@selector(searchForHPOTerm:)])
+        [_app searchForHPOTerm:code];
+}
+
+// --- Stichwortsuche im Brieftext -------------------------------------------------
+
+- (void)controlTextDidChange:(CPNotification)aNotification
+{
+    if ([aNotification object] !== _letterSearch)
+        return;
+    _searchIndex = -1;
+    [self _renderLetter];          // alte Treffer entfernen, neue hinterlegen
+    [self searchInLetter:nil];
+}
+
+// Eingabetaste im Suchfeld: zum nächsten Treffer
+- (void)searchInLetter:(id)sender
+{
+    var hits = [self _computeSearchHits];
+    if (!hits.length)
+    {
+        [_letterSearchInfo setStringValue:(OTTrim([_letterSearch stringValue]).length ? "0" : "")];
+        return;
+    }
+    if (typeof _searchIndex !== "number" || isNaN(_searchIndex))
+        _searchIndex = -1;
+    _searchIndex = (_searchIndex + 1) % hits.length;
+    [self _applySearchHits:YES];
+}
+
+- (id)_computeSearchHits
+{
+    var term = OTTrim([_letterSearch stringValue] || "").toLowerCase(), text = ([_letterView string] || "").toLowerCase();
+    _searchHits = [];
+    if (term.length < 2)
+        return _searchHits;
+    var pos = text.indexOf(term);
+    while (pos >= 0 && _searchHits.length < 500)
+    {
+        _searchHits.push(CPMakeRange(pos, term.length));
+        pos = text.indexOf(term, pos + term.length);
+    }
+    return _searchHits;
+}
+
+- (void)_applySearchHits:(BOOL)shouldScroll
+{
+    var hits = [self _computeSearchHits], storage = [_letterView textStorage];
+    if (!hits.length)
+    {
+        [_letterSearchInfo setStringValue:(OTTrim([_letterSearch stringValue] || "").length >= 2 ? "0" : "")];
+        return;
+    }
+    if (_searchIndex >= hits.length)
+        _searchIndex = 0;
+    var other = [CPColor colorWithRed:0.93 green:0.80 blue:1.0 alpha:1.0], current = [CPColor colorWithRed:0.75 green:0.50 blue:1.0 alpha:1.0];
+    for (var i = 0; i < hits.length; i++)
+        [storage addAttribute:CPBackgroundColorAttributeName value:(i === _searchIndex ? current : other) range:hits[i]];
+    [_letterSearchInfo setStringValue:(_searchIndex >= 0 ? (_searchIndex + 1) + "/" : "") + hits.length];
+    if (shouldScroll && _searchIndex >= 0)
+        [_letterView scrollRangeToVisible:hits[_searchIndex]];
 }
 
 - (void)_prefetchAfter:(id)anItemId
@@ -2549,17 +2749,22 @@ function OVAlert(aMessage, anInfo)
     var setId = _currentSet.id;
     // Extraktionsmodell aus der Auswahl „LLM Model“ im Hauptfenster
     var model = (aMode === "reextract" && _app && [_app respondsToSelector:@selector(selectedModel)]) ? [_app selectedModel] : nil;
-    [OVDialog prompt:(aMode === "stored" ? "Gespeicherte Phenopackets gegen die Referenz prüfen" : "Alle " + _currentSet.n_items + " Briefe mit " + (model || "dem Standardmodell") + " neu extrahieren und prüfen")
+    // Deep Mode aus dem Schalter im Hauptfenster
+    var deep = aMode === "reextract" && _app && [_app respondsToSelector:@selector(deepModeEnabled)] && [_app deepModeEnabled];
+    var what = (model || "dem Standardmodell") + (deep ? " im Deep Mode" : "");
+    [OVDialog prompt:(aMode === "stored" ? "Gespeicherte Phenopackets gegen die Referenz prüfen" : "Alle " + _currentSet.n_items + " Briefe mit " + what + " neu extrahieren und prüfen")
                 info:(aMode === "stored" ? "Bezeichnung des Laufs, z. B. „Bestand vor Neu-Extraktion“:" :
                       (noRef ? "Der Datensatz hat noch keine Referenz: Der Lauf speichert nur die Extraktionen. Danach lässt er sich mit „Lauf als Referenz einfrieren …“ zur Pipeline-Referenz machen. " : "") +
-                      "Das Modell kommt aus der Auswahl „LLM Model“ oben rechts im Hauptfenster. Bezeichnung des Laufs, z. B. „" + (model || "gpt-oss-120b") + " Lauf 1“. Die Neu-Extraktion dauert.")
-               value:(model ? model + " " : "") ok:"Lauf starten" then:function(label)
+                      "Modell und Deep Mode kommen aus der Auswahl „LLM Model“ und dem Schalter „Deep Mode“ im Hauptfenster. Bezeichnung des Laufs, z. B. „" + (model || "gpt-oss-120b") + (deep ? " Deep" : "") + " Lauf 1“. Die Neu-Extraktion dauert" + (deep ? ", im Deep Mode etwa doppelt so lange." : "."))
+               value:(model ? model + (deep ? " Deep " : " ") : "") ok:"Lauf starten" then:function(label)
     {
         if (label === nil)
             return;
         var payload = { mode: aMode, label: label };
         if (model)
             payload.model = model;
+        if (deep)
+            payload.deep_mode = 1;
         OTPostJSON("/BBB/validation/sets/" + setId + "/runs", payload, 60.0, function(res, error)
         {
             if (!res || res.error)
@@ -2636,7 +2841,7 @@ function OVAlert(aMessage, anInfo)
     if (r.error)
         L.push("Fehler: " + r.error);
     var fp = r.fingerprint || {};
-    L.push("Pipeline-Stand " + (fp.hash || "–") + "   Modell " + (r.mode === "stored" ? "Bestand" : (fp.model || "–")) + "   Git " + (fp.git || "–"));
+    L.push("Pipeline-Stand " + (fp.hash || "–") + "   Modell " + (r.mode === "stored" ? "Bestand" : (fp.model || "–") + (fp.deep_mode ? " (Deep Mode)" : "")) + "   Git " + (fp.git || "–"));
     L.push("Referenz " + [self _referenceText:fp.reference] + (fp.reference && fp.reference.frozen_by ? ", eingefroren von " + fp.reference.frozen_by : ""));
     var m = r.metrics;
     if (m && m.without_reference)
@@ -2902,6 +3107,8 @@ function OVAlert(aMessage, anInfo)
                 if (!en)
                     return "";
                 var votes = " (" + (en.verdict === "correct" ? en.ok : en.err) + "/" + en.n + ")";
+                if (en.derived && en.verdict === "correct")
+                    return "berechnet, korrekt" + votes;
                 return en.verdict === "correct" ? "korrekt" + votes : (en.verdict === "split" ? "uneinig (" + en.ok + ":" + en.err + ")" : "⚑ " + (en.problem || "Fehler") + votes);
             case "others":
                 if (!_item.others)
@@ -2959,7 +3166,9 @@ function OVAlert(aMessage, anInfo)
         var all = (r.metrics && r.metrics.all) ? r.metrics.all : {};
         switch (ident)
         {
-            case "started":     return String(r.started_at || "").substring(0, 16);
+            case "started":     return r.status === "queued" ? "wartet" : String(r.started_at || "").substring(0, 16);
+            case "duration":    return r.status === "queued" || r.duration_s === null || r.duration_s === undefined ? "" : OVDuration(r.duration_s);
+            case "perletter":   return r.median_s === null || r.median_s === undefined ? "" : String(r.median_s).replace(".", ",") + " s";
             case "mode":        return r.mode === "stored" ? "gespeichert" : "neu extrahiert";
             case "status":      return r.status === "running" ? "läuft " + r.progress + " %" : (r.status === "finished" ? "fertig" : r.status);
             case "f1":          return OVPct(all.f1);
@@ -2979,7 +3188,7 @@ function OVAlert(aMessage, anInfo)
                     return "nicht vergleichbar";
                 return r.comparison.verdict === "ok" ? "ok" : "Regression";
             case "fingerprint": return r.fingerprint ? (r.fingerprint.hash || "") : "";
-            case "model":       return r.mode === "stored" ? "Bestand" : (r.fingerprint ? (r.fingerprint.model || "") : "");
+            case "model":       return r.mode === "stored" ? "Bestand" : (r.fingerprint ? (r.fingerprint.model || "") + (r.fingerprint.deep_mode ? " (Deep)" : "") : "");
             case "reference":   return [self _referenceText:(r.fingerprint ? r.fingerprint.reference : nil)];
             default:            return r[ident] === undefined || r[ident] === null ? @"" : String(r[ident]);
         }
@@ -3002,6 +3211,7 @@ function OVAlert(aMessage, anInfo)
     {
         _lastSelTable = table;
         [self _highlightSelection:0];
+        [self _showCodeInOntologyBrowser];
     }
 }
 

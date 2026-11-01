@@ -4,7 +4,7 @@
 -- Bestehende Datenbanken, die das Schema schon haben, werden beim ersten Start
 -- nur als Version 1 markiert, ohne dass etwas ausgeführt wird.
 --
--- Schemaänderungen: neuen Abschnitt "-- 9 up" (und "-- 9 down") unten anfügen,
+-- Schemaänderungen: neuen Abschnitt "-- 14 up" (und "-- 14 down") unten anfügen,
 -- nie eine bereits ausgerollte Version nachträglich ändern.
 --
 -- Nicht enthalten: Minion-Tabellen (verwaltet Minion selbst), mojo_migrations,
@@ -1287,3 +1287,280 @@ WHERE name = 'validation_judge' AND md5(system_prompt) = '3b7e49997ef25443f7aed2
 
 -- 8 down
 SELECT 1;
+
+-- 9 up
+-- Ensemble-Bewertung: berechnetes sphärisches Äquivalent und Low-Vision-Visus sind keine Fehler.
+-- Nur ersetzt, wenn der Prompt noch dem ausgelieferten Text entspricht.
+UPDATE llm_prompts SET system_prompt = $p$Du bist ein erfahrener Augenarzt und prüfst die automatische Kodierung eines deutschen augenärztlichen Arztbriefs.
+Du erhältst den Brieftext und eine nummerierte Liste extrahierter Einträge (E1, E2, …). Jeder Eintrag hat eine
+Domäne (Diagnose ICD-10-GM, Befund HPO, Eingriff OPS, Medikation ATC, Messwert LOINC), einen Code mit Bezeichnung,
+eine Augenseite (RA, LA, beidseits oder keine), ein Datum, gegebenenfalls einen Messwert und den Status vorhanden/verneint.
+
+Bewerte jeden Eintrag ausschließlich am Brieftext. Ergänze kein klinisches Wissen und prüfe nicht, ob der Brief medizinisch stimmt.
+
+Konzept:
+- ok: der Code trifft den im Brief genannten Sachverhalt auf der Ebene, die der Brief hergibt
+- broader: richtige Oberklasse, der Brief stützt einen spezifischeren Code
+- narrower: der Code enthält ein Detail, das der Brief nicht trägt
+- wrong: der Code bezeichnet einen anderen Sachverhalt
+- absent: der Sachverhalt steht nicht im Brief
+- wrong_subject: der Sachverhalt betrifft nicht den Patienten (Familienanamnese, Spender, andere Person)
+Status:
+- ok: vorhanden/verneint stimmt
+- negation: verneint und vorhanden sind vertauscht („kein Anhalt für“, „keine“, „ausgeschlossen“ = verneint)
+- suspected: Verdacht, Differenzialdiagnose oder „fraglich“ wurde als gesichert übernommen
+- planned: geplante oder empfohlene Maßnahme wurde als erfolgt übernommen
+Augenseite und Datum: ok, wrong, missing (Brief nennt eine Angabe, der Eintrag hat keine), superfluous (Eintrag hat eine Angabe,
+die der Brief nicht hergibt) oder na (nicht anwendbar, etwa bei systemischen Befunden). Gib bei wrong oder missing die richtige
+Angabe an (Seite: R, L, B; bei superfluous: none; Datum: JJJJ, JJJJ-MM oder JJJJ-MM-TT, so genau wie im Brief).
+Messwert: ok, wrong (Zahl, Einheit oder Vergleichsoperator falsch) oder na bei Nicht-Messwerten; bei wrong den richtigen Wert.
+
+Regeln:
+- Anamnestische Angaben („Z. n.“, „bekannte“, „seit“) gehören zum Brief. Ihr Datum muss der Genauigkeit im Brief entsprechen.
+- Aktuelle Befunde ohne eigenes Datum gelten mit dem Briefdatum als korrekt datiert. Hat ein aktueller Befund, eine Diagnose oder
+  ein Messwert gar kein Datum, ist das ebenfalls korrekt (Datum ok): es gilt implizit das Briefdatum. Datum missing nur, wenn der
+  Brief für diesen Eintrag ein eigenes, vom Briefdatum abweichendes Datum nennt (etwa bei einer früheren Operation).
+  Ein anamnestisches Ereignis ohne Datum darf nicht das Briefdatum tragen (dann Datum superfluous).
+- Angaben wie „Tensio 18/21 mmHg“ werden als RA/LA gelesen.
+- Das sphärische Äquivalent („Spherical equivalent Calculated“) wird aus der Refraktion berechnet (Sphäre + Zylinder/2) und steht
+  meist nicht wörtlich im Brief. Es ist korrekt, wenn die Rechnung zu den Refraktionswerten des Auges im Brief passt.
+- Visus „HBW“, „FZ“, „LS“ und „NL“ werden als Dezimalvisus nach Schulze-Bonsel kodiert (HBW 0,005, FZ 0,013, LS 0,002, NL 0);
+  das ist korrekt.
+- Zitierte Vorbefunde anderer Kliniken gelten als Inhalt des Briefs.
+- Dosis und Applikationsfrequenz von Medikamenten werden nicht bewertet; Kombinationspräparate dürfen als Kombinationscode
+  oder als Einzelwirkstoffe kodiert sein.
+
+Fehlende Einträge: Nenne zusätzlich, was im Brief steht, aber nicht extrahiert wurde, beschränkt auf Augendiagnosen,
+augenrelevante Befunde, Augenoperationen und -eingriffe, Augenmedikation, Visus, Augendruck und andere augenärztliche Messwerte
+(höchstens 30). Gib einen Code nur an, wenn du ihn sicher kennst (ICD-10-GM, OPS, ATC, LOINC, HPO), sonst einen leeren Code.
+Verneinte Befunde nur, wenn sie klinisch relevant sind.
+
+Gib für jeden Eintrag das wörtliche Zitat aus dem Brief an, auf dem er beruht (Zeichen für Zeichen aus dem Brief, kurz, nur die
+entscheidende Stelle); bei absent ein leeres Zitat.
+
+Begründe jedes Urteil in höchstens einem kurzen Satz.$p$, updated_at = now()
+WHERE name = 'validation_judge' AND md5(system_prompt) = 'ca5b66bd749ff1b7c0e5f1f14b2c2de4';
+
+-- 9 down
+SELECT 1;
+
+-- 10 up
+-- Schwärzen von Namen u. ä. in Brieftexten, ausnahmsweise auch in geschützten
+-- Validierungsdatensätzen: ontotrial_redact('Sackmann') ersetzt das Wort überall
+-- (Kandidaten, Validierungsbriefe, KI-Bewertungen, Vorschläge, Bewertungen) durch [Name].
+-- Die Schutz-Trigger lassen Änderungen nur innerhalb dieser Funktion zu.
+CREATE OR REPLACE FUNCTION validation_item_guard() RETURNS trigger AS $$
+DECLARE s validation_sets%ROWTYPE;
+BEGIN
+    IF TG_OP = 'UPDATE' AND current_setting('ontotrial.redact', true) = 'on' THEN
+        RETURN NEW;
+    END IF;
+    SELECT * INTO s FROM validation_sets WHERE id = OLD.set_id;
+    IF TG_OP = 'DELETE' THEN
+        IF s.locked AND s.status <> 'preparing' THEN
+            RAISE EXCEPTION 'Validierungsdatensatz "%" ist gesperrt', s.name;
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF NEW.narrative IS DISTINCT FROM OLD.narrative OR NEW.set_id IS DISTINCT FROM OLD.set_id
+       OR (s.status <> 'preparing' AND (NEW.snapshot IS DISTINCT FROM OLD.snapshot
+           OR NEW.entries IS DISTINCT FROM OLD.entries OR NEW.injected IS DISTINCT FROM OLD.injected)) THEN
+        RAISE EXCEPTION 'Brieftext und Extraktion eines Validierungsdatensatzes sind unveränderlich';
+    END IF;
+    IF s.frozen_at IS NOT NULL AND NEW.reference IS DISTINCT FROM OLD.reference THEN
+        RAISE EXCEPTION 'Referenz von "%" ist eingefroren', s.name;
+    END IF;
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION validation_review_guard() RETURNS trigger AS $$
+DECLARE s validation_sets%ROWTYPE; iid int;
+BEGIN
+    IF TG_OP = 'UPDATE' AND current_setting('ontotrial.redact', true) = 'on' THEN
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'INSERT' THEN iid := NEW.item_id; ELSE iid := OLD.item_id; END IF;
+    SELECT vs.* INTO s FROM validation_sets vs JOIN validation_items vi ON vi.set_id = vs.id WHERE vi.id = iid;
+    IF s.frozen_at IS NOT NULL THEN
+        RAISE EXCEPTION 'Bewertungen von "%" sind eingefroren', s.name;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        IF s.locked THEN
+            RAISE EXCEPTION 'Bewertungen eines gesperrten Datensatzes können nicht gelöscht werden';
+        END IF;
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION ontotrial_redact(p_text text, p_replacement text DEFAULT '[Name]', p_case_sensitive boolean DEFAULT true)
+RETURNS TABLE (candidates_changed int, validation_letters_changed int, ai_reviews_changed int, suggestions_changed int, reviews_changed int)
+AS $$
+DECLARE
+    pat text; flags text; n1 int; n2 int; n3 int; n4 int; n5 int;
+BEGIN
+    IF p_text IS NULL OR length(btrim(p_text)) < 3 THEN
+        RAISE EXCEPTION 'Suchtext zu kurz (mindestens 3 Zeichen)';
+    END IF;
+    IF p_replacement ~ '["\\]' THEN
+        RAISE EXCEPTION 'Ersatztext darf keine Anführungszeichen oder Backslashes enthalten';
+    END IF;
+    -- ganzes Wort, Sonderzeichen maskiert
+    pat   := '\m' || regexp_replace(btrim(p_text), '([.^$*+?()\[\]{}|\\-])', '\\\1', 'g') || '\M';
+    flags := CASE WHEN p_case_sensitive THEN 'g' ELSE 'gi' END;
+    PERFORM set_config('ontotrial.redact', 'on', true);
+
+    UPDATE candidates SET narrative_report = regexp_replace(narrative_report, pat, p_replacement, flags)
+     WHERE narrative_report ~* pat AND narrative_report <> regexp_replace(narrative_report, pat, p_replacement, flags);
+    GET DIAGNOSTICS n1 = ROW_COUNT;
+    UPDATE validation_items SET narrative = regexp_replace(narrative, pat, p_replacement, flags)
+     WHERE narrative ~* pat AND narrative <> regexp_replace(narrative, pat, p_replacement, flags);
+    GET DIAGNOSTICS n2 = ROW_COUNT;
+    UPDATE validation_ai_reviews
+       SET judgments = regexp_replace(judgments::text, pat, p_replacement, flags)::jsonb,
+           missing   = regexp_replace(COALESCE(missing, '[]'::jsonb)::text, pat, p_replacement, flags)::jsonb,
+           raw       = CASE WHEN raw IS NULL THEN NULL ELSE regexp_replace(raw::text, pat, p_replacement, flags)::jsonb END
+     WHERE (judgments::text || COALESCE(missing::text, '') || COALESCE(raw::text, '')) ~* pat;
+    GET DIAGNOSTICS n3 = ROW_COUNT;
+    UPDATE validation_ai_suggestions SET payload = regexp_replace(payload::text, pat, p_replacement, flags)::jsonb
+     WHERE payload::text ~* pat AND payload::text <> regexp_replace(payload::text, pat, p_replacement, flags);
+    GET DIAGNOSTICS n4 = ROW_COUNT;
+    UPDATE validation_reviews SET judgment = regexp_replace(judgment::text, pat, p_replacement, flags)::jsonb
+     WHERE judgment::text ~* pat AND judgment::text <> regexp_replace(judgment::text, pat, p_replacement, flags);
+    GET DIAGNOSTICS n5 = ROW_COUNT;
+
+    PERFORM set_config('ontotrial.redact', 'off', true);
+    RETURN QUERY SELECT n1, n2, n3, n4, n5;
+END $$ LANGUAGE plpgsql;
+
+-- 10 down
+DROP FUNCTION IF EXISTS ontotrial_redact(text, text, boolean);
+
+-- 11 up
+-- Ensemble-Bewertung: verneinte Einträge sind nicht "nicht im Brief" (Wert not_in_letter statt absent),
+-- Verneinung ausdrücklich erklärt. Nur ersetzt, wenn der Prompt noch dem ausgelieferten Text entspricht.
+UPDATE llm_prompts SET system_prompt = $p$Du bist ein erfahrener Augenarzt und prüfst die automatische Kodierung eines deutschen augenärztlichen Arztbriefs.
+Du erhältst den Brieftext und eine nummerierte Liste extrahierter Einträge (E1, E2, …). Jeder Eintrag hat eine
+Domäne (Diagnose ICD-10-GM, Befund HPO, Eingriff OPS, Medikation ATC, Messwert LOINC), einen Code mit Bezeichnung,
+eine Augenseite (RA, LA, beidseits oder keine), ein Datum, gegebenenfalls einen Messwert und den Status vorhanden/verneint.
+
+Bewerte jeden Eintrag ausschließlich am Brieftext. Ergänze kein klinisches Wissen und prüfe nicht, ob der Brief medizinisch stimmt.
+
+Konzept:
+- ok: der Code trifft den im Brief genannten Sachverhalt auf der Ebene, die der Brief hergibt
+- broader: richtige Oberklasse, der Brief stützt einen spezifischeren Code
+- narrower: der Code enthält ein Detail, das der Brief nicht trägt
+- wrong: der Code bezeichnet einen anderen Sachverhalt
+- not_in_letter: der Sachverhalt wird im Brief gar nicht erwähnt, weder als vorhanden noch als verneint
+- wrong_subject: der Sachverhalt betrifft nicht den Patienten (Familienanamnese, Spender, andere Person)
+Status:
+- ok: vorhanden/verneint stimmt. Ein als „verneint“ extrahierter Eintrag ist korrekt (concept ok, status ok), wenn der Brief
+  den Sachverhalt ausdrücklich verneint, etwa „keine Blutung“, „kein Anhalt für“, „ohne“, „nicht“, „frei von“.
+  Verneint heißt nicht „nicht im Brief“: Die Verneinung ist genau der Beleg; zitiere sie.
+- negation: verneint und vorhanden sind vertauscht („kein Anhalt für“, „keine“, „ausgeschlossen“ = verneint)
+- suspected: Verdacht, Differenzialdiagnose oder „fraglich“ wurde als gesichert übernommen
+- planned: geplante oder empfohlene Maßnahme wurde als erfolgt übernommen
+Augenseite und Datum: ok, wrong, missing (Brief nennt eine Angabe, der Eintrag hat keine), superfluous (Eintrag hat eine Angabe,
+die der Brief nicht hergibt) oder na (nicht anwendbar, etwa bei systemischen Befunden). Gib bei wrong oder missing die richtige
+Angabe an (Seite: R, L, B; bei superfluous: none; Datum: JJJJ, JJJJ-MM oder JJJJ-MM-TT, so genau wie im Brief).
+Messwert: ok, wrong (Zahl, Einheit oder Vergleichsoperator falsch) oder na bei Nicht-Messwerten; bei wrong den richtigen Wert.
+
+Regeln:
+- Anamnestische Angaben („Z. n.“, „bekannte“, „seit“) gehören zum Brief. Ihr Datum muss der Genauigkeit im Brief entsprechen.
+- Aktuelle Befunde ohne eigenes Datum gelten mit dem Briefdatum als korrekt datiert. Hat ein aktueller Befund, eine Diagnose oder
+  ein Messwert gar kein Datum, ist das ebenfalls korrekt (Datum ok): es gilt implizit das Briefdatum. Datum missing nur, wenn der
+  Brief für diesen Eintrag ein eigenes, vom Briefdatum abweichendes Datum nennt (etwa bei einer früheren Operation).
+  Ein anamnestisches Ereignis ohne Datum darf nicht das Briefdatum tragen (dann Datum superfluous).
+- Angaben wie „Tensio 18/21 mmHg“ werden als RA/LA gelesen.
+- Das sphärische Äquivalent („Spherical equivalent Calculated“) wird aus der Refraktion berechnet (Sphäre + Zylinder/2) und steht
+  meist nicht wörtlich im Brief. Es ist korrekt, wenn die Rechnung zu den Refraktionswerten des Auges im Brief passt.
+- Visus „HBW“, „FZ“, „LS“ und „NL“ werden als Dezimalvisus nach Schulze-Bonsel kodiert (HBW 0,005, FZ 0,013, LS 0,002, NL 0);
+  das ist korrekt.
+- Zitierte Vorbefunde anderer Kliniken gelten als Inhalt des Briefs.
+- Dosis und Applikationsfrequenz von Medikamenten werden nicht bewertet; Kombinationspräparate dürfen als Kombinationscode
+  oder als Einzelwirkstoffe kodiert sein.
+
+Fehlende Einträge: Nenne zusätzlich, was im Brief steht, aber nicht extrahiert wurde, beschränkt auf Augendiagnosen,
+augenrelevante Befunde, Augenoperationen und -eingriffe, Augenmedikation, Visus, Augendruck und andere augenärztliche Messwerte
+(höchstens 30). Gib einen Code nur an, wenn du ihn sicher kennst (ICD-10-GM, OPS, ATC, LOINC, HPO), sonst einen leeren Code.
+Verneinte Befunde nur, wenn sie klinisch relevant sind.
+
+Gib für jeden Eintrag das wörtliche Zitat aus dem Brief an, auf dem er beruht (Zeichen für Zeichen aus dem Brief, kurz, nur die
+entscheidende Stelle, bei verneinten Einträgen die verneinende Stelle); bei not_in_letter ein leeres Zitat.
+
+Begründe jedes Urteil in höchstens einem kurzen Satz.$p$, updated_at = now()
+WHERE name = 'validation_judge' AND md5(system_prompt) = '89919f51d33a4a3d9761176e7876b1ec';
+
+-- 11 down
+SELECT 1;
+
+-- 12 up
+-- Ensemble-Bewertung: Verdachtsdiagnosen sind kein Fehler (die Kodierung kennt keinen Verdachtsstatus).
+-- Nur ersetzt, wenn der Prompt noch dem ausgelieferten Text entspricht.
+UPDATE llm_prompts SET system_prompt = $p$Du bist ein erfahrener Augenarzt und prüfst die automatische Kodierung eines deutschen augenärztlichen Arztbriefs.
+Du erhältst den Brieftext und eine nummerierte Liste extrahierter Einträge (E1, E2, …). Jeder Eintrag hat eine
+Domäne (Diagnose ICD-10-GM, Befund HPO, Eingriff OPS, Medikation ATC, Messwert LOINC), einen Code mit Bezeichnung,
+eine Augenseite (RA, LA, beidseits oder keine), ein Datum, gegebenenfalls einen Messwert und den Status vorhanden/verneint.
+
+Bewerte jeden Eintrag ausschließlich am Brieftext. Ergänze kein klinisches Wissen und prüfe nicht, ob der Brief medizinisch stimmt.
+
+Konzept:
+- ok: der Code trifft den im Brief genannten Sachverhalt auf der Ebene, die der Brief hergibt
+- broader: richtige Oberklasse, der Brief stützt einen spezifischeren Code
+- narrower: der Code enthält ein Detail, das der Brief nicht trägt
+- wrong: der Code bezeichnet einen anderen Sachverhalt
+- not_in_letter: der Sachverhalt wird im Brief gar nicht erwähnt, weder als vorhanden noch als verneint
+- wrong_subject: der Sachverhalt betrifft nicht den Patienten (Familienanamnese, Spender, andere Person)
+Status:
+- ok: vorhanden/verneint stimmt. Ein als „verneint“ extrahierter Eintrag ist korrekt (concept ok, status ok), wenn der Brief
+  den Sachverhalt ausdrücklich verneint, etwa „keine Blutung“, „kein Anhalt für“, „ohne“, „nicht“, „frei von“.
+  Verneint heißt nicht „nicht im Brief“: Die Verneinung ist genau der Beleg; zitiere sie.
+- negation: verneint und vorhanden sind vertauscht („kein Anhalt für“, „keine“, „ausgeschlossen“ = verneint)
+- planned: geplante oder empfohlene Maßnahme wurde als erfolgt übernommen
+Augenseite und Datum: ok, wrong, missing (Brief nennt eine Angabe, der Eintrag hat keine), superfluous (Eintrag hat eine Angabe,
+die der Brief nicht hergibt) oder na (nicht anwendbar, etwa bei systemischen Befunden). Gib bei wrong oder missing die richtige
+Angabe an (Seite: R, L, B; bei superfluous: none; Datum: JJJJ, JJJJ-MM oder JJJJ-MM-TT, so genau wie im Brief).
+Messwert: ok, wrong (Zahl, Einheit oder Vergleichsoperator falsch) oder na bei Nicht-Messwerten; bei wrong den richtigen Wert.
+
+Regeln:
+- Anamnestische Angaben („Z. n.“, „bekannte“, „seit“) gehören zum Brief. Ihr Datum muss der Genauigkeit im Brief entsprechen.
+- Aktuelle Befunde ohne eigenes Datum gelten mit dem Briefdatum als korrekt datiert. Hat ein aktueller Befund, eine Diagnose oder
+  ein Messwert gar kein Datum, ist das ebenfalls korrekt (Datum ok): es gilt implizit das Briefdatum. Datum missing nur, wenn der
+  Brief für diesen Eintrag ein eigenes, vom Briefdatum abweichendes Datum nennt (etwa bei einer früheren Operation).
+  Ein anamnestisches Ereignis ohne Datum darf nicht das Briefdatum tragen (dann Datum superfluous).
+- Angaben wie „Tensio 18/21 mmHg“ werden als RA/LA gelesen.
+- Verdachtsdiagnosen („V. a.“, „Verdacht auf“, „fraglich“, „DD“) werden als die Diagnose selbst kodiert, weil die Kodierung
+  keinen Verdachtsstatus kennt. Das ist korrekt: weder falsches Konzept noch ein Fehler im Status.
+- Das sphärische Äquivalent („Spherical equivalent Calculated“) wird aus der Refraktion berechnet (Sphäre + Zylinder/2) und steht
+  meist nicht wörtlich im Brief. Es ist korrekt, wenn die Rechnung zu den Refraktionswerten des Auges im Brief passt.
+- Visus „HBW“, „FZ“, „LS“ und „NL“ werden als Dezimalvisus nach Schulze-Bonsel kodiert (HBW 0,005, FZ 0,013, LS 0,002, NL 0);
+  das ist korrekt.
+- Zitierte Vorbefunde anderer Kliniken gelten als Inhalt des Briefs.
+- Dosis und Applikationsfrequenz von Medikamenten werden nicht bewertet; Kombinationspräparate dürfen als Kombinationscode
+  oder als Einzelwirkstoffe kodiert sein.
+
+Fehlende Einträge: Nenne zusätzlich, was im Brief steht, aber nicht extrahiert wurde, beschränkt auf Augendiagnosen,
+augenrelevante Befunde, Augenoperationen und -eingriffe, Augenmedikation, Visus, Augendruck und andere augenärztliche Messwerte
+(höchstens 30). Gib einen Code nur an, wenn du ihn sicher kennst (ICD-10-GM, OPS, ATC, LOINC, HPO), sonst einen leeren Code.
+Verneinte Befunde nur, wenn sie klinisch relevant sind.
+
+Gib für jeden Eintrag das wörtliche Zitat aus dem Brief an, auf dem er beruht (Zeichen für Zeichen aus dem Brief, kurz, nur die
+entscheidende Stelle, bei verneinten Einträgen die verneinende Stelle); bei not_in_letter ein leeres Zitat.
+
+Begründe jedes Urteil in höchstens einem kurzen Satz.$p$, updated_at = now()
+WHERE name = 'validation_judge' AND md5(system_prompt) = 'f113dff58903a143888968ad10ac3084';
+
+-- 12 down
+SELECT 1;
+
+-- 13 up
+-- Laufzeiten: Zeitpunkt der Anmeldung (queued_at) getrennt vom tatsächlichen Start (started_at),
+-- Extraktionszeit je Brief (seconds). Ältere Läufe: started_at war der Anmeldezeitpunkt.
+ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS queued_at timestamptz;
+UPDATE validation_runs SET queued_at = started_at WHERE queued_at IS NULL;
+ALTER TABLE validation_runs ALTER COLUMN queued_at SET DEFAULT now();
+ALTER TABLE validation_run_items ADD COLUMN IF NOT EXISTS seconds real;
+
+-- 13 down
+ALTER TABLE validation_run_items DROP COLUMN IF EXISTS seconds;
+ALTER TABLE validation_runs DROP COLUMN IF EXISTS queued_at;

@@ -11245,6 +11245,7 @@ sub _val_build_reference {
     my %dropped_sig;
 
     for my $e (@{ $item->{entries} }) {
+        next if _val_is_derived($e);                    # berechnete Werte gehören nicht in die Referenz
         if (my $i = $inj{ $e->{key} }) {               # eingestreuter Fehler: Wahrheit ist das Original
             push @ref, { %{ $i->{original} }, src => 'snapshot' };
             next;
@@ -11256,7 +11257,7 @@ sub _val_build_reference {
         next if $concept =~ /^(?:wrong|absent|wrong_subject)$/;
         if ($concept =~ /^(?:broader|narrower)$/) { push @tol, { %$e, why => $concept }; next; }
         my $status = $j->{status} // 'ok';
-        next if $status eq 'suspected' || $status eq 'planned';
+        next if $status eq 'planned';      # Verdacht ist kein Fehler: die Kodierung kennt keinen Verdachtsstatus
 
         my %r = (%$e, src => 'snapshot');
         $r{excluded} = $r{excluded} ? 0 : 1 if $status eq 'negation';
@@ -11319,8 +11320,15 @@ sub _val_attr_check {
     return $pv eq $rv ? 1 : 0;   # side
 }
 
+# Berechnete Werte (z. B. sphärisches Äquivalent) stehen nicht im Brief und werden nicht geprüft
+our %VAL_DERIVED_CODES;        # befüllt weiter unten beim Ensemble
+sub _val_is_derived { my $e = shift; return $e && $VAL_DERIVED_CODES{ $e->{code} // '' } ? 1 : 0 }
+
 sub _val_compare {
     my ($c, $ref, $pred) = @_;
+    $ref  = { %$ref, entries => [ grep { !_val_is_derived($_) } @{ $ref->{entries} // [] } ],
+                     tolerated => [ grep { !_val_is_derived($_) } @{ $ref->{tolerated} // [] } ] };
+    $pred = [ grep { !_val_is_derived($_) } @{ $pred // [] } ];
     my %dom = map { $_ => { tp => 0, fp => 0, fn => 0, partial => 0, tolerated => 0,
                             map { ("${_}_ok" => 0, "${_}_n" => 0) } qw(side date status value) } } @VAL_DOMAINS;
     my (@fn, @fp, @partial, @attr_err, @tp_keys);
@@ -11909,16 +11917,19 @@ get '/BBB/validation/sets/:id/items' => sub {
     my $me  = $c->param('reviewer') // '';
     my $rows = $db->query(q{
         SELECT i.id, i.position, i.candidate_id, i.pseudonym, i.doc_source, i.reference_date, i.stratum, i.double_review,
-               jsonb_array_length(i.entries) AS n_entries,
+               (SELECT count(*) FROM jsonb_array_elements(i.entries) e
+                 WHERE NOT (e->>'code' = ANY (?::text[]))) AS n_entries,
                EXISTS (SELECT 1 FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.phase = 'final' AND r.entry_key = '_done'
                        AND (r.judgment->>'done')::boolean) AS my_done,
                EXISTS (SELECT 1 FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.phase = 'final' AND r.entry_key = '_checklist'
                        AND (r.judgment->>'done')::boolean) AS my_checklist,
-               (SELECT count(*) FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.phase = 'final' AND r.entry_key NOT LIKE '\_%' AND r.entry_key NOT LIKE 'missing:%') AS my_judged,
+               (SELECT count(*) FROM validation_reviews r WHERE r.item_id = i.id AND r.reviewer = ? AND r.phase = 'final'
+                  AND r.judgment->>'verdict' IS NOT NULL
+                  AND r.entry_key IN (SELECT e->>'key' FROM jsonb_array_elements(i.entries) e WHERE NOT (e->>'code' = ANY (?::text[])))) AS my_judged,
                (SELECT count(DISTINCT r.reviewer) FROM validation_reviews r WHERE r.item_id = i.id AND r.phase = 'final' AND r.entry_key = '_done'
                 AND (r.judgment->>'done')::boolean) AS n_done
         FROM validation_items i WHERE i.set_id = ? ORDER BY i.position
-    }, $me, $me, $me, $set->{id})->hashes->to_array;
+    }, [ sort keys %VAL_DERIVED_CODES ], $me, $me, $me, [ sort keys %VAL_DERIVED_CODES ], $set->{id})->hashes->to_array;
     $c->render(json => { set => $set, items => $rows });
 };
 
@@ -11945,7 +11956,7 @@ get '/BBB/validation/items/:id' => sub {
         doc_source => $item->{doc_source}, reference_date => $item->{reference_date}, double_review => $item->{double_review} ? 1 : 0,
         purpose => $set->{purpose}, frozen => $set->{frozen_at} ? 1 : 0, preparing => ($set->{status} // '') eq 'preparing' ? 1 : 0,
         narrative => $item->{narrative}, blind => $blind ? 1 : 0,
-        entries => $blind ? [] : $item->{entries}, judgments => \%mine,
+        entries => $blind ? [] : [ grep { !_val_is_derived($_) } @{ $item->{entries} // [] } ], judgments => \%mine,
     );
     # KI-Hinweise des Ensembles: bei Regressions-Datensätzen sofort, bei Studien erst nach dem
     # eigenen Abschluss (Zweitblick), damit die Erstbewertung unbeeinflusst bleibt
@@ -11956,7 +11967,37 @@ get '/BBB/validation/items/:id' => sub {
     my $ens = _val_ensemble_view($db, $item);
     my $have = @$sugg || %{ $ens->{entries} };
     $assist_visible = $have && ($set->{purpose} ne 'study' || $my_done || $has_pre) ? 1 : 0;
-    $out{assist} = $assist_visible ? { visible => 1, suggestions => [ grep { $_->{kind} eq 'missing' } @$sugg ], entries => $ens->{entries}, models => $ens->{models} }
+    my @usable = grep { $_->{kind} eq 'missing' && _val_suggestion_ok($c->app, $_->{payload} // {}) } @$sugg;
+    # kanonische Bezeichnungen der Terminologie für alle Codes des Briefs (Tooltip im Prüffenster)
+    {
+        my %ont = (disease => 'icd10', phenotype => 'hpo', procedure => 'ops', treatment => 'atc', measurement => 'loinc');
+        my %labels;
+        my @codes = map { [ $_->{domain}, $_->{code} ] } @{ $out{entries} // [] };
+        push @codes, map { [ ($_->{payload} // {})->{domain}, ($_->{payload} // {})->{code} ] } @$sugg;
+        for my $r (@$rows) {
+            next unless $r->{entry_key} =~ /^missing:/;
+            my $j = _val_json($r->{judgment}) // {};
+            push @codes, [ $j->{domain}, $j->{code} ];
+        }
+        for my $dc (@codes) {
+            my ($d, $code) = @$dc;
+            next unless $d && $ont{$d} && length($code // '') && !exists $labels{$code};
+            $labels{$code} = eval { $c->get_canonical_ontology_label($ont{$d}, $code) } // undef;
+        }
+        $out{term_labels} = { map { $_ => $labels{$_} } grep { defined $labels{$_} } keys %labels };
+    }
+    {
+        my %tl = %{ $out{term_labels} // {} };
+        my @existing = map { { %$_, labels => [ $_->{label}, $tl{ $_->{code} // '' } ] } } @{ $out{entries} // [] };
+        for my $r (@$rows) {
+            next unless $r->{entry_key} =~ /^missing:/;
+            my $j = _val_json($r->{judgment}) // {};
+            push @existing, { %$j, labels => [ $j->{label}, $tl{ $j->{code} // '' } ] } unless $j->{deleted};
+        }
+        @usable = grep { !_val_cross_duplicate({ %{ $_->{payload} // {} }, code_label => $tl{ ($_->{payload} // {})->{code} // '' } }, \@existing)
+                         && !_val_ivom_covered($_->{payload} // {}, \@existing) } @usable;
+    }
+    $out{assist} = $assist_visible ? { visible => 1, suggestions => \@usable, entries => $ens->{entries}, models => $ens->{models} }
                  : { visible => 0, waiting => ($have && $set->{purpose} eq 'study') ? 1 : 0 };
     # Konsens sieht die Urteile aller Prüfer, normale Prüfer nur die eigenen
     $out{others} = \%others if $me eq $VAL_CONSENSUS;
@@ -12107,24 +12148,34 @@ post '/BBB/validation/sets/:id/runs' => sub {
     my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
     return if _val_preparing($c, $set);
     # ohne eingefrorene Referenz: Lauf speichert nur die Extraktionen (z. B. als künftige Pipeline-Referenz)
-    return $c->render(json => { error => 'Für diesen Datensatz läuft bereits ein Lauf.' }, status => 409)
-        if $db->query(q{SELECT 1 FROM validation_runs WHERE set_id = ? AND status IN ('queued', 'running')}, $set->{id})->array;
     my $mode = ($p->{mode} // '') eq 'stored' ? 'stored' : 'reextract';
     # bei Neu-Extraktion das gewählte Extraktionsmodell verwenden und im Pipeline-Stand vermerken
     my $model  = $mode eq 'reextract' && defined $p->{model} && length $p->{model} ? $p->{model} : undef;
     my $fp     = _val_fingerprint($c->app, $model);
+    my $deep   = $mode eq 'reextract' && $p->{deep_mode} ? 1 : 0;
+    $fp->{deep_mode} = 1 if $deep;           # Deep Mode gehört zum Pipeline-Stand des Laufs
     $fp->{mode} = $mode;
     $fp->{reference} = _val_reference_info($set);
     my $run_id = $db->insert('validation_runs', { set_id => $set->{id}, mode => $mode, label => $p->{label} // '',
                                                   fingerprint => to_json($fp) }, { returning => 'id' })->hash->{id};
-    $c->minion->enqueue(validation_run_task => [{ run_id => $run_id, model => $model }], { attempts => 1, queue => 'validation', priority => -5 });
-    $c->render(json => { ok => 1, run_id => $run_id, mode => $mode, model => $fp->{model} });
+    $c->minion->enqueue(validation_run_task => [{ run_id => $run_id, model => $model, deep_mode => $deep }], { attempts => 1, queue => 'validation', priority => -5 });
+    $c->render(json => { ok => 1, run_id => $run_id, mode => $mode, model => $fp->{model}, deep_mode => $deep });
 };
 
 get '/BBB/validation/sets/:id/runs' => sub {
     my $c = shift;
-    my $rows = $c->pg->db->query(q{SELECT id, mode, label, status, progress, fingerprint, metrics, comparison, error, started_at, finished_at
-                                   FROM validation_runs WHERE set_id = ? ORDER BY id DESC}, $c->param('id'))->expand->hashes->to_array;
+    my $rows = eval { $c->pg->db->query(q{SELECT r.id, r.mode, r.label, r.status, r.progress, r.fingerprint, r.metrics, r.comparison, r.error,
+                                          r.queued_at, r.started_at, r.finished_at,
+                                          round(extract(epoch FROM COALESCE(r.finished_at, now()) - r.started_at)) AS duration_s,
+                                          (SELECT round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ri.seconds)::numeric, 1)
+                                             FROM validation_run_items ri WHERE ri.run_id = r.id AND ri.seconds IS NOT NULL) AS median_s,
+                                          (SELECT round(sum(ri.seconds)::numeric) FROM validation_run_items ri WHERE ri.run_id = r.id) AS sum_s
+                                   FROM validation_runs r WHERE r.set_id = ? ORDER BY r.id DESC}, $c->param('id'))->expand->hashes->to_array };
+    unless ($rows) {
+        my $err = $@ =~ /queued_at|seconds/ ? 'Datenbankschema veraltet (Schema-Version 13 fehlt): migrations/ontotrial.sql aktualisieren und neu starten.' : "$@";
+        $c->app->log->error("[VALIDATION] Läufe nicht lesbar: $@");
+        return $c->render(json => { error => $err }, status => 500);
+    }
     $c->render(json => $rows);
 };
 
@@ -12273,25 +12324,29 @@ app->minion->add_task(validation_run_task => sub {
     my $items  = _val_load_items($db, $set->{id});
     my $task   = "validation_run_$run_id";
     my $n      = scalar @$items;
-    $db->update('validation_runs', { status => 'running' }, { id => $run_id });
+    # Start erst hier setzen: Wartezeit in der Warteschlange zählt nicht zur Laufzeit
+    $db->query(q{UPDATE validation_runs SET status = 'running', started_at = now() WHERE id = ?}, $run_id);
 
     my $k = 0;
     for my $i (@$items) {
         $k++;
         my ($pp, $err);
+        my $t0 = [gettimeofday];
         if ($run->{mode} eq 'stored') {
             my $row = $i->{candidate_id} ? $db->query('SELECT narrative_report, phenopacket_json::text AS pp FROM candidates WHERE id = ?', $i->{candidate_id})->hash : undef;
             if (!$row) { $err = 'Brief nicht mehr im Bestand' }
             elsif (md5_hex(encode('UTF-8', $row->{narrative_report} // '')) ne $i->{narrative_md5}) { $err = 'Brieftext im Bestand wurde geändert' }
             else { $pp = _ppd_parse_json($row->{pp}) or $err = 'Phenopacket nicht lesbar' }
         } else {
-            $app->generate_phenopacket_impl($i->{narrative}, $payload->{model}, undef, $i->{reference_date}, 0, undef)
+            $app->generate_phenopacket_impl($i->{narrative}, $payload->{model}, undef, $i->{reference_date}, $payload->{deep_mode} ? 1 : 0, undef)
                 ->then(sub { $pp = shift })->catch(sub { $err = 'Pipeline-Fehler: ' . shift })->wait;
         }
+        my $secs   = sprintf('%.2f', tv_interval($t0));                       # Extraktionszeit dieses Briefs
         my $result = $pp && !$err && $set->{frozen_at} ? _val_compare($app, $i->{reference} // { entries => [] }, _val_entries($pp)) : undef;
-        $db->query(q{INSERT INTO validation_run_items (run_id, item_id, phenopacket, result, error) VALUES (?, ?, ?::jsonb, ?::jsonb, ?)
-                     ON CONFLICT (run_id, item_id) DO UPDATE SET phenopacket = EXCLUDED.phenopacket, result = EXCLUDED.result, error = EXCLUDED.error},
-                   $run_id, $i->{id}, $pp ? to_json($pp) : undef, $result ? to_json($result) : undef, $err);
+        $db->query(q{INSERT INTO validation_run_items (run_id, item_id, phenopacket, result, error, seconds) VALUES (?, ?, ?::jsonb, ?::jsonb, ?, ?)
+                     ON CONFLICT (run_id, item_id) DO UPDATE SET phenopacket = EXCLUDED.phenopacket, result = EXCLUDED.result, error = EXCLUDED.error,
+                                                                 seconds = EXCLUDED.seconds},
+                   $run_id, $i->{id}, $pp ? to_json($pp) : undef, $result ? to_json($result) : undef, $err, $secs);
         my $pct = int(100 * $k / ($n || 1));
         $db->update('validation_runs', { progress => $pct }, { id => $run_id });
         $app->notify_task_progress($task, 'running', $pct, "Validierung: Brief $k von $n");
@@ -12341,7 +12396,7 @@ sub _val_study_counts {
     my %inj = map { $_->{key} => $_ } @{ $item->{injected} // [] };
     my %c;
     for my $e (@{ $item->{entries} }) {
-        next if $inj{ $e->{key} };
+        next if $inj{ $e->{key} } || _val_is_derived($e);
         my $j = $res->{judgments}{ $e->{key} } or next;
         my $v = $j->{verdict} // '';
         my $d = $e->{domain};
@@ -12360,7 +12415,7 @@ sub _val_study_counts {
             $c{$d}{"${a}_ok"}++ if $s eq 'ok';
         }
         $c{$d}{status_n}++;
-        $c{$d}{status_ok}++ if ($j->{status} // 'ok') eq 'ok';
+        $c{$d}{status_ok}++ if ($j->{status} // 'ok') =~ /^(?:ok|suspected)$/;
     }
     for my $l (@{ ($res->{checklist} // {})->{lines} // [] }) {
         my $cat = $l->{cat} // 'sonstiges';
@@ -12606,12 +12661,13 @@ Konzept:
 - broader: richtige Oberklasse, der Brief stützt einen spezifischeren Code
 - narrower: der Code enthält ein Detail, das der Brief nicht trägt
 - wrong: der Code bezeichnet einen anderen Sachverhalt
-- absent: der Sachverhalt steht nicht im Brief
+- not_in_letter: der Sachverhalt wird im Brief gar nicht erwähnt, weder als vorhanden noch als verneint
 - wrong_subject: der Sachverhalt betrifft nicht den Patienten (Familienanamnese, Spender, andere Person)
 Status:
-- ok: vorhanden/verneint stimmt
+- ok: vorhanden/verneint stimmt. Ein als „verneint“ extrahierter Eintrag ist korrekt (concept ok, status ok), wenn der Brief
+  den Sachverhalt ausdrücklich verneint, etwa „keine Blutung“, „kein Anhalt für“, „ohne“, „nicht“, „frei von“.
+  Verneint heißt nicht „nicht im Brief“: Die Verneinung ist genau der Beleg; zitiere sie.
 - negation: verneint und vorhanden sind vertauscht („kein Anhalt für“, „keine“, „ausgeschlossen“ = verneint)
-- suspected: Verdacht, Differenzialdiagnose oder „fraglich“ wurde als gesichert übernommen
 - planned: geplante oder empfohlene Maßnahme wurde als erfolgt übernommen
 Augenseite und Datum: ok, wrong, missing (Brief nennt eine Angabe, der Eintrag hat keine), superfluous (Eintrag hat eine Angabe,
 die der Brief nicht hergibt) oder na (nicht anwendbar, etwa bei systemischen Befunden). Gib bei wrong oder missing die richtige
@@ -12625,6 +12681,12 @@ Regeln:
   Brief für diesen Eintrag ein eigenes, vom Briefdatum abweichendes Datum nennt (etwa bei einer früheren Operation).
   Ein anamnestisches Ereignis ohne Datum darf nicht das Briefdatum tragen (dann Datum superfluous).
 - Angaben wie „Tensio 18/21 mmHg“ werden als RA/LA gelesen.
+- Verdachtsdiagnosen („V. a.“, „Verdacht auf“, „fraglich“, „DD“) werden als die Diagnose selbst kodiert, weil die Kodierung
+  keinen Verdachtsstatus kennt. Das ist korrekt: weder falsches Konzept noch ein Fehler im Status.
+- Das sphärische Äquivalent („Spherical equivalent Calculated“) wird aus der Refraktion berechnet (Sphäre + Zylinder/2) und steht
+  meist nicht wörtlich im Brief. Es ist korrekt, wenn die Rechnung zu den Refraktionswerten des Auges im Brief passt.
+- Visus „HBW“, „FZ“, „LS“ und „NL“ werden als Dezimalvisus nach Schulze-Bonsel kodiert (HBW 0,005, FZ 0,013, LS 0,002, NL 0);
+  das ist korrekt.
 - Zitierte Vorbefunde anderer Kliniken gelten als Inhalt des Briefs.
 - Dosis und Applikationsfrequenz von Medikamenten werden nicht bewertet; Kombinationspräparate dürfen als Kombinationscode
   oder als Einzelwirkstoffe kodiert sein.
@@ -12635,7 +12697,7 @@ augenrelevante Befunde, Augenoperationen und -eingriffe, Augenmedikation, Visus,
 Verneinte Befunde nur, wenn sie klinisch relevant sind.
 
 Gib für jeden Eintrag das wörtliche Zitat aus dem Brief an, auf dem er beruht (Zeichen für Zeichen aus dem Brief, kurz, nur die
-entscheidende Stelle); bei absent ein leeres Zitat.
+entscheidende Stelle, bei verneinten Einträgen die verneinende Stelle); bei not_in_letter ein leeres Zitat.
 
 Begründe jedes Urteil in höchstens einem kurzen Satz.
 TXT
@@ -12652,8 +12714,8 @@ sub _val_judge_schema {
                 type => 'object',
                 properties => {
                     id            => { type => 'string' },
-                    concept       => $enum->(qw(ok broader narrower wrong absent wrong_subject)),
-                    status        => $enum->(qw(ok negation suspected planned)),
+                    concept       => $enum->(qw(ok broader narrower wrong not_in_letter wrong_subject)),
+                    status        => $enum->(qw(ok negation planned)),
                     side          => $attr,
                     side_correct  => $enum->('', 'R', 'L', 'B', 'none'),
                     date          => $attr,
@@ -12705,7 +12767,7 @@ sub _val_judge_user_message {
     my %side = (R => 'RA', L => 'LA', B => 'beidseits', '' => 'keine');
     my @lines;
     my $n = 0;
-    for my $e (@{ $item->{entries} // [] }) {
+    for my $e (grep { !_val_is_derived($_) } @{ $item->{entries} // [] }) {
         $n++;
         my $val = defined $e->{value} && length $e->{value} ? " | Wert: " . ($e->{comparator} && $e->{comparator} ne '=' ? "$e->{comparator} " : '') .
                   "$e->{value}" . (length($e->{unit} // '') ? " $e->{unit}" : '') : (length($e->{value_text} // '') ? " | Wert: $e->{value_text}" : '');
@@ -12852,10 +12914,11 @@ sub _val_ai_convert {
     my %by = map { uc($_->{id} // '') => $_ } @{ $out->{entries} // [] };
     my (%j, @missing, $unjudged);
     my $n = 0;
-    for my $e (@{ $item->{entries} // [] }) {
+    for my $e (grep { !_val_is_derived($_) } @{ $item->{entries} // [] }) {
         $n++;
         my $a = $by{"E$n"} or do { $unjudged++; next };
         my %x = map { $_ => lc($a->{$_} // '') } qw(concept status side date value);
+        $x{concept} = 'absent' if $x{concept} eq 'not_in_letter';      # interner Wert bleibt 'absent'
         $x{side_correct}  = uc($a->{side_correct} // '');
         $x{date_correct}  = $a->{date_correct} // '';
         $x{value_correct} = $a->{value_correct} // '';
@@ -13175,6 +13238,11 @@ app->minion->add_task(validation_ensemble_task => sub {
             }
             my $code = _val_code($cnd->{code});
             next if length $code && $in_snapshot{$code};
+            next if _val_cross_duplicate({ code => $cnd->{code}, label => $cnd->{label}, code_label => $cnd->{code_label},
+                                           side => $cnd->{side}, excluded => $cnd->{excluded} }, $entries);
+            next if _val_ivom_covered({ code => $cnd->{code}, side => $cnd->{side}, date => $cnd->{date} }, $entries);
+            next unless _val_suggestion_ok($app, { code => $cnd->{code}, label => $cnd->{label}, quote => $cnd->{quote},
+                                                   domain => $cnd->{domain}, value => $cnd->{value} });
             my $gk = length $code ? "$cnd->{domain}|$code|" . ($cnd->{side} // '') : "$cnd->{domain}|" . lc($cnd->{label}) . '|' . ($cnd->{side} // '');
             unless ($group{$gk}) { $group{$gk} = { %$cnd, sources => [] }; push @order, $gk }
             my $g = $group{$gk};
@@ -13260,17 +13328,186 @@ sub _val_relax_date {
     return \%x;
 }
 
+# Bekannte Fehlalarme des Ensembles neutralisieren (wirkt auch auf vorhandene Ergebnisse):
+#  - fehlendes Datum, wenn das richtige Datum nur das Briefdatum ist
+#  - berechnetes sphärisches Äquivalent (steht nicht wörtlich im Brief; Sphäre und Zylinder
+#    werden als eigene Einträge geprüft)
+#  - Visus HBW/FZ/LS/NL als Dezimalwert nach Schulze-Bonsel
+%VAL_DERIVED_CODES = map { $_ => 1 } qw(LOINC:95327-3 LOINC:95328-1);
+our %VAL_LOWVISION = (0.005 => 1, 0.013 => 1, 0.002 => 1, 0 => 1);
+our $VAL_NEG_CUE = qr/\b(?:kein\w*|ohne|nicht|frei\s+von|ausgeschlossen|negativ|unauff[äa]llig|o\.\s?B\.|regelrecht)\b/i;
+sub _val_negation_in_letter {
+    my ($entry, $narrative) = @_;
+    return 0 unless defined $narrative && length $narrative;
+    my @words = grep { length >= 5 } map { lc } (($entry->{label} // '') =~ /([[:alpha:]äöüÄÖÜß-]+)/g);
+    for my $w (@words) {
+        my $stem = substr($w, 0, length($w) > 7 ? length($w) - 2 : length($w));
+        return 1 if $narrative =~ /$VAL_NEG_CUE.{0,60}?\Q$stem\E/is || $narrative =~ /\Q$stem\E\w*.{0,30}?\b(?:nicht|negativ|ausgeschlossen)\b/is;
+    }
+    return 0;
+}
+
+sub _val_relax {
+    my ($j, $ref, $entry, $narrative) = @_;
+    my $x = _val_relax_date($j, $ref);
+    return $x if ($x->{verdict} // '') eq 'correct' || !$entry;
+    my %y = %$x;
+    my $other_ok = sub {
+        ($y{status} // 'ok') eq 'ok' && ($y{side} // 'ok') =~ /^(?:ok|na)$/ && ($y{date} // 'ok') =~ /^(?:ok|na)$/
+    };
+    my $code = $entry->{code} // '';
+    # Verdacht als Fehler gemeldet (alter Prompt): als korrekt werten
+    my $va = qr/\b(?:v\.\s?a\.|verdacht|fraglich|dd\b|differenzialdiagnos|suspect)/i;
+    if (($y{status} // 'ok') eq 'suspected'
+        || (($y{concept} // 'ok') =~ /^(?:wrong|absent)$/ && (($y{comment} // '') =~ $va || ($y{quote} // '') =~ $va))) {
+        $y{status} = 'ok';
+        $y{concept} = 'ok' if ($y{concept} // 'ok') =~ /^(?:wrong|absent)$/;
+        if (($y{side} // 'ok') =~ /^(?:ok|na)$/ && ($y{date} // 'ok') =~ /^(?:ok|na)$/ && ($y{value} // 'ok') =~ /^(?:ok|na)$/) {
+            $y{verdict} = 'correct';
+            return \%y;
+        }
+    }
+    # verneinter Eintrag als "nicht im Brief" gemeldet, der Brief verneint ihn aber (Missverständnis des alten Prompts)
+    if ($entry->{excluded} && ($y{concept} // '') eq 'absent' && ($y{status} // 'ok') eq 'ok'
+        && ((length($y{quote} // '') && $y{quote} =~ $VAL_NEG_CUE) || _val_negation_in_letter($entry, $narrative))) {
+        @y{qw(verdict concept)} = ('correct', 'ok');
+        return \%y;
+    }
+    if ($VAL_DERIVED_CODES{$code} && ($y{concept} // 'ok') =~ /^(?:ok|absent)$/ && $other_ok->()) {
+        @y{qw(verdict concept value derived)} = ('correct', 'ok', 'ok', 1);
+        return \%y;
+    }
+    if (($entry->{domain} // '') eq 'measurement' && ($y{value} // 'ok') eq 'wrong' && ($y{concept} // 'ok') eq 'ok' && $other_ok->()
+        && defined $entry->{value} && $entry->{value} =~ /^-?[\d.]+$/ && $VAL_LOWVISION{ $entry->{value} + 0 }
+        && ($y{value_correct} // '') =~ /^\s*(?:hbw|handbewegung|fz|fingerz|ls|lichtschein|nl|nulla)/i) {
+        @y{qw(verdict value)} = ('correct', 'ok');
+        return \%y;
+    }
+    return $x;
+}
+
 # Zusammengeführtes Urteil der Ensemble-Modelle je Eintrag: Mehrheit, Stimmen, Beleg
+# Vorschlag für einen fehlenden Eintrag brauchbar? Ohne Code oder als Normalbefund bzw.
+# nicht kodierbare Angabe (dieselben Filterregeln wie die Pipeline) nicht.
+# LOINC-Codes, die die Pipeline selbst vergibt (Intercepts, feste Codes, bisherige Extraktionen).
+# Vorschläge mit anderen Messwert-Codes (Panels, "study", "comment", "type") passen nie zur
+# Kodierkonvention der Pipeline und würden jedes Modell als "fehlt" bestrafen.
+my ($VAL_LOINC_KNOWN, $VAL_LOINC_AT) = ({}, 0);
+sub _val_pipeline_loinc {
+    my ($app) = @_;
+    return $VAL_LOINC_KNOWN if time - $VAL_LOINC_AT < 300;
+    my %k = map { _val_code($_->[0]) => 1 } @OPHTH_LOINC_FALLBACK{ keys %OPHTH_LOINC_FALLBACK };
+    eval {
+        my $db = $app->pg->db;
+        for my $r (@{ $db->query(q{SELECT code FROM ontology_intercepts WHERE domain = 'loinc' AND active AND NOT COALESCE(suppress, false)})->arrays }) {
+            my $c = _val_code($r->[0]); $c = "LOINC:$c" unless $c =~ /^LOINC:/; $k{$c} = 1;
+        }
+        for my $r (@{ $db->query(q{SELECT DISTINCT e->>'code' FROM validation_items i, jsonb_array_elements(i.entries) e WHERE e->>'domain' = 'measurement'})->arrays }) {
+            $k{ _val_code($r->[0]) } = 1;
+        }
+        1;
+    };
+    ($VAL_LOINC_KNOWN, $VAL_LOINC_AT) = (\%k, time);
+    return $VAL_LOINC_KNOWN;
+}
+
+# Dubletten über Codesysteme hinweg: Ein Vorschlag (z. B. ICD-10 „Glaskörperblutung“) beschreibt
+# denselben Sachverhalt wie ein vorhandener Eintrag eines anderen Codesystems (HPO „Glaskörperblutung“),
+# wenn die Bezeichnungen übereinstimmen oder eine die andere enthält und die Seite passt.
+sub _val_norm_label {
+    my $t = lc(shift // '');
+    $t =~ s/\b(?:v\.?\s?a\.?|z\.?\s?n\.?|verdacht auf|zustand nach|des|der|die|das|am|im|bei)\b/ /g;
+    $t =~ s/[^[:alpha:]äöüß]+//g;
+    return $t;
+}
+sub _val_cross_duplicate {
+    my ($p, $existing) = @_;
+    my $code = _val_code($p->{code});
+    my ($sys) = $code =~ /^([A-Z0-9]+):/;
+    my @mine = grep { length } map { _val_norm_label($_) } ($p->{label}, $p->{code_label}, $p->{label_letter});
+    return 0 unless @mine;
+    my $ps = uc($p->{side} // '');
+    for my $e (@$existing) {
+        my $ec = _val_code($e->{code});
+        next if !length $ec || $ec eq $code;
+        my ($esys) = $ec =~ /^([A-Z0-9]+):/;
+        next if defined $sys && defined $esys && $sys eq $esys;            # gleiches System: andere Regeln
+        my $es = uc($e->{side} // '');
+        next unless $ps eq '' || $es eq '' || $ps eq $es || $es eq 'B';
+        next if ($p->{excluded} ? 1 : 0) != ($e->{excluded} ? 1 : 0);
+        for my $el (grep { length } map { _val_norm_label($_) } @{ $e->{labels} // [ $e->{label} ] }) {
+            for my $m (@mine) {
+                my ($short, $long) = length $m <= length $el ? ($m, $el) : ($el, $m);
+                return 1 if $m eq $el || (length $short >= 8 && index($long, $short) >= 0);
+            }
+        }
+    }
+    return 0;
+}
+
+# IVOM wird als Medikament (ATC) mit Augenseite und Datum gespeichert. Ein Vorschlag für den Eingriff
+# "Applikation von Medikamenten in den Glaskörper" (OPS 5-156.9) ist überflüssig, wenn im Phenopacket
+# bereits ein Medikament mit passender Seite und Datum steht; sonst bleibt er sichtbar.
+our $VAL_IVOM_CODE = qr/^OPS:5-156\.9/;
+sub _val_ivom_covered {
+    my ($p, $existing) = @_;
+    return 0 unless _val_code($p->{code}) =~ $VAL_IVOM_CODE;
+    my $ps = uc($p->{side} // '');
+    my $pd = $p->{date} // '';
+    for my $e (@$existing) {
+        next unless ($e->{domain} // '') eq 'treatment' && !$e->{excluded} && !$e->{deleted};
+        my $es = uc($e->{side} // '');
+        my $ed = $e->{date} // '';
+        next unless length $es && length $ed;                                  # Medikament mit Seite und Datum
+        next unless $ps eq '' || $ps eq $es || $es eq 'B' || $ps eq 'B';
+        next if length $pd && index($ed, substr($pd, 0, length $ed)) != 0 && index($pd, $ed) != 0;   # Daten widersprechen sich
+        return 1;
+    }
+    return 0;
+}
+
+# Zu allgemeine HPO-Begriffe (Wurzel "All", "Phenotypic abnormality", Organsystem-Oberbegriffe wie
+# "Abnormality of the eye" und die anderen Unterbäume der Wurzel) taugen nicht als Vorschlag.
+my ($VAL_HPO_GENERIC, $VAL_HPO_GENERIC_AT) = ({}, 0);
+sub _val_hpo_generic {
+    my ($app) = @_;
+    return $VAL_HPO_GENERIC if time - $VAL_HPO_GENERIC_AT < 3600;
+    my %g = map { $_ => 1 } (1, 118, 5, 12823, 40279, 31797, 478);        # falls die Hierarchie fehlt
+    eval {
+        $g{ $_->[0] } = 1 for @{ $app->pg->db->query('SELECT idchild FROM isas WHERE idparent IN (1, 118)')->arrays };
+        1;
+    };
+    ($VAL_HPO_GENERIC, $VAL_HPO_GENERIC_AT) = (\%g, time);
+    return $VAL_HPO_GENERIC;
+}
+
+sub _val_suggestion_ok {
+    my ($app, $p) = @_;
+    return 0 unless length($p->{code} // '');
+    if (_val_code($p->{code}) =~ /^HP:0*(\d+)$/) {
+        return 0 if _val_hpo_generic($app)->{ $1 + 0 };
+    }
+    if (($p->{domain} // '') eq 'measurement') {
+        return 0 unless length($p->{value} // '');                       # Messwert ohne Wert ist kein fehlender Eintrag
+        return 0 unless _val_pipeline_loinc($app)->{ _val_code($p->{code}) };
+    }
+    for my $t (grep { defined && length } $p->{label_letter}, $p->{label}, $p->{quote}) {
+        return 0 if eval { $app->is_normal_physiological_finding($t) } || eval { $app->is_uncodable_or_future_rule($t) };
+    }
+    return 1;
+}
+
 sub _val_ensemble_view {
     my ($db, $item) = @_;
     my $rows = $db->query('SELECT model, judgments FROM validation_ai_reviews WHERE item_id = ? AND error IS NULL ORDER BY model', $item->{id})->expand->hashes->to_array;
     my (%e, @models);
     push @models, $_->{model} for @$rows;
     for my $entry (@{ _val_json($item->{entries}) // [] }) {
-        my ($ok, $err, @errj, $quote) = (0, 0);
+        my ($ok, $err, @errj, $quote, $derived) = (0, 0);
         for my $r (@$rows) {
             my $j = ($r->{judgments} // {})->{ $entry->{key} } or next;
-            $j = _val_relax_date($j, $item->{reference_date});
+            $j = _val_relax($j, $item->{reference_date}, $entry, $item->{narrative});
+            $derived = 1 if $j->{derived};
             $quote //= $j->{quote} if length($j->{quote} // '');
             if (($j->{verdict} // '') eq 'correct') { $ok++ } else { $err++; push @errj, { %$j, model => $r->{model} } }
         }
@@ -13286,7 +13523,7 @@ sub _val_ensemble_view {
             push @prob, 'Wert falsch' . (length($j->{value_correct} // '') ? " (richtig: $j->{value_correct})" : '') if ($j->{value} // 'ok') eq 'wrong';
         }
         my %jj = %$j; delete $jj{model}; delete $jj{quote};
-        $e{ $entry->{key} } = { verdict => $verdict, ok => $ok, err => $err, n => $ok + $err, quote => $quote // '',
+        $e{ $entry->{key} } = { verdict => $verdict, ok => $ok, err => $err, n => $ok + $err, quote => $quote // '', derived => $derived ? 1 : 0,
                                 judgment => \%jj, problem => join('; ', @prob), reasons => [ map { "$_->{model}: " . ($_->{comment} // '') } @errj ] };
     }
     return { entries => \%e, models => \@models };

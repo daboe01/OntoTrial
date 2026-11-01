@@ -332,11 +332,15 @@ The validation window (actions menu of the candidate list → *Validation...*) s
 
 There is no stand-alone AI reference; references come from physician reviews or from a pipeline run (*Freeze run as reference*). Variables: `ONTOTRIAL_JUDGE_LOCAL_MODELS` (comma-separated; default: `VLLM_MODEL`), `ONTOTRIAL_ENSEMBLE_MODELS` (subset), `ONTOTRIAL_JUDGE_URL_<MODEL>`/`ONTOTRIAL_JUDGE_KEY_<MODEL>` (default: `VLLM_ENDPOINT`, `VLLM_API_KEY`), `ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS` (32000), `ONTOTRIAL_JUDGE_REASONING_EFFORT` (medium), `ONTOTRIAL_ENSEMBLE_REASONING_EFFORT` (low), `ONTOTRIAL_ENSEMBLE_CHUNK_CHARS` (1800). Prompts: `validation_judge`, `validation_recall`, `validation_verify` in `llm_prompts`.
 
+**Parallel runs and run time.** Regression runs of a set are not locked against each other; how many run at once is decided by the number of jobs of the validation worker (`-j`). Runs of models on separate infrastructure (e.g. vLLM on GPU servers and MLX on a Mac Studio) can run in parallel without slowing each other down. Every run logs its real start (not the time it was queued), its duration and the extraction time of every letter; the runs table shows run time and median seconds per letter.
+
+**Redacting names.** Letter texts in validation sets are immutable. To remove a name found in a letter anyway, run in psql `SELECT * FROM ontotrial_redact('Surname');` (optional: replacement text, case sensitivity). It replaces the whole word in candidates, validation letters, ensemble ratings, suggestions and reviews and reports the number of changed rows; the protecting triggers allow this only inside the function. Inflected forms (e.g. a genitive "s") need their own call.
+
 Preparation, regression runs and the ensemble are Minion jobs in the queue `validation`, so they do not compete with everyday extraction. Run a dedicated worker for it:
 
 ```bash
 perl backend.pl minion worker                      # default queue (extraction, import)
-perl backend.pl minion worker -q validation -j 1   # validation and AI ensemble
+perl backend.pl minion worker -q validation -j 4   # validation, runs, AI ensemble; -j = jobs in parallel
 ```
 
 ---
@@ -425,6 +429,14 @@ export PATCHBAY_URL="http://localhost:3036"
 ```
 
 Requests are routed to Ollama when `LLM_PROVIDER=ollama` or when the selected model name contains `-mlx` or `ollama`.
+
+Extra request parameters for a single model (OpenAI-compatible endpoints only) can be set as JSON; other models are sent unchanged. The variable name is the model name in upper case with other characters as `_`:
+
+```bash
+export ONTOTRIAL_LLM_EXTRA_GLM_53='{"reasoning_effort":"low"}'   # glm-53 without long reasoning
+```
+
+With `"stream": true` in this JSON the answer is fetched as a stream and reassembled, for servers that deliver a model reliably only when streamed. `ONTOTRIAL_LLM_DUMP_DIR` (optionally with `ONTOTRIAL_LLM_DUMP_MODELS`) saves every request as a JSON file for diagnosis.
 
 The PostgreSQL connection is currently set in `backend.pl` (`postgresql://postgres:postgres@localhost/hpo`, used for both `Mojo::Pg` and Minion).
 
