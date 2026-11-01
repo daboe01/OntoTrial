@@ -445,6 +445,45 @@ helper process_patchbay_queue => sub {
 # =========================================================
 # ENHANCED JSON PARSER & CLEANER
 # =========================================================
+# Schließt offene Zeichenketten, Listen und Objekte am Ende eines abgeschnittenen JSON-Textes.
+sub _json_close_open {
+    my ($t) = @_;
+    my (@stack, $in_str, $esc);
+    for my $ch (split //, $t) {
+        if ($in_str) {
+            if ($esc) { $esc = 0 } elsif ($ch eq '\\') { $esc = 1 } elsif ($ch eq '"') { $in_str = 0 }
+            next;
+        }
+        if    ($ch eq '"') { $in_str = 1 }
+        elsif ($ch eq '{' || $ch eq '[') { push @stack, $ch }
+        elsif ($ch eq '}' || $ch eq ']') { pop @stack }
+    }
+    $t .= '"' if $in_str;
+    $t =~ s/[\s,:]+$//;
+    $t .= join '', map { $_ eq '{' ? '}' : ']' } reverse @stack;
+    return $t;
+}
+
+sub _json_repair_truncated {
+    my ($t) = @_;
+    $t =~ s/\s+$//;
+    for (1 .. 8) {
+        # nur an einer Elementgrenze schließen: ein mitten im Wert abgeschnittenes Element wird verworfen
+        if ($t =~ /[\}\]]\s*,?\s*$/) {
+            my $d = eval { from_json(_json_close_open($t)) };
+            return $d if defined $d && ref $d eq 'HASH';
+        }
+        # bis zum letzten vollständigen Element zurückschneiden und erneut versuchen
+        my $end = length($t) - 1;
+        $end-- if $end >= 0 && substr($t, $end, 1) =~ /[\}\]]/;
+        my $pos = -1;
+        for my $ch ('}', ']') { my $p = rindex($t, $ch, $end); $pos = $p if $p > $pos }
+        last if $pos < 0;
+        $t = substr($t, 0, $pos + 1);
+    }
+    return undef;
+}
+
 sub clean_and_parse_json {
     my ($raw_content) = @_;
     return undef unless defined $raw_content && length $raw_content;
@@ -467,6 +506,17 @@ sub clean_and_parse_json {
         $data = eval { decode_json(encode('UTF-8', $raw_content)) };
     }
     return $data if defined $data;
+
+    # Abgeschnittenes oder nicht geschlossenes JSON-Objekt reparieren (z. B. Modelle, die nach der
+    # Liste nur noch Leerzeilen schreiben, bis das Token-Limit erreicht ist). Greift nur, wenn die
+    # Antwort sonst unlesbar wäre; gültige Antworten bleiben unverändert.
+    if ($raw_content =~ /^\{/) {
+        my $fixed = _json_repair_truncated($raw_content);
+        if (defined $fixed) {
+            eval { app->log->warn('[JSON REPAIRED] unvollständige Modellantwort geschlossen (' . length($raw_content) . ' Zeichen)') };
+            return $fixed;
+        }
+    }
 
     # Fallback array extraction
     if ($raw_content =~ /(\[\s*\{.*\}\s*\])/s) {
@@ -12179,6 +12229,101 @@ get '/BBB/validation/sets/:id/runs' => sub {
     $c->render(json => $rows);
 };
 
+# Lauf abbrechen (wartend oder laufend) bzw. löschen (abgeschlossen, fehlgeschlagen, abgebrochen)
+post '/BBB/validation/runs/:id/cancel' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $run = $db->query('SELECT id, status FROM validation_runs WHERE id = ?', $c->param('id'))->hash
+        or return $c->render(json => { error => 'Lauf nicht gefunden' }, status => 404);
+    return $c->render(json => { error => 'Der Lauf ist nicht mehr aktiv.' }, status => 409)
+        unless $run->{status} =~ /^(?:queued|running)$/;
+    $db->query(q{UPDATE validation_runs SET status = 'cancelled', finished_at = now() WHERE id = ?}, $run->{id});
+    # noch wartenden Job aus der Warteschlange nehmen; ein laufender Job beendet sich vor dem nächsten Brief
+    my $jobs = $c->minion->jobs({ tasks => ['validation_run_task'], states => ['inactive'] });
+    while (my $j = $jobs->next) {
+        $c->minion->job($j->{id})->remove if ref $j->{args} eq 'ARRAY' && ($j->{args}[0]{run_id} // 0) == $run->{id};
+    }
+    $c->render(json => { ok => 1, cancelled => $run->{id} });
+};
+
+# Lauf neu bewerten: gespeicherte Extraktionen mit der aktuellen Vergleichslogik gegen die Referenz
+# abgleichen (ohne neu zu extrahieren), z. B. nachdem berechnete Werte aus der Prüfung genommen wurden.
+post '/BBB/validation/runs/:id/rescore' => sub {
+    my $c   = shift;
+    my $app = $c->app;
+    my $db  = $app->pg->db;
+    my $run = $db->query('SELECT * FROM validation_runs WHERE id = ?', $c->param('id'))->expand->hash
+        or return $c->render(json => { error => 'Lauf nicht gefunden' }, status => 404);
+    return $c->render(json => { error => 'Nur fertige Läufe lassen sich neu bewerten.' }, status => 409) unless $run->{status} eq 'finished';
+    my $set = _val_load_set($db, $run->{set_id});
+    return $c->render(json => { error => 'Die Referenz ist nicht eingefroren.' }, status => 409) unless $set->{frozen_at};
+    my %item = map { $_->{id} => $_ } @{ _val_load_items($db, $set->{id}) };
+    my $ri = $db->query('SELECT item_id, phenopacket FROM validation_run_items WHERE run_id = ? AND phenopacket IS NOT NULL', $run->{id})->expand->hashes->to_array;
+    my $tx = $db->begin;
+    for my $r (@$ri) {
+        my $i = $item{ $r->{item_id} } or next;
+        my $result = _val_compare($app, $i->{reference} // { entries => [] }, _val_entries($r->{phenopacket}));
+        $db->query('UPDATE validation_run_items SET result = ?::jsonb WHERE run_id = ? AND item_id = ?', to_json($result), $run->{id}, $r->{item_id});
+    }
+    my $n       = scalar keys %item;
+    my $rows    = $db->query('SELECT ri.item_id, i.position, ri.result, ri.phenopacket IS NOT NULL AS has_pp FROM validation_run_items ri JOIN validation_items i ON i.id = ri.item_id WHERE ri.run_id = ? ORDER BY i.position', $run->{id})->expand->hashes->to_array;
+    my @results = map { $_->{result} } grep { $_->{result} } @$rows;
+    my $metrics = _val_metrics(\@results);
+    $metrics->{n_items}     = $n;
+    $metrics->{n_failed}    = $n - scalar(grep { $_->{has_pp} } @$rows);
+    $metrics->{rescored_at} = POSIX::strftime('%Y-%m-%d %H:%M', localtime);
+    my $cmp;
+    if (my $base_id = $set->{baseline_run_id}) {
+        if ($base_id != $run->{id}) {
+            my $base = $db->query('SELECT metrics, fingerprint FROM validation_runs WHERE id = ?', $base_id)->expand->hash;
+            my $bi   = $db->query('SELECT item_id, result FROM validation_run_items WHERE run_id = ?', $base_id)->expand->hashes->to_array;
+            $cmp = _val_regression_compare($metrics, $base->{metrics} // {}, $rows, $bi) if $base;
+            $cmp->{baseline_run_id} = $base_id + 0 if $cmp;
+        }
+    }
+    $db->update('validation_runs', { metrics => to_json($metrics), comparison => $cmp ? to_json($cmp) : undef }, { id => $run->{id} });
+    $tx->commit;
+    $app->log->info("[VALIDATION] Lauf $run->{id} neu bewertet: F1 " . ($metrics->{all}{f1} // '-'));
+    $c->render(json => { ok => 1, run_id => $run->{id}, f1 => $metrics->{all}{f1} });
+};
+
+# Lauf fortsetzen: nur Briefe ohne Ergebnis, ursprüngliches Modell und Deep Mode
+post '/BBB/validation/runs/:id/resume' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $run = $db->query('SELECT id, status, mode, fingerprint FROM validation_runs WHERE id = ?', $c->param('id'))->expand->hash
+        or return $c->render(json => { error => 'Lauf nicht gefunden' }, status => 404);
+    return $c->render(json => { error => 'Der Lauf ist bereits fertig.' }, status => 409) if $run->{status} eq 'finished';
+    # kein noch aktiver Job dieses Laufs (sonst liefen zwei Jobs auf denselben Briefen)
+    my $jobs = $c->minion->jobs({ tasks => ['validation_run_task', 'validation_run_resume_task'], states => ['inactive', 'active'] });
+    while (my $j = $jobs->next) {
+        next unless ref $j->{args} eq 'ARRAY' && ($j->{args}[0]{run_id} // 0) == $run->{id};
+        return $c->render(json => { error => "Für diesen Lauf ist noch Job $j->{id} aktiv. Diesen zuerst beenden "
+                                             . "(perl backend.pl minion job -b kill -a '[\"TERM\", $j->{id}]')." }, status => 409);
+    }
+    my $fp = $run->{fingerprint} // {};
+    $db->query(q{UPDATE validation_runs SET status = 'queued', finished_at = NULL WHERE id = ?}, $run->{id});
+    my $id = $c->minion->enqueue(validation_run_resume_task => [{ run_id => $run->{id}, model => $fp->{model}, deep_mode => $fp->{deep_mode} ? 1 : 0 }],
+                                 { attempts => 1, queue => 'validation', priority => -5 });
+    $c->render(json => { ok => 1, resumed => $run->{id}, job => $id });
+};
+
+del '/BBB/validation/runs/:id' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $run = $db->query('SELECT id, set_id, status FROM validation_runs WHERE id = ?', $c->param('id'))->hash
+        or return $c->render(json => { error => 'Lauf nicht gefunden' }, status => 404);
+    return $c->render(json => { error => 'Laufende Läufe zuerst abbrechen.' }, status => 409)
+        if $run->{status} =~ /^(?:queued|running)$/;
+    my $tx = $db->begin;
+    $db->query('UPDATE validation_sets SET baseline_run_id = NULL WHERE baseline_run_id = ?', $run->{id});
+    $db->query('DELETE FROM validation_run_items WHERE run_id = ?', $run->{id});
+    $db->query('DELETE FROM validation_runs WHERE id = ?', $run->{id});
+    $tx->commit;
+    $c->app->log->info("[VALIDATION] Lauf $run->{id} gelöscht");
+    $c->render(json => { ok => 1, deleted => $run->{id} });
+};
+
 get '/BBB/validation/runs/:id' => sub {
     my $c   = shift;
     my $db  = $c->pg->db;
@@ -12314,7 +12459,10 @@ app->minion->add_task(validation_prepare_task => sub {
     $job->finish({ ok => $ok, failed => $failed });
 });
 
-app->minion->add_task(validation_run_task => sub {
+# Ein Lauf; mit resume => 1 nur die Briefe ohne Ergebnis (Fortsetzen nach Hänger oder Abbruch).
+# Fortsetzen hat eine eigene Job-Art, damit nur ein Worker mit diesem Code sie übernimmt.
+my $VAL_RUN_TASK;
+$VAL_RUN_TASK = sub {
     my ($job, $payload) = @_;
     my $app    = $job->app;
     my $db     = $app->pg->db;
@@ -12325,10 +12473,25 @@ app->minion->add_task(validation_run_task => sub {
     my $task   = "validation_run_$run_id";
     my $n      = scalar @$items;
     # Start erst hier setzen: Wartezeit in der Warteschlange zählt nicht zur Laufzeit
-    $db->query(q{UPDATE validation_runs SET status = 'running', started_at = now() WHERE id = ?}, $run_id);
+    # (beim Fortsetzen bleibt der ursprüngliche Start stehen)
+    if ($payload->{resume}) {
+        $db->query(q{UPDATE validation_runs SET status = 'running' WHERE id = ?}, $run_id);
+    } else {
+        $db->query(q{UPDATE validation_runs SET status = 'running', started_at = now() WHERE id = ?}, $run_id);
+    }
+    my %done = $payload->{resume}
+        ? map { $_->[0] => 1 } @{ $db->query('SELECT item_id FROM validation_run_items WHERE run_id = ? AND phenopacket IS NOT NULL', $run_id)->arrays }
+        : ();
 
     my $k = 0;
     for my $i (@$items) {
+        if ($done{ $i->{id} }) { $k++; next; }         # beim Fortsetzen schon erledigt
+        # abgebrochen? (Knopf „Lauf abbrechen / löschen …“)
+        my $st = $db->query('SELECT status FROM validation_runs WHERE id = ?', $run_id)->hash;
+        if (!$st || $st->{status} eq 'cancelled') {
+            $app->notify_task_progress($task, 'finished', 100, 'Lauf abgebrochen');
+            return $job->finish({ run_id => $run_id, cancelled => 1 });
+        }
         $k++;
         my ($pp, $err);
         my $t0 = [gettimeofday];
@@ -12354,6 +12517,8 @@ app->minion->add_task(validation_run_task => sub {
 
     my $rows    = $db->query('SELECT ri.item_id, i.position, ri.result, ri.phenopacket IS NOT NULL AS has_pp FROM validation_run_items ri JOIN validation_items i ON i.id = ri.item_id WHERE ri.run_id = ? ORDER BY i.position', $run_id)->expand->hashes->to_array;
     my @results = map { $_->{result} } grep { $_->{result} } @$rows;
+    my $st_end = $db->query('SELECT status FROM validation_runs WHERE id = ?', $run_id)->hash;
+    return $job->finish({ run_id => $run_id, cancelled => 1 }) if !$st_end || $st_end->{status} eq 'cancelled';
     my $metrics = $set->{frozen_at} ? _val_metrics(\@results) : { without_reference => 1 };
     $metrics->{n_items}  = $n;
     $metrics->{n_failed} = $n - scalar(grep { $_->{has_pp} } @$rows);
@@ -12374,7 +12539,9 @@ app->minion->add_task(validation_run_task => sub {
                                      comparison => $cmp ? to_json($cmp) : undef, finished_at => \'now()' }, { id => $run_id });
     $app->notify_task_progress($task, 'finished', 100, 'Validierung abgeschlossen');
     $job->finish({ run_id => $run_id });
-});
+};
+app->minion->add_task(validation_run_task        => $VAL_RUN_TASK);
+app->minion->add_task(validation_run_resume_task => sub { my ($job, $payload) = @_; $VAL_RUN_TASK->($job, { %$payload, resume => 1 }) });
 
 # ---------------------------------------------------------
 # Validierungsstudie: Kennzahlen nach Bewertungshandbuch und Rohdaten

@@ -1869,6 +1869,7 @@ function OVAlert(aMessage, anInfo)
     [v addSubview:OTButton(CGRectMake(495, by, 160, 26), "Als Basis festlegen", self, @selector(setBaseline:))];
     [v addSubview:OTButton(CGRectMake(660, by, 140, 26), "Bericht als CSV", self, @selector(downloadRunReport:))];
     [v addSubview:OTButton(CGRectMake(810, by, 240, 26), "Lauf als Referenz einfrieren …", self, @selector(freezeFromRun:))];
+    [v addSubview:OTButton(CGRectMake(1055, by, 225, 26), "Lauf abbrechen / bewerten …", self, @selector(cancelOrDeleteRun:))];
 
     var dt = OVTextArea(CGRectMake(5, 442, 1260, 262), YES);
     _runDetailView = dt.text;
@@ -2787,6 +2788,95 @@ function OVAlert(aMessage, anInfo)
     return (row >= 0 && row < _runs.length) ? _runs[row] : nil;
 }
 
+// Wartende oder laufende Läufe abbrechen, beendete Läufe löschen
+- (void)cancelOrDeleteRun:(id)sender
+{
+    var r = [self _selectedRun];
+    if (!r)
+    {
+        OVAlert("Bitte zuerst einen Lauf in der Tabelle auswählen.");
+        return;
+    }
+    var name = "Lauf " + r.id + (r.label ? " („" + r.label + "“)" : "");
+    if (r.status === "queued" || r.status === "running")
+    {
+        [OVDialog confirm:name + " abbrechen?"
+                     info:"Ein laufender Lauf hört nach dem aktuellen Brief auf. Danach kannst du ihn löschen."
+                       ok:"Lauf abbrechen" then:function(ok)
+        {
+            if (!ok)
+                return;
+            OTPostJSON("/BBB/validation/runs/" + r.id + "/cancel", {}, 60.0, function(res, error)
+            {
+                if (!res || res.error)
+                    OVAlert("Abbrechen fehlgeschlagen", (res && res.error) || error || "keine Antwort");
+                [self loadRuns:nil];
+            });
+        }];
+        return;
+    }
+    if (r.status === "finished")
+    {
+        [OVDialog choose:name + " ist fertig."
+                    info:"„Neu bewerten“ gleicht die gespeicherten Extraktionen mit der aktuellen Logik neu gegen die Referenz ab, ohne neu zu extrahieren (z. B. nach Änderungen an den Bewertungsregeln)."
+                 buttons:["Neu bewerten", "Lauf löschen …", "Abbrechen"] then:function(index)
+        {
+            if (index === 0)
+                OTPostJSON("/BBB/validation/runs/" + r.id + "/rescore", {}, 300.0, function(res, error)
+                {
+                    if (!res || res.error)
+                        OVAlert("Neu bewerten fehlgeschlagen", (res && res.error) || error || "keine Antwort");
+                    [self loadRuns:nil];
+                });
+            else if (index === 1)
+                [self _deleteRun:r name:name];
+        }];
+        return;
+    }
+    // abgebrochen, fehlgeschlagen oder hängengeblieben: fortsetzen oder löschen
+    [OVDialog choose:name + " ist nicht fertig (" + r.status + ")."
+                info:"„Fortsetzen“ extrahiert nur die Briefe ohne Ergebnis, mit demselben Modell und Modus. Dafür muss ein Validierungs-Worker mit der aktuellen backend.pl laufen."
+             buttons:["Lauf fortsetzen", "Lauf löschen …", "Abbrechen"] then:function(index)
+    {
+        if (index === 0)
+            OTPostJSON("/BBB/validation/runs/" + r.id + "/resume", {}, 60.0, function(res, error)
+            {
+                if (!res || res.error)
+                    OVAlert("Fortsetzen nicht möglich", (res && res.error) || error || "keine Antwort");
+                [self loadRuns:nil];
+            });
+        else if (index === 1)
+            [self _deleteRun:r name:name];
+    }];
+}
+
+- (void)_deleteRun:(id)r name:(CPString)name
+{
+    [OVDialog confirm:name + " endgültig löschen?"
+                 info:"Ergebnisse und extrahierte Phenopackets dieses Laufs werden entfernt. Die Referenz bleibt unberührt."
+                   ok:"Lauf löschen" then:function(ok)
+    {
+        if (!ok)
+            return;
+        var req = new XMLHttpRequest();
+        req.open("DELETE", "/BBB/validation/runs/" + r.id, true);
+        req.onreadystatechange = function()
+        {
+            if (req.readyState !== 4)
+                return;
+            var res = nil;
+            try { res = JSON.parse(req.responseText); } catch (e) {}
+            if (req.status !== 200)
+                OVAlert("Löschen fehlgeschlagen", (res && res.error) || ("HTTP " + req.status));
+            if (_currentSet && _currentSet.baseline_run_id === r.id)
+                _currentSet.baseline_run_id = null;
+            [self loadRuns:nil];
+            [[CPRunLoop currentRunLoop] limitDateForMode:CPDefaultRunLoopMode];
+        };
+        req.send(null);
+    }];
+}
+
 - (void)freezeFromRun:(id)sender
 {
     var r = [self _selectedRun];
@@ -3170,7 +3260,7 @@ function OVAlert(aMessage, anInfo)
             case "duration":    return r.status === "queued" || r.duration_s === null || r.duration_s === undefined ? "" : OVDuration(r.duration_s);
             case "perletter":   return r.median_s === null || r.median_s === undefined ? "" : String(r.median_s).replace(".", ",") + " s";
             case "mode":        return r.mode === "stored" ? "gespeichert" : "neu extrahiert";
-            case "status":      return r.status === "running" ? "läuft " + r.progress + " %" : (r.status === "finished" ? "fertig" : r.status);
+            case "status":      return r.status === "running" ? "läuft " + r.progress + " %" : (r.status === "finished" ? "fertig" : (r.status === "cancelled" ? "abgebrochen" : (r.status === "queued" ? "wartet" : r.status)));
             case "f1":          return OVPct(all.f1);
             case "precision":   return OVPct(all.precision);
             case "recall":      return OVPct(all.recall);
