@@ -315,6 +315,10 @@ The long-format export contains pseudonyms (PIZ) and exact dates and is therefor
 
 ## Validation
 
+<img width="1376" height="747" alt="Bildschirmfoto 2026-11-01 um 15 30 27" src="https://github.com/user-attachments/assets/0753bd94-4744-4933-9dce-88e2373bcd6a" />
+
+<img width="1398" height="811" alt="Bildschirmfoto 2026-11-01 um 15 27 36" src="https://github.com/user-attachments/assets/3ed87f56-1cbc-4ef3-ac41-d5f4e50127ba" />
+
 The validation window (actions menu of the candidate list → *Validation...*) serves two purposes with the same data: regression tests that protect the pipeline against unnoticed changes after updates, and a validation study of the extraction.
 
 **Reference data sets.** A data set is a stratified random sample of letters from the stock (by source and year, at most one letter per patient by default, reproducible via a seed). Letter text and extracted phenopacket are copied at sampling time, so later re-extractions or deletions in the stock do not change the set. Sets are locked on creation: a locked set cannot be deleted, and frozen reviews cannot be changed. Database triggers enforce this, and the generic table routes are blocked for the validation tables. *Download backup* exports a complete set as JSON.
