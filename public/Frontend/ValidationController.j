@@ -565,6 +565,11 @@ function OVAlert(aMessage, anInfo)
     return OTTrim([_reviewerField stringValue]);
 }
 
+- (void)showChartReview:(id)sender
+{
+    [[ChartReviewController sharedController] show];
+}
+
 - (BOOL)isConsensus
 {
     return [self reviewer] === OVConsensusName;
@@ -613,15 +618,16 @@ function OVAlert(aMessage, anInfo)
     [cv addSubview:OTButton(CGRectMake(415, 12, 150, 26), "Neuer Datensatz …", self, @selector(showNewSetPanel:))];
     [cv addSubview:OTButton(CGRectMake(575, 12, 150, 26), "Sicherung laden", self, @selector(exportSet:))];
 
-    [cv addSubview:OTLabel(CGRectMake(745, 17, 50, 18), "Prüfer:", YES)];
+    [cv addSubview:OTButton(CGRectMake(735, 12, 120, 26), "Chart-Review …", self, @selector(showChartReview:))];
+    [cv addSubview:OTLabel(CGRectMake(865, 17, 50, 18), "Prüfer:", YES)];
     var stored = "";
     try { stored = window.localStorage.getItem(OVReviewerStorageKey) || ""; } catch (e) { stored = ""; }
-    _reviewerField = OTField(CGRectMake(795, 12, 150, 26), stored, "Name");
+    _reviewerField = OTField(CGRectMake(915, 12, 130, 26), stored, "Name");
     [_reviewerField setTarget:self];
     [_reviewerField setAction:@selector(reviewerChanged:)];
     [cv addSubview:_reviewerField];
 
-    _setInfoLabel = OVM(OTLabel(CGRectMake(960, 10, 330, 32), "", NO), CPViewWidthSizable);
+    _setInfoLabel = OVM(OTLabel(CGRectMake(1055, 10, 235, 32), "", NO), CPViewWidthSizable);
     [_setInfoLabel setTextColor:[CPColor grayColor]];
     [cv addSubview:_setInfoLabel];
 
@@ -3303,6 +3309,798 @@ function OVAlert(aMessage, anInfo)
         [self _highlightSelection:0];
         [self _showCodeInOntologyBrowser];
     }
+}
+
+@end
+
+// ================================================================================
+// CHART-REVIEW: Fall-Listen retrospektiver Studien (CSV) prüfen
+// Je Fall alle Briefe des Patienten (Zeitfenster markiert), Urteilscode + Kommentar je Prüfer,
+// Ergebnis als CSV. Die Listen enthalten identifizierende Daten und bleiben im Haus.
+// ================================================================================
+
+var CRSharedController = nil;
+
+function CRSplitCSVLine(line, delim)
+{
+    var out = [], field = "", inq = NO;
+    for (var i = 0; i < line.length; i++)
+    {
+        var ch = line.charAt(i);
+        if (inq)
+        {
+            if (ch === '"')
+            {
+                if (line.charAt(i + 1) === '"') { field += '"'; i++; }
+                else inq = NO;
+            }
+            else field += ch;
+        }
+        else if (ch === '"' && field === "") inq = YES;
+        else if (ch === delim) { out.push(field.trim()); field = ""; }
+        else field += ch;
+    }
+    out.push(field.trim());
+    return out;
+}
+
+function CRHeaderOf(text)
+{
+    var first = (text.replace(/^\uFEFF/, "").split(/\r?\n/)[0]) || "";
+    var counts = { ",": (first.match(/,/g) || []).length, ";": (first.match(/;/g) || []).length, "\t": (first.match(/\t/g) || []).length };
+    var delim = ",";
+    for (var d in counts)
+        if (counts[d] > counts[delim])
+            delim = d;
+    return CRSplitCSVLine(first, delim);
+}
+
+function CRGuess(cols, pattern)
+{
+    for (var i = 0; i < cols.length; i++)
+        if (pattern.test(cols[i]))
+            return cols[i];
+    return nil;
+}
+
+@implementation ChartReviewController : CPObject
+{
+    CPPanel         _window;
+    CPPopUpButton   _setPopUp;
+    CPTextField     _reviewerField;
+    CPTextField     _infoLabel;
+    CPTableView     _casesTable;
+    CPTableView     _lettersTable;
+    CPTableView     _ppTable;
+    CPTextField     _ppTitle;
+    id              _ppEntries;
+    CPTextView      _caseInfoView;
+    CPTextView      _letterView;
+    CPTextField     _searchField;
+    CPTextField     _searchInfo;
+    CPPopUpButton   _codePopUp;
+    CPTextView      _commentView;
+    CPTextView      _othersView;
+    CPTextField     _caseTitle;
+    id              _sets;
+    id              _currentSet;
+    id              _cases;
+    id              _case;
+    id              _letters;
+    id              _searchHits;
+    int             _searchIndex;
+    // Upload
+    CPPanel         _upPanel;
+    CPTextField     _upName;
+    CPTextField     _upFileLabel;
+    CPPopUpButton   _upId;
+    CPPopUpButton   _upEye;
+    CPPopUpButton   _upFrom;
+    CPPopUpButton   _upTo;
+    CPTextField     _upBefore;
+    CPTextField     _upAfter;
+    CPTextView      _upCodes;
+    CPPopUpButton   _upSampleMode;
+    CPTextField     _upSampleN;
+    CPPopUpButton   _upSampleBy;
+    CPTextField     _upSeed;
+    CPString        _upText;
+}
+
++ (ChartReviewController)sharedController
+{
+    if (!CRSharedController)
+        CRSharedController = [[ChartReviewController alloc] init];
+    return CRSharedController;
+}
+
+- (void)show
+{
+    if (!_window)
+        [self _buildWindow];
+    [_window makeKeyAndOrderFront:self];
+    [self loadSets:nil];
+}
+
+- (CPString)reviewer
+{
+    return OTTrim([_reviewerField stringValue] || "");
+}
+
+- (void)_buildWindow
+{
+    _sets = []; _cases = []; _letters = []; _ppEntries = [];
+    _window = [[CPPanel alloc] initWithContentRect:CGRectMake(40, 30, 1300, 800)
+                                         styleMask:CPTitledWindowMask | CPClosableWindowMask | CPResizableWindowMask];
+    [_window setFloatingPanel:YES];
+    [_window setMinSize:CGSizeMake(1000, 560)];
+    [_window setTitle:@"Chart-Review"];
+    var cv = [_window contentView];
+
+    [cv addSubview:OTLabel(CGRectMake(15, 17, 45, 18), "Liste:", YES)];
+    _setPopUp = [[CPPopUpButton alloc] initWithFrame:CGRectMake(60, 12, 300, 26) pullsDown:NO];
+    [_setPopUp setTarget:self];
+    [_setPopUp setAction:@selector(setChanged:)];
+    [cv addSubview:_setPopUp];
+    [cv addSubview:OTButton(CGRectMake(370, 12, 150, 26), "Liste hochladen …", self, @selector(showUpload:))];
+    [cv addSubview:OTButton(CGRectMake(525, 12, 175, 26), "Ergebnis herunterladen", self, @selector(downloadResult:))];
+    [cv addSubview:OTButton(CGRectMake(705, 12, 120, 26), "Liste löschen …", self, @selector(deleteSet:))];
+    [cv addSubview:OTLabel(CGRectMake(840, 17, 50, 18), "Prüfer:", YES)];
+    var stored = "";
+    try { stored = window.localStorage.getItem(OVReviewerStorageKey) || ""; } catch (e) {}
+    _reviewerField = OTField(CGRectMake(890, 12, 140, 26), stored, "Name");
+    [_reviewerField setTarget:self];
+    [_reviewerField setAction:@selector(reviewerChanged:)];
+    [cv addSubview:_reviewerField];
+    _infoLabel = OVM(OTLabel(CGRectMake(1040, 10, 250, 32), "", NO), CPViewWidthSizable);
+    [_infoLabel setTextColor:[CPColor grayColor]];
+    [cv addSubview:_infoLabel];
+
+    // links: Fälle
+    var ct = OVTable(CGRectMake(10, 50, 250, 740), [["pos", "#", 35], ["pseudonym", "PIZ", 85], ["eye", "Auge", 38], ["code", "Urteil", 50], ["state", "Stand", 40]], self);
+    _casesTable = ct.table;
+    [cv addSubview:OVM(ct.scroll, CPViewHeightSizable)];
+
+    // Mitte: Fallinfo, Briefe, Brieftext
+    _caseTitle = OVM(OTLabel(CGRectMake(270, 50, 560, 18), "", YES), CPViewWidthSizable);
+    [cv addSubview:_caseTitle];
+    var info = OVTextArea(CGRectMake(270, 70, 560, 140), YES);
+    _caseInfoView = info.text;
+    [cv addSubview:OVM(info.scroll, CPViewWidthSizable)];
+    var lt = OVTable(CGRectMake(270, 218, 560, 140), [["date", "Datum", 95], ["source", "Quelle", 70], ["len", "Zeichen", 65], ["win", "Zeitfenster", 90], ["npp", "Einträge", 70]], self);
+    _lettersTable = lt.table;
+    [cv addSubview:OVM(lt.scroll, CPViewWidthSizable)];
+    _searchField = OVM([CPTextField textFieldWithStringValue:"" placeholder:"Im Brief suchen …" width:200], CPViewMinXMargin);
+    [_searchField setFrame:CGRectMake(585, 364, 200, 24)];
+    [_searchField setTarget:self];
+    [_searchField setAction:@selector(searchInLetter:)];
+    [_searchField setDelegate:self];
+    [cv addSubview:_searchField];
+    _searchInfo = OVM(OTLabel(CGRectMake(790, 368, 40, 18), "", NO), CPViewMinXMargin);
+    [cv addSubview:_searchInfo];
+    var tv = OVTextArea(CGRectMake(270, 392, 560, 398), NO);
+    _letterView = tv.text;
+    [_letterView setRichText:YES];
+    [_letterView setFont:[CPFont systemFontOfSize:13.0]];
+    [cv addSubview:OVM(tv.scroll, CPViewWidthSizable | CPViewHeightSizable)];
+
+    // rechts: Urteil
+    var rx = 840, rm = CPViewMinXMargin;
+    [cv addSubview:OVM(OTLabel(CGRectMake(rx, 50, 450, 18), "Urteil", YES), rm)];
+    _codePopUp = OVM([[CPPopUpButton alloc] initWithFrame:CGRectMake(rx, 70, 450, 26) pullsDown:NO], rm);
+    [cv addSubview:_codePopUp];
+    [cv addSubview:OVM(OTLabel(CGRectMake(rx, 104, 450, 18), "Kommentar", YES), rm)];
+    var cm = OVTextArea(CGRectMake(rx, 124, 450, 120), NO);
+    _commentView = cm.text;
+    [_commentView setEditable:YES];
+    [cv addSubview:OVM(cm.scroll, rm)];
+    [cv addSubview:OVM(OTButton(CGRectMake(rx, 252, 140, 26), "Speichern", self, @selector(saveReview:)), rm)];
+    [cv addSubview:OVM(OTButton(CGRectMake(rx + 145, 252, 200, 26), "Fall abschließen, nächster", self, @selector(finishCase:)), rm)];
+    [cv addSubview:OVM(OTButton(CGRectMake(rx + 350, 252, 100, 26), "Wieder öffnen", self, @selector(reopenCase:)), rm)];
+    [cv addSubview:OVM(OTLabel(CGRectMake(rx, 290, 450, 18), "Urteile der Prüfer und Legende", YES), rm)];
+    var ot = OVTextArea(CGRectMake(rx, 310, 450, 150), NO);
+    _othersView = ot.text;
+    [cv addSubview:OVM(ot.scroll, rm)];
+    // gespeichertes Phenopacket des gewählten Briefs (Ist-Stand, keine Neuextraktion)
+    _ppTitle = OVM(OTLabel(CGRectMake(rx, 468, 450, 18), "Phenopacket des Briefs (gespeichert)", YES), rm);
+    [cv addSubview:_ppTitle];
+    var pt = OVTable(CGRectMake(rx, 488, 450, 302), [["domain", "Domäne", 72], ["label", "Bezeichnung", 160], ["code", "Code", 90], ["side", "Seite", 36],
+                                                     ["date", "Datum", 78], ["value", "Wert", 60]], self);
+    _ppTable = pt.table;
+    [cv addSubview:OVM(pt.scroll, rm | CPViewHeightSizable)];
+}
+
+- (void)reviewerChanged:(id)sender
+{
+    try { window.localStorage.setItem(OVReviewerStorageKey, [self reviewer]); } catch (e) {}
+    [self _loadCases];
+}
+
+// ---- Listen ---------------------------------------------------------------------
+
+- (void)loadSets:(id)sender
+{
+    var keep = _currentSet ? _currentSet.id : nil;
+    OTGetJSON("/BBB/chartreview/sets?reviewer=" + encodeURIComponent([self reviewer]), 60.0, function(res, error)
+    {
+        _sets = (res && res.length !== undefined) ? res : [];
+        [_setPopUp removeAllItems];
+        if (!_sets.length)
+            [_setPopUp addItemWithTitle:@"– noch keine Liste –"];
+        var sel = 0;
+        for (var i = 0; i < _sets.length; i++)
+        {
+            [_setPopUp addItemWithTitle:_sets[i].name];
+            if (_sets[i].id === keep)
+                sel = i;
+        }
+        [_setPopUp selectItemAtIndex:sel];
+        [self setChanged:nil];
+    });
+}
+
+- (void)setChanged:(id)sender
+{
+    var i = [_setPopUp indexOfSelectedItem];
+    _currentSet = (i >= 0 && i < _sets.length) ? _sets[i] : nil;
+    _case = nil;
+    [self _renderCase];
+    [self _fillCodes:(_currentSet ? _currentSet.codes : [])];
+    [self _loadCases];
+}
+
+- (void)_fillCodes:(id)codes
+{
+    [_codePopUp removeAllItems];
+    [_codePopUp addItemWithTitle:@"– kein Urteil –"];
+    for (var i = 0; i < (codes || []).length; i++)
+        [_codePopUp addItemWithTitle:codes[i].code + " – " + codes[i].label];
+}
+
+- (void)_loadCases
+{
+    if (!_currentSet)
+    {
+        _cases = [];
+        [_casesTable reloadData];
+        [_infoLabel setStringValue:""];
+        return;
+    }
+    var setId = _currentSet.id;
+    OTGetJSON("/BBB/chartreview/sets/" + setId + "/cases?reviewer=" + encodeURIComponent([self reviewer]), 60.0, function(res, error)
+    {
+        if (!_currentSet || _currentSet.id !== setId)
+            return;
+        _cases = (res && res.length !== undefined) ? res : [];
+        [_casesTable reloadData];
+        var done = 0;
+        for (var i = 0; i < _cases.length; i++)
+            if (_cases[i].my_done)
+                done++;
+        var sm = _currentSet.sample;
+        [_infoLabel setStringValue:_cases.length + " Fälle" + (sm ? " (Stichprobe aus " + sm.total + ", Seed " + sm.seed + ")" : "") + " · " + done + " von mir abgeschlossen" +
+                                   (_currentSet.from_col ? " · Fenster: " + _currentSet.from_col + " − " + _currentSet.before_days + " Tage bis " +
+                                    (_currentSet.to_col || _currentSet.from_col) + " + " + _currentSet.after_days + " Tage" : "")];
+        if (!_case && _cases.length)
+            [self _selectCaseAt:[self _nextOpenIndexFrom:-1]];
+    });
+}
+
+- (int)_nextOpenIndexFrom:(int)start
+{
+    for (var i = start + 1; i < _cases.length; i++)
+        if (!_cases[i].my_done)
+            return i;
+    for (var j = 0; j <= start && j < _cases.length; j++)
+        if (!_cases[j].my_done)
+            return j;
+    return Math.max(0, Math.min(start + 1, _cases.length - 1));
+}
+
+- (void)_selectCaseAt:(int)idx
+{
+    if (idx < 0 || idx >= _cases.length)
+        return;
+    [_casesTable selectRowIndexes:[CPIndexSet indexSetWithIndex:idx] byExtendingSelection:NO];
+    [_casesTable scrollRowToVisible:idx];
+    [self _loadCase:_cases[idx].id];
+}
+
+- (void)_loadCase:(int)caseId
+{
+    OTGetJSON("/BBB/chartreview/cases/" + caseId, 60.0, function(res, error)
+    {
+        if (!res || res.error)
+        {
+            OVAlert("Fall nicht ladbar", (res && res.error) || error || "keine Antwort");
+            return;
+        }
+        _case = res;
+        _letters = res.letters || [];
+        [self _renderCase];
+    });
+}
+
+- (void)_renderCase
+{
+    [_lettersTable reloadData];
+    if (!_case)
+    {
+        [_caseTitle setStringValue:""];
+        [_caseInfoView setString:@""];
+        [_letterView setString:@""];
+        [_othersView setString:@""];
+        [_commentView setString:@""];
+        _ppEntries = [];
+        [_ppTable reloadData];
+        return;
+    }
+    var k = _case.case, cols = _case.columns || [], lines = [];
+    for (var i = 0; i < cols.length; i++)
+    {
+        var v = k.data[cols[i]];
+        if (v !== undefined && v !== null && String(v) !== "")
+            lines.push(cols[i] + ": " + v);
+    }
+    [_caseInfoView setString:lines.join("\n")];
+    var inWin = 0;
+    for (var j = 0; j < _letters.length; j++)
+        if (_letters[j].in_window)
+            inWin++;
+    [_caseTitle setStringValue:"Fall " + k.position + " · PIZ " + (k.pseudonym || "–") + (k.eye ? " · " + k.eye : "") +
+                              " · " + _letters.length + " Briefe, " + inWin + " im Zeitfenster" +
+                              (_case.window && _case.window.start ? " (" + _case.window.start + " bis " + (_case.window.end || "") + ")" : "")];
+    // eigenes Urteil
+    var mine = nil, others = [];
+    for (var r = 0; r < (_case.reviews || []).length; r++)
+    {
+        var rv = _case.reviews[r];
+        if (rv.reviewer === [self reviewer])
+            mine = rv;
+        others.push(rv.reviewer + ": " + (rv.code || "–") + (rv.done ? "" : " (offen)") + (rv.comment ? " – " + rv.comment : ""));
+    }
+    [self _fillCodes:_case.codes];
+    var sel = 0;
+    for (var c = 0; mine && c < (_case.codes || []).length; c++)
+        if (_case.codes[c].code === mine.code)
+            sel = c + 1;
+    [_codePopUp selectItemAtIndex:sel];
+    [_commentView setString:mine ? (mine.comment || "") : ""];
+    [_othersView setString:(others.length ? others.join("\n") : "noch keine Urteile") + "\n\n" + (_case.legend || "")];
+    // ersten Brief im Zeitfenster zeigen
+    var first = -1;
+    for (var l = 0; l < _letters.length; l++)
+        if (_letters[l].in_window) { first = l; break; }
+    if (first < 0 && _letters.length)
+        first = 0;
+    if (first >= 0)
+    {
+        [_lettersTable selectRowIndexes:[CPIndexSet indexSetWithIndex:first] byExtendingSelection:NO];
+        [_lettersTable scrollRowToVisible:first];
+        [self _showLetter:first];
+    }
+    else
+    {
+        [_letterView setString:@"Keine Briefe zu dieser PIZ im Bestand."];
+        _ppEntries = [];
+        [_ppTable reloadData];
+        [_ppTitle setStringValue:"Phenopacket des Briefs (gespeichert)"];
+    }
+}
+
+- (void)_showLetter:(int)idx
+{
+    var l = _letters[idx];
+    if (!l)
+        return;
+    [_letterView setString:l.text || ""];
+    [_letterView scrollPoint:CGPointMake(0, 0)];
+    _searchIndex = -1;
+    [self _applySearch:NO];
+    _ppEntries = l.entries || [];
+    [_ppTable reloadData];
+    [_ppTitle setStringValue:l.has_pp ? "Phenopacket des Briefs vom " + (l.date || "") + " (gespeichert, " + _ppEntries.length + " Einträge)"
+                                      : "Zu diesem Brief ist kein Phenopacket gespeichert."];
+}
+
+// ---- Urteil ---------------------------------------------------------------------
+
+- (id)_reviewPayload:(BOOL)done
+{
+    var i = [_codePopUp indexOfSelectedItem];
+    var code = (i > 0 && _case && _case.codes[i - 1]) ? _case.codes[i - 1].code : "";
+    return { reviewer: [self reviewer], code: code, comment: [_commentView string] || "", done: done ? 1 : 0 };
+}
+
+- (void)_save:(BOOL)done then:(Function)aCallback
+{
+    if (!_case)
+        return;
+    if (![self reviewer].length)
+    {
+        OVAlert("Bitte oben einen Prüfer eintragen.");
+        return;
+    }
+    var payload = [self _reviewPayload:done];
+    if (done && !payload.code && (_case.codes || []).length)
+    {
+        OVAlert("Bitte ein Urteil wählen.", "Zum Zwischenspeichern ohne Urteil „Speichern“ verwenden.");
+        return;
+    }
+    OTPostJSON("/BBB/chartreview/cases/" + _case.case.id + "/review", payload, 60.0, function(res, error)
+    {
+        if (!res || res.error)
+        {
+            OVAlert("Speichern fehlgeschlagen", (res && res.error) || error || "keine Antwort");
+            return;
+        }
+        for (var i = 0; i < _cases.length; i++)
+            if (_cases[i].id === _case.case.id)
+            {
+                _cases[i].my_code = payload.code;
+                _cases[i].my_done = done;
+            }
+        [_casesTable reloadData];
+        if (aCallback)
+            aCallback();
+    });
+}
+
+- (void)saveReview:(id)sender
+{
+    [self _save:NO then:nil];
+}
+
+- (void)finishCase:(id)sender
+{
+    var row = [_casesTable selectedRow];
+    [self _save:YES then:function()
+    {
+        [self _loadCases];
+        [self _selectCaseAt:[self _nextOpenIndexFrom:row]];
+    }];
+}
+
+- (void)reopenCase:(id)sender
+{
+    [self _save:NO then:nil];
+}
+
+// ---- Tabellen -------------------------------------------------------------------
+
+- (int)numberOfRowsInTableView:(CPTableView)aTable
+{
+    if (aTable === _ppTable)
+        return _ppEntries.length;
+    return aTable === _casesTable ? _cases.length : _letters.length;
+}
+
+- (id)tableView:(CPTableView)aTable objectValueForTableColumn:(CPTableColumn)aColumn row:(int)row
+{
+    var id = [aColumn identifier];
+    if (aTable === _casesTable)
+    {
+        var k = _cases[row];
+        if (!k) return "";
+        switch (id)
+        {
+            case "pos":       return k.position;
+            case "pseudonym": return k.pseudonym || "–";
+            case "eye":       return k.eye || "";
+            case "code":      return k.my_code || "";
+            case "state":     return k.my_done ? "fertig" : (k.n_done > 0 ? k.n_done + "×" : "");
+        }
+        return "";
+    }
+    if (aTable === _ppTable)
+    {
+        var e = _ppEntries[row];
+        if (!e) return "";
+        switch (id)
+        {
+            case "domain": return OVDomainTitles[e.domain] || e.domain || "";
+            case "label":  return (e.excluded ? "[verneint] " : "") + (e.label || "");
+            case "code":   return e.code || "";
+            case "side":   return { R: "RA", L: "LA", B: "bds." }[e.side] || "";
+            case "date":   return e.date || "";
+            case "value":  return e.value !== undefined && e.value !== null && String(e.value) !== "" ? String(e.value) + (e.unit ? " " + e.unit : "") : "";
+        }
+        return "";
+    }
+    var l = _letters[row];
+    if (!l) return "";
+    switch (id)
+    {
+        case "npp":    return l.has_pp ? (l.entries || []).length : "keins";
+        case "date":   return l.date || "";
+        case "source": return l.source || "";
+        case "len":    return (l.text || "").length;
+        case "win":    return l.in_window ? "im Fenster" : "";
+    }
+    return "";
+}
+
+- (void)tableViewSelectionDidChange:(CPNotification)aNotification
+{
+    var table = [aNotification object];
+    var row = [table selectedRow];
+    if (row < 0)
+        return;
+    if (table === _casesTable)
+    {
+        if (!_case || !_cases[row] || _cases[row].id !== _case.case.id)
+            [self _loadCase:_cases[row].id];
+    }
+    else if (table === _lettersTable)
+        [self _showLetter:row];
+    else if (table === _ppTable)
+    {
+        // Bezeichnung im Brief suchen (erstes Wort mit mindestens 5 Buchstaben)
+        var e = _ppEntries[row], words = ((e && e.label) || "").match(/[A-Za-zÄÖÜäöüß]{5,}/g) || [];
+        if (words.length)
+        {
+            [_searchField setStringValue:words[0]];
+            _searchIndex = -1;
+            [self searchInLetter:nil];
+        }
+    }
+}
+
+// ---- Suche im Brief ---------------------------------------------------------------
+
+- (void)controlTextDidChange:(CPNotification)aNotification
+{
+    if ([aNotification object] !== _searchField)
+        return;
+    _searchIndex = -1;
+    [self _applySearch:YES];
+}
+
+- (void)searchInLetter:(id)sender
+{
+    if (typeof _searchIndex !== "number" || isNaN(_searchIndex))
+        _searchIndex = -1;
+    _searchIndex++;
+    [self _applySearch:YES];
+}
+
+- (void)_applySearch:(BOOL)shouldScroll
+{
+    var storage = [_letterView textStorage], len = [storage length];
+    [storage removeAttribute:CPBackgroundColorAttributeName range:CPMakeRange(0, len)];
+    var term = OTTrim([_searchField stringValue] || "").toLowerCase(), text = ([_letterView string] || "").toLowerCase();
+    var hits = [];
+    if (term.length >= 2)
+    {
+        var pos = text.indexOf(term);
+        while (pos >= 0 && hits.length < 500)
+        {
+            hits.push(CPMakeRange(pos, term.length));
+            pos = text.indexOf(term, pos + term.length);
+        }
+    }
+    if (!hits.length)
+    {
+        [_searchInfo setStringValue:(term.length >= 2 ? "0" : "")];
+        return;
+    }
+    if (_searchIndex < 0 || _searchIndex >= hits.length)
+        _searchIndex = 0;
+    var other = [CPColor colorWithRed:0.93 green:0.80 blue:1.0 alpha:1.0], current = [CPColor colorWithRed:0.75 green:0.50 blue:1.0 alpha:1.0];
+    for (var i = 0; i < hits.length; i++)
+        [storage addAttribute:CPBackgroundColorAttributeName value:(i === _searchIndex ? current : other) range:hits[i]];
+    [_searchInfo setStringValue:(_searchIndex + 1) + "/" + hits.length];
+    if (shouldScroll)
+        [_letterView scrollRangeToVisible:hits[_searchIndex]];
+}
+
+// ---- Ergebnis, Löschen -----------------------------------------------------------
+
+- (void)downloadResult:(id)sender
+{
+    if (!_currentSet)
+        return;
+    window.open("/BBB/chartreview/sets/" + _currentSet.id + "/result.csv", "_blank");
+}
+
+- (void)deleteSet:(id)sender
+{
+    if (!_currentSet)
+        return;
+    var set = _currentSet;
+    [OVDialog prompt:"Liste „" + set.name + "“ mit allen Urteilen löschen?"
+                info:"Zur Bestätigung den Namen der Liste eingeben. Vorher das Ergebnis herunterladen."
+               value:"" ok:"Löschen" then:function(value)
+    {
+        if (value !== set.name)
+            return;
+        var req = new XMLHttpRequest();
+        req.open("DELETE", "/BBB/chartreview/sets/" + set.id + "?confirm=" + encodeURIComponent(value), true);
+        req.onreadystatechange = function()
+        {
+            if (req.readyState !== 4)
+                return;
+            if (req.status !== 200)
+                OVAlert("Löschen fehlgeschlagen", "HTTP " + req.status);
+            _currentSet = nil;
+            [self loadSets:nil];
+            [[CPRunLoop currentRunLoop] limitDateForMode:CPDefaultRunLoopMode];
+        };
+        req.send(null);
+    }];
+}
+
+// ---- Hochladen ---------------------------------------------------------------------
+
+- (void)showUpload:(id)sender
+{
+    if (!_upPanel)
+        [self _buildUploadPanel];
+    _upText = nil;
+    [_upFileLabel setStringValue:"keine Datei gewählt"];
+    [self _fillColumnPopUps:[]];
+    [_upPanel makeKeyAndOrderFront:self];
+}
+
+- (void)_buildUploadPanel
+{
+    _upPanel = [[CPPanel alloc] initWithContentRect:CGRectMake(150, 60, 560, 690) styleMask:CPTitledWindowMask | CPClosableWindowMask];
+    [_upPanel setFloatingPanel:YES];
+    [_upPanel setTitle:@"Chart-Review-Liste hochladen"];
+    var cv = [_upPanel contentView], y = 15, lx = 15, fx = 175, w = 370;
+    var row = function(label, view, h)
+    {
+        [cv addSubview:OTLabel(CGRectMake(lx, y + 4, 155, 18), label, YES)];
+        [view setFrame:CGRectMake(fx, y, w, h || 26)];
+        [cv addSubview:view];
+        y += (h || 26) + 8;
+    };
+    _upName = OTField(CGRectMake(0, 0, w, 26), "", "z. B. DMEK-Versagen Chart-Review");
+    row("Name", _upName);
+    var fileButton = OTButton(CGRectMake(0, 0, 130, 26), "CSV wählen …", self, @selector(chooseFile:));
+    [cv addSubview:OTLabel(CGRectMake(lx, y + 4, 155, 18), "Datei", YES)];
+    [fileButton setFrame:CGRectMake(fx, y, 130, 26)];
+    [cv addSubview:fileButton];
+    _upFileLabel = OTLabel(CGRectMake(fx + 140, y + 4, w - 140, 18), "keine Datei gewählt", NO);
+    [cv addSubview:_upFileLabel];
+    y += 34;
+    _upId   = [[CPPopUpButton alloc] initWithFrame:CGRectMakeZero() pullsDown:NO]; row("Spalte Patienten-ID", _upId);
+    _upEye  = [[CPPopUpButton alloc] initWithFrame:CGRectMakeZero() pullsDown:NO]; row("Spalte Auge", _upEye);
+    _upFrom = [[CPPopUpButton alloc] initWithFrame:CGRectMakeZero() pullsDown:NO]; row("Zeitfenster: Beginn", _upFrom);
+    _upBefore = OTField(CGRectMakeZero(), "365", "Tage"); row("… Tage davor", _upBefore);
+    _upTo   = [[CPPopUpButton alloc] initWithFrame:CGRectMakeZero() pullsDown:NO]; row("Zeitfenster: Ende", _upTo);
+    _upAfter  = OTField(CGRectMakeZero(), "30", "Tage");  row("… Tage danach", _upAfter);
+    _upSampleMode = [[CPPopUpButton alloc] initWithFrame:CGRectMakeZero() pullsDown:NO];
+    [_upSampleMode addItemsWithTitles:["alle Fälle der Liste", "Zufallsstichprobe von n Fällen", "Zufallsstichprobe von n Fällen je Gruppe"]];
+    row("Stichprobe", _upSampleMode);
+    _upSampleN = OTField(CGRectMakeZero(), "50", "n"); row("n", _upSampleN);
+    _upSampleBy = [[CPPopUpButton alloc] initWithFrame:CGRectMakeZero() pullsDown:NO]; row("Gruppe aus Spalte", _upSampleBy);
+    _upSeed = OTField(CGRectMakeZero(), String(Math.floor(Math.random() * 900000000) + 100000000), "Seed"); row("Seed", _upSeed);
+    [cv addSubview:OTLabel(CGRectMake(lx, y + 4, 155, 36), "Urteilscodes\n(je Zeile „P = …“)", YES)];
+    var codes = OVTextArea(CGRectMake(fx, y, w, 150), YES);
+    _upCodes = codes.text;
+    [_upCodes setEditable:YES];
+    [cv addSubview:codes.scroll];
+    y += 160;
+    [cv addSubview:OTLabel(CGRectMake(lx, y, 530, 36), "Es wird nichts neu extrahiert: gezeigt werden die gespeicherten Briefe. Briefe außerhalb des Zeitfensters erscheinen unmarkiert; ohne Zeitfenster gelten alle Briefe des Patienten.", NO)];
+    y += 44;
+    [cv addSubview:OTButton(CGRectMake(325, y, 100, 26), "Abbrechen", self, @selector(cancelUpload:))];
+    [cv addSubview:OTButton(CGRectMake(435, y, 110, 26), "Hochladen", self, @selector(doUpload:))];
+}
+
+- (void)_fillColumnPopUps:(id)cols
+{
+    var fill = function(popup, allowNone, guess)
+    {
+        [popup removeAllItems];
+        if (allowNone)
+            [popup addItemWithTitle:@"– keine –"];
+        for (var i = 0; i < cols.length; i++)
+            [popup addItemWithTitle:cols[i]];
+        if (guess)
+            [popup selectItemWithTitle:guess];
+    };
+    fill(_upId, NO, CRGuess(cols, /^(piz|pseudonym|pid|patient)/i));
+    fill(_upEye, YES, CRGuess(cols, /^(auge|seite|eye|lat)/i));
+    var dates = [];
+    for (var i = 0; i < cols.length; i++)
+        if (/(date|datum)/i.test(cols[i]))
+            dates.push(cols[i]);
+    fill(_upFrom, YES, dates[0]);
+    fill(_upTo, YES, dates[1]);
+    fill(_upSampleBy, YES, CRGuess(cols, /^(stichprobe|gruppe|group|arm|kohorte)/i));
+}
+
+- (void)chooseFile:(id)sender
+{
+    var input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".csv,.txt,text/csv";
+    input.onchange = function()
+    {
+        var file = input.files && input.files[0];
+        if (!file)
+            return;
+        var read = function(encoding, retry)
+        {
+            var fr = new FileReader();
+            fr.onload = function()
+            {
+                var text = fr.result || "";
+                if (retry && text.indexOf("\uFFFD") >= 0)
+                {
+                    read("windows-1252", NO);       // Excel-CSV in Windows-Kodierung
+                    return;
+                }
+                _upText = text;
+                var cols = CRHeaderOf(text);
+                var lines = text.split(/\r?\n/).filter(function(x) { return x.trim().length; }).length - 1;
+                [_upFileLabel setStringValue:file.name + " · " + lines + " Zeilen, " + cols.length + " Spalten"];
+                [self _fillColumnPopUps:cols];
+                if (!OTTrim([_upName stringValue] || "").length)
+                    [_upName setStringValue:file.name.replace(/\.[^.]+$/, "")];
+                [[CPRunLoop currentRunLoop] limitDateForMode:CPDefaultRunLoopMode];
+            };
+            fr.readAsText(file, encoding);
+        };
+        read("UTF-8", YES);
+    };
+    input.click();
+}
+
+- (void)cancelUpload:(id)sender
+{
+    [_upPanel orderOut:self];
+}
+
+- (CPString)_popValue:(CPPopUpButton)popup
+{
+    var t = [popup titleOfSelectedItem];
+    return (!t || t === "– keine –") ? "" : t;
+}
+
+- (void)doUpload:(id)sender
+{
+    if (!_upText)
+    {
+        OVAlert("Bitte zuerst eine CSV-Datei wählen.");
+        return;
+    }
+    var payload = {
+        name: OTTrim([_upName stringValue] || ""), csv: _upText, reviewer: [self reviewer],
+        id_col: [self _popValue:_upId], eye_col: [self _popValue:_upEye],
+        from_col: [self _popValue:_upFrom], to_col: [self _popValue:_upTo],
+        before_days: parseInt([_upBefore stringValue], 10) || 0, after_days: parseInt([_upAfter stringValue], 10) || 0,
+        codes: [_upCodes string] || ""
+    };
+    var mode = [_upSampleMode indexOfSelectedItem];
+    if (mode > 0)
+    {
+        payload.sample_n = parseInt([_upSampleN stringValue], 10) || 0;
+        payload.sample_seed = OTTrim([_upSeed stringValue] || "");
+        if (mode === 2)
+            payload.sample_by = [self _popValue:_upSampleBy];
+        if (payload.sample_n <= 0 || (mode === 2 && !payload.sample_by))
+        {
+            OVAlert("Stichprobe unvollständig", "Bitte n angeben" + (mode === 2 ? " und eine Spalte für die Gruppen wählen." : "."));
+            return;
+        }
+    }
+    OTPostJSON("/BBB/chartreview/sets", payload, 120.0, function(res, error)
+    {
+        if (!res || res.error)
+        {
+            OVAlert("Hochladen fehlgeschlagen", (res && res.error) || error || "keine Antwort");
+            return;
+        }
+        [_upPanel orderOut:self];
+        var smp = res.sample ? "Stichprobe: " + res.sample.drawn + " von " + res.sample.total + " Zeilen" + (res.sample.by ? " (je Wert von „" + res.sample.by + "“ höchstens " + res.sample.n + ")" : "") + ", Seed " + res.sample.seed + ". " : "";
+        OVAlert("Liste angelegt", smp + res.n_cases + " Fälle, davon " + res.n_with_letters + " mit Briefen im Bestand" +
+                (res.n_without_id ? ", " + res.n_without_id + " ohne Patienten-ID" : "") + ". " +
+                (res.n_codes ? res.n_codes + " Urteilscodes erkannt." : "Keine Urteilscodes erkannt: Urteile nur als Kommentar."));
+        _currentSet = { id: res.id };
+        [self loadSets:nil];
+    });
 }
 
 @end

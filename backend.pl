@@ -13780,6 +13780,278 @@ sub _val_judge_agreement {
 # GENERIC DB REST CRUD ENDPOINTS
 # =========================================================
 
+# =========================================================================
+# CHART-REVIEW
+# Fall-Listen retrospektiver Studien (CSV, z. B. die Arbeitsliste aus dem R-Skript) hochladen,
+# je Fall die Briefe des Patienten im Zeitfenster prüfen, Urteile je Prüfer, Ergebnis als CSV.
+# Die Listen enthalten identifizierende Daten und bleiben im Haus.
+# =========================================================================
+
+# CSV-Text -> (Kopfzeile, Zeilen, Trennzeichen); Trennzeichen aus der Kopfzeile erkannt
+sub _cr_parse_csv {
+    my ($text) = @_;
+    $text =~ s/^\x{FEFF}//;
+    $text =~ s/\r\n?/\n/g;
+    my ($first) = $text =~ /^([^\n]*)/;
+    my %cnt = map { my $d = $_; ($d => scalar(() = $first =~ /\Q$d\E/g)) } (',', ';', "\t");
+    my ($delim) = sort { $cnt{$b} <=> $cnt{$a} } keys %cnt;
+    my (@rows, @row, $field, $inq);
+    $field = '';
+    my $len = length $text;
+    for (my $i = 0; $i < $len; $i++) {
+        my $ch = substr($text, $i, 1);
+        if ($inq) {
+            if ($ch eq '"') {
+                if (substr($text, $i + 1, 1) eq '"') { $field .= '"'; $i++ } else { $inq = 0 }
+            } else { $field .= $ch }
+        } elsif ($ch eq '"' && $field eq '') { $inq = 1 }
+        elsif ($ch eq $delim) { push @row, $field; $field = '' }
+        elsif ($ch eq "\n") { push @row, $field; push @rows, [@row] if grep { length } @row; @row = (); $field = '' }
+        else { $field .= $ch }
+    }
+    if (length $field || @row) { push @row, $field; push @rows, [@row] if grep { length } @row }
+    my $header = shift(@rows) // [];
+    s/^\s+|\s+$//g for @$header;
+    return ($header, \@rows, $delim);
+}
+
+sub _cr_norm_id {
+    my $x = shift // '';
+    $x =~ s/^\s+|\s+$//g;
+    $x =~ s/\.0+$//;
+    $x =~ s/^0+(?=\d)// if $x =~ /^\d+$/;
+    return length $x ? uc $x : undef;
+}
+
+sub _cr_norm_eye {
+    my $x = uc(shift // '');
+    $x =~ s/^\s+|\s+$//g;
+    return 'R' if $x =~ /^(?:RA|R|OD|RECHTS|RIGHT)$/;
+    return 'L' if $x =~ /^(?:LA|L|OS|LINKS|LEFT)$/;
+    return 'B' if $x =~ /^(?:BA|B|BDS\.?|BEIDSEITS|OU|BOTH)$/;
+    return '';
+}
+
+sub _cr_date {
+    my $x = shift // '';
+    return "$1-$2-$3" if $x =~ /^\s*(\d{4})-(\d{2})-(\d{2})/;
+    return sprintf('%04d-%02d-%02d', $3, $2, $1) if $x =~ /^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})/;
+    return undef;
+}
+
+# "P = primäres Versagen" je Zeile; mehrere Codes in einer Zeile mit " / " getrennt
+sub _cr_parse_codes {
+    my $text = shift // '';
+    my @codes;
+    for my $line (split /\n/, $text) {
+        for my $part (split m{\s+/\s+(?=[A-Za-z0-9]{1,4}\s*[=:])}, $line) {
+            next unless $part =~ /^\s*([A-Za-z0-9]{1,4})\s*[=:]\s*(.+?)\s*$/;
+            push @codes, { code => $1, label => $2 } unless grep { $_->{code} eq $1 } @codes;
+        }
+    }
+    return \@codes;
+}
+
+sub _cr_csv_field {
+    my ($v, $delim) = @_;
+    $v //= '';
+    $v = qq{"} . ($v =~ s/"/""/gr) . qq{"} if $v =~ /[\Q$delim\E"\n\r]/;
+    return $v;
+}
+
+get '/BBB/chartreview/sets' => sub {
+    my $c  = shift;
+    my $me = $c->param('reviewer') // '';
+    my $rows = $c->pg->db->query(q{
+        SELECT s.id, s.name, s.created_by, s.created_at, s.locked, s.id_col, s.eye_col, s.from_col, s.to_col,
+               s.before_days, s.after_days, s.codes, s.legend, s.sample,
+               (SELECT count(*) FROM chartreview_cases k WHERE k.set_id = s.id) AS n_cases,
+               (SELECT count(*) FROM chartreview_cases k JOIN chartreview_reviews r ON r.case_id = k.id
+                 WHERE k.set_id = s.id AND r.reviewer = ? AND r.done) AS n_done_mine,
+               (SELECT count(DISTINCT r.reviewer) FROM chartreview_cases k JOIN chartreview_reviews r ON r.case_id = k.id
+                 WHERE k.set_id = s.id) AS n_reviewers
+        FROM chartreview_sets s ORDER BY s.created_at DESC}, $me)->expand->hashes->to_array;
+    $c->render(json => $rows);
+};
+
+post '/BBB/chartreview/sets' => sub {
+    my $c  = shift;
+    my $p  = $c->req->json // {};
+    my $db = $c->pg->db;
+    my $name = $p->{name} // ''; $name =~ s/^\s+|\s+$//g;
+    return $c->render(json => { error => 'Bitte einen Namen angeben.' }, status => 400) unless length $name;
+    return $c->render(json => { error => "Liste \"$name\" existiert bereits." }, status => 409)
+        if $db->query('SELECT 1 FROM chartreview_sets WHERE name = ?', $name)->array;
+    my ($header, $rows, $delim) = _cr_parse_csv($p->{csv} // '');
+    return $c->render(json => { error => 'Die Datei enthält keine Zeilen.' }, status => 400) unless @$header && @$rows;
+    return $c->render(json => { error => 'Höchstens 5000 Fälle je Liste.' }, status => 400) if @$rows > 5000;
+    my %col = map { $header->[$_] => $_ } 0 .. $#$header;
+    my $idc = $p->{id_col} // '';
+    return $c->render(json => { error => "Spalte \"$idc\" für die Patienten-ID fehlt in der Datei." }, status => 400) unless exists $col{$idc};
+    for my $k (qw(eye_col from_col to_col)) {
+        my $v = $p->{$k} // '';
+        return $c->render(json => { error => "Spalte \"$v\" fehlt in der Datei." }, status => 400) if length $v && !exists $col{$v};
+    }
+    my $codes = _cr_parse_codes($p->{codes});
+
+    # Stichprobe: alle Zeilen, n zufällig oder n je Gruppe (Wert einer Spalte); reproduzierbar über den Seed
+    my $total = scalar @$rows;
+    my @idx = (0 .. $#$rows);
+    my $n_sample = int($p->{sample_n} // 0);
+    my $by = $p->{sample_by} // '';
+    my $seed = length($p->{sample_seed} // '') ? $p->{sample_seed} : int(rand(1e9));
+    return $c->render(json => { error => "Spalte \"$by\" für die Gruppen fehlt in der Datei." }, status => 400) if length $by && !exists $col{$by};
+    my $sample;
+    if ($n_sample > 0) {
+        my %key = map { $_ => md5_hex("$seed:$_") } @idx;
+        my %grp;
+        push @{ $grp{ length $by ? ($rows->[$_][ $col{$by} ] // '') : '' } }, $_ for @idx;
+        my (@pick, %per);
+        for my $g (sort keys %grp) {
+            my @o = sort { $key{$a} cmp $key{$b} } @{ $grp{$g} };
+            my @take = @o[0 .. ($n_sample < @o ? $n_sample : scalar @o) - 1];
+            push @pick, @take;
+            $per{$g} = { available => scalar @o, drawn => scalar @take } if length $by;
+        }
+        @idx = sort { $a <=> $b } @pick;
+        $sample = { n => $n_sample, seed => "$seed", by => length $by ? $by : undef, total => $total, drawn => scalar @idx,
+                    (length $by ? (groups => \%per) : ()) };
+    }
+    my $tx = $db->begin;
+    my $sid = $db->insert('chartreview_sets', {
+        name => $name, created_by => $p->{reviewer} // '', columns => to_json($header), delimiter => $delim,
+        id_col => $idc, eye_col => $p->{eye_col} || undef, from_col => $p->{from_col} || undef, to_col => $p->{to_col} || undef,
+        before_days => int($p->{before_days} // 0), after_days => int($p->{after_days} // 0),
+        codes => to_json($codes), legend => $p->{codes} // '', sample => $sample ? to_json($sample) : undef }, { returning => 'id' })->hash->{id};
+    my ($pos, $no_id) = (0, 0);
+    for my $i (@idx) {
+        my $r = $rows->[$i];
+        my %d = map { $header->[$_] => $r->[$_] // '' } 0 .. $#$header;
+        my $pid = _cr_norm_id($d{$idc});
+        $no_id++ unless defined $pid;
+        $db->insert('chartreview_cases', {
+            set_id => $sid, position => ++$pos, pseudonym => $pid, row_no => $i + 1,
+            eye => length($p->{eye_col} // '') ? _cr_norm_eye($d{ $p->{eye_col} }) : '',
+            date_from => length($p->{from_col} // '') ? _cr_date($d{ $p->{from_col} }) : undef,
+            date_to   => length($p->{to_col} // '')   ? _cr_date($d{ $p->{to_col} })   : undef,
+            data => to_json(\%d) });
+    }
+    $tx->commit;
+    my $with_letters = $db->query(q{SELECT count(DISTINCT k.id) FROM chartreview_cases k
+                                   JOIN candidates c ON regexp_replace(trim(c.pseudonym), '^0+(?=\d)', '') = k.pseudonym
+                                   WHERE k.set_id = ?}, $sid)->array->[0];
+    $c->app->log->info("[CHARTREVIEW] Liste $sid \"$name\": $pos Fälle, $with_letters mit Briefen, " . scalar(@$codes) . ' Urteilscodes');
+    $c->render(json => { ok => 1, id => $sid, n_cases => $pos, n_rows => $total, n_with_letters => $with_letters + 0, n_without_id => $no_id,
+                         n_codes => scalar @$codes, delimiter => $delim, sample => $sample });
+};
+
+del '/BBB/chartreview/sets/:id' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = $db->query('SELECT id, name FROM chartreview_sets WHERE id = ?', $c->param('id'))->hash
+        or return $c->render(json => { error => 'Liste nicht gefunden' }, status => 404);
+    return $c->render(json => { error => 'Bitte den Namen der Liste zur Bestätigung eingeben.' }, status => 400)
+        unless ($c->param('confirm') // '') eq $set->{name};
+    $db->query('DELETE FROM chartreview_sets WHERE id = ?', $set->{id});
+    $c->render(json => { ok => 1 });
+};
+
+get '/BBB/chartreview/sets/:id/cases' => sub {
+    my $c  = shift;
+    my $me = $c->param('reviewer') // '';
+    my $rows = $c->pg->db->query(q{
+        SELECT k.id, k.position, k.pseudonym, k.eye, k.date_from, k.date_to,
+               r.code AS my_code, COALESCE(r.done, false) AS my_done,
+               (SELECT count(*) FROM chartreview_reviews o WHERE o.case_id = k.id AND o.done) AS n_done,
+               (SELECT string_agg(DISTINCT o.code, '/') FROM chartreview_reviews o WHERE o.case_id = k.id AND o.done AND o.code <> '') AS codes_done
+        FROM chartreview_cases k
+        LEFT JOIN chartreview_reviews r ON r.case_id = k.id AND r.reviewer = ?
+        WHERE k.set_id = ? ORDER BY k.position}, $me, $c->param('id'))->hashes->to_array;
+    $c->render(json => $rows);
+};
+
+get '/BBB/chartreview/cases/:id' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $k   = $db->query('SELECT * FROM chartreview_cases WHERE id = ?', $c->param('id'))->expand->hash
+        or return $c->render(json => { error => 'Fall nicht gefunden' }, status => 404);
+    my $set = $db->query('SELECT * FROM chartreview_sets WHERE id = ?', $k->{set_id})->expand->hash;
+    my ($start, $end);
+    my $d_first = $k->{date_from} // $k->{date_to};
+    my $d_last  = $k->{date_to}   // $k->{date_from};
+    ($start) = $db->query(q{SELECT (?::date - ?::int)::text}, $d_first, $set->{before_days})->array->[0] if defined $d_first;
+    ($end)   = $db->query(q{SELECT (?::date + ?::int)::text}, $d_last, $set->{after_days})->array->[0] if defined $d_last;
+    my $letters = defined $k->{pseudonym} ? $db->query(q{
+        SELECT c.id, c.reference_date::text AS date, c.doc_source AS source, c.narrative_report AS text,
+               c.phenopacket_json::text AS pp_json
+        FROM candidates c
+        WHERE regexp_replace(trim(c.pseudonym), '^0+(?=\d)', '') = ? AND c.narrative_report IS NOT NULL
+        ORDER BY c.reference_date, c.id}, $k->{pseudonym})->hashes->to_array : [];
+ for my $l (@$letters) {
+        # gespeichertes Phenopacket (Ist-Stand, keine Neuextraktion) als Einträge
+        my $pp = defined $l->{pp_json} ? eval { from_json($l->{pp_json}) } : undef;
+        delete $l->{pp_json};
+        $l->{has_pp}  = $pp ? 1 : 0;
+        $l->{entries} = $pp ? [ map { { domain => $_->{domain}, code => $_->{code}, label => $_->{label}, side => $_->{side},
+                                        date => $_->{date}, excluded => $_->{excluded} ? 1 : 0, value => $_->{value}, unit => $_->{unit} } }
+                                @{ _val_entries($pp) } ] : [];
+        $l->{in_window} = (!defined $start || ($l->{date} // '') ge $start) && (!defined $end || ($l->{date} // '') le $end) ? 1 : 0;
+    }
+    my $reviews = $db->query('SELECT reviewer, code, comment, done, updated_at FROM chartreview_reviews WHERE case_id = ? ORDER BY reviewer', $k->{id})->hashes->to_array;
+    $c->render(json => { case => $k, columns => $set->{columns}, codes => $set->{codes}, legend => $set->{legend},
+                         window => { start => $start, end => $end }, letters => $letters, reviews => $reviews, locked => $set->{locked} ? 1 : 0 });
+};
+
+post '/BBB/chartreview/cases/:id/review' => sub {
+    my $c  = shift;
+    my $p  = $c->req->json // {};
+    my $db = $c->pg->db;
+    my $rv = $p->{reviewer} // ''; $rv =~ s/^\s+|\s+$//g;
+    return $c->render(json => { error => 'Bitte oben einen Prüfer eintragen.' }, status => 400) unless length $rv;
+    my $k = $db->query(q{SELECT k.id, s.locked FROM chartreview_cases k JOIN chartreview_sets s ON s.id = k.set_id WHERE k.id = ?}, $c->param('id'))->hash
+        or return $c->render(json => { error => 'Fall nicht gefunden' }, status => 404);
+    return $c->render(json => { error => 'Die Liste ist gesperrt.' }, status => 409) if $k->{locked};
+    $db->query(q{INSERT INTO chartreview_reviews (case_id, reviewer, code, comment, done, updated_at) VALUES (?, ?, ?, ?, ?, now())
+                 ON CONFLICT (case_id, reviewer) DO UPDATE SET code = EXCLUDED.code, comment = EXCLUDED.comment,
+                                                              done = EXCLUDED.done, updated_at = now()},
+               $k->{id}, $rv, $p->{code} // '', $p->{comment} // '', $p->{done} ? 1 : 0);
+    $c->render(json => { ok => 1 });
+};
+
+# Ergebnis: Originalspalten + je Prüfer Urteil, Kommentar, fertig + Konsens
+get '/BBB/chartreview/sets/:id/result.csv' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = $db->query('SELECT * FROM chartreview_sets WHERE id = ?', $c->param('id'))->expand->hash
+        or return $c->render(text => 'Liste nicht gefunden', status => 404);
+    my $cases = $db->query('SELECT id, data, row_no FROM chartreview_cases WHERE set_id = ? ORDER BY position', $set->{id})->expand->hashes->to_array;
+    my %rev;
+    for my $r (@{ $db->query(q{SELECT r.* FROM chartreview_reviews r JOIN chartreview_cases k ON k.id = r.case_id WHERE k.set_id = ?}, $set->{id})->hashes }) {
+        $rev{ $r->{case_id} }{ $r->{reviewer} } = $r;
+    }
+    my %seen; my @reviewers = sort grep { !$seen{$_}++ } map { keys %$_ } values %rev;
+    my $d = $set->{delimiter} // ',';
+    my @head = ('zeile_original', @{ $set->{columns} }, (map { my $t = $_ =~ s/[^A-Za-z0-9]+/_/gr; ("urteil_$t", "kommentar_$t", "fertig_$t") } @reviewers), 'urteil_konsens');
+    my @out = (join $d, map { _cr_csv_field($_, $d) } @head);
+    for my $k (@$cases) {
+        my @v = ($k->{row_no} // '', map { $k->{data}{$_} } @{ $set->{columns} });
+        my %codes;
+        for my $r (@reviewers) {
+            my $x = $rev{ $k->{id} }{$r};
+            push @v, $x ? ($x->{code}, $x->{comment}, $x->{done} ? 'ja' : 'nein') : ('', '', '');
+            $codes{ $x->{code} }++ if $x && $x->{done} && length($x->{code} // '');
+        }
+        push @v, keys(%codes) == 1 ? (keys %codes)[0] : keys(%codes) > 1 ? 'uneinig' : '';
+        push @out, join $d, map { _cr_csv_field($_, $d) } @v;
+    }
+    (my $file = $set->{name}) =~ s/[^A-Za-z0-9._-]+/_/g;
+    $c->res->headers->content_type('text/csv; charset=UTF-8');
+    $c->res->headers->content_disposition(qq{attachment; filename="${file}_ergebnis.csv"});
+    $c->render(data => Encode::encode('UTF-8', "\x{FEFF}" . join("\n", @out) . "\n"));
+};
+
+
+
 get '/BBB/:table/:col/:pk' => [col => qr/[a-z_0-9\s]+/, pk => qr/[a-z0-9\s\-_\.]+/i] => sub {
     my $self  = shift;
     my $table = resolve_table_name($self->param('table'));

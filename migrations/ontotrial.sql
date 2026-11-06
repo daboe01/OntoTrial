@@ -4,7 +4,7 @@
 -- Bestehende Datenbanken, die das Schema schon haben, werden beim ersten Start
 -- nur als Version 1 markiert, ohne dass etwas ausgeführt wird.
 --
--- Schemaänderungen: neuen Abschnitt "-- 14 up" (und "-- 14 down") unten anfügen,
+-- Schemaänderungen: neuen Abschnitt "-- 16 up" (und "-- 16 down") unten anfügen,
 -- nie eine bereits ausgerollte Version nachträglich ändern.
 --
 -- Nicht enthalten: Minion-Tabellen (verwaltet Minion selbst), mojo_migrations,
@@ -1564,3 +1564,59 @@ ALTER TABLE validation_run_items ADD COLUMN IF NOT EXISTS seconds real;
 -- 13 down
 ALTER TABLE validation_run_items DROP COLUMN IF EXISTS seconds;
 ALTER TABLE validation_runs DROP COLUMN IF EXISTS queued_at;
+
+-- 14 up
+-- Chart-Review: hochgeladene Fall-Listen (z. B. Arbeitslisten retrospektiver Studien),
+-- je Fall alle Briefe des Patienten im Zeitfenster, Urteile je Prüfer, Ergebnis als CSV.
+CREATE TABLE IF NOT EXISTS chartreview_sets (
+    id            serial PRIMARY KEY,
+    name          text NOT NULL UNIQUE,
+    created_by    text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    columns       jsonb NOT NULL DEFAULT '[]',
+    delimiter     text NOT NULL DEFAULT ',',
+    id_col        text NOT NULL,
+    eye_col       text,
+    from_col      text,
+    to_col        text,
+    before_days   integer NOT NULL DEFAULT 0,
+    after_days    integer NOT NULL DEFAULT 0,
+    codes         jsonb NOT NULL DEFAULT '[]',
+    legend        text,
+    locked        boolean NOT NULL DEFAULT false
+);
+CREATE TABLE IF NOT EXISTS chartreview_cases (
+    id         serial PRIMARY KEY,
+    set_id     integer NOT NULL REFERENCES chartreview_sets(id) ON DELETE CASCADE,
+    position   integer NOT NULL,
+    pseudonym  text,
+    eye        text,
+    date_from  date,
+    date_to    date,
+    data       jsonb NOT NULL,
+    UNIQUE (set_id, position)
+);
+CREATE INDEX IF NOT EXISTS chartreview_cases_pseudonym ON chartreview_cases (pseudonym);
+CREATE TABLE IF NOT EXISTS chartreview_reviews (
+    case_id    integer NOT NULL REFERENCES chartreview_cases(id) ON DELETE CASCADE,
+    reviewer   text NOT NULL,
+    code       text,
+    comment    text,
+    done       boolean NOT NULL DEFAULT false,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (case_id, reviewer)
+);
+
+-- 14 down
+DROP TABLE IF EXISTS chartreview_reviews;
+DROP TABLE IF EXISTS chartreview_cases;
+DROP TABLE IF EXISTS chartreview_sets;
+
+-- 15 up
+-- Chart-Review: Stichprobe aus der hochgeladenen Liste, Zeilennummer der Originaldatei je Fall
+ALTER TABLE chartreview_sets  ADD COLUMN IF NOT EXISTS sample jsonb;
+ALTER TABLE chartreview_cases ADD COLUMN IF NOT EXISTS row_no integer;
+
+-- 15 down
+ALTER TABLE chartreview_cases DROP COLUMN IF EXISTS row_no;
+ALTER TABLE chartreview_sets  DROP COLUMN IF EXISTS sample;
