@@ -22,6 +22,7 @@ Originally centered on the Human Phenotype Ontology (HPO), OntoTrial now offers 
 - [Anonymized export](#anonymized-export)
 - [Long-format export for statistics](#long-format-export-for-statistics)
 - [Installation](#installation)
+  - [Background workers](#background-workers)
 - [Configuration](#configuration)
 - [Keeping terminologies up to date](#keeping-terminologies-up-to-date)
 - [API reference](#api-reference)
@@ -338,12 +339,7 @@ There is no stand-alone AI reference; references come from physician reviews or 
 
 **Redacting names.** Letter texts in validation sets are immutable. To remove a name found in a letter anyway, run in psql `SELECT * FROM ontotrial_redact('Surname');` (optional: replacement text, case sensitivity). It replaces the whole word in candidates, validation letters, ensemble ratings, suggestions and reviews and reports the number of changed rows; the protecting triggers allow this only inside the function. Inflected forms (e.g. a genitive "s") need their own call.
 
-Preparation, regression runs and the ensemble are Minion jobs in the queue `validation`, so they do not compete with everyday extraction. Run a dedicated worker for it:
-
-```bash
-perl backend.pl minion worker                      # default queue (extraction, import)
-perl backend.pl minion worker -q validation -j 4   # validation, runs, AI ensemble; -j = jobs in parallel
-```
+Preparation, regression runs, the ensemble and synthetic letters are Minion jobs in the queue `validation`, so they do not compete with everyday extraction. They need a dedicated worker (`perl backend.pl minion worker -q validation -j 4`); see [Background workers](#background-workers) for all workers and how to run them permanently.
 
 ---
 
@@ -404,13 +400,83 @@ Then load the terminologies (see [Keeping terminologies up to date](#keeping-ter
 perl backend.pl daemon -l http://*:4007
 
 # Production (Hypnotoad, port 4007, 3 workers)
-hypnotoad backend.pl
-
-# Background worker for letter import and re-extraction
-perl backend.pl minion worker
+hypnotoad backend.pl          # start or hot deploy
+hypnotoad -s backend.pl       # stop
 ```
 
 The frontend is served from `public/Frontend`.
+
+### Background workers
+
+Long-running work runs as [Minion](https://metacpan.org/pod/Minion) jobs in three queues. Each queue needs its own worker process; a job in a queue without a worker stays at *waiting for a worker* (in the UI: „wartet auf einen Worker …“). Start all workers from the directory that contains `backend.pl` and `.env`, so they read the same configuration as the web server.
+
+| Queue | Tasks | Start command |
+| :--- | :--- | :--- |
+| `default` | `import_and_extract_letter_task` (letter import and extraction, re-extraction by tag), `notify_document_ready_task` (callback to the source system) | `perl backend.pl minion worker` |
+| `validation` | `validation_prepare_task` (re-extraction of a new data set), `validation_synth_task` (synthetic letters), `validation_run_task`, `validation_run_resume_task` (regression runs), `validation_ensemble_task` (AI ensemble) | `perl backend.pl minion worker -q validation -j 4` |
+| `backfill` | `cataract_backfill_task` (one-off maintenance: add cataract surgery parameters to older phenopackets) | `perl backend.pl minion worker -q backfill` |
+
+```bash
+cd /path/to/ontotrial                                   # directory with backend.pl and .env
+
+perl backend.pl minion worker                           # default: import, extraction, callbacks
+perl backend.pl minion worker -q validation -j 4        # validation, regression runs, AI ensemble, synthetic letters
+perl backend.pl minion worker -q backfill               # only while a backfill job is pending
+```
+
+`-j` sets the number of jobs a worker runs in parallel (default 4). For the `validation` queue it decides how many regression runs or synthetic batches run at the same time; lower it if the LLM server is the bottleneck. A worker can also serve several queues at once (`-q default -q validation`), but separate workers keep validation work from delaying everyday extraction.
+
+For a quick start in one terminal, run the workers in the background and write their output to log files:
+
+```bash
+nohup perl backend.pl minion worker                    > log/worker-default.log    2>&1 &
+nohup perl backend.pl minion worker -q validation -j 4 > log/worker-validation.log 2>&1 &
+```
+
+For permanent operation use one systemd unit per queue, for example `/etc/systemd/system/ontotrial-worker-validation.service`:
+
+```ini
+[Unit]
+Description=OntoTrial Minion worker (validation)
+After=network.target postgresql.service
+
+[Service]
+WorkingDirectory=/path/to/ontotrial
+ExecStart=/usr/bin/perl backend.pl minion worker -q validation -j 4
+Restart=on-failure
+User=ontotrial
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ontotrial-worker-validation
+```
+
+Create `ontotrial-worker-default.service` the same way without `-q`.
+
+**Checking workers and jobs**
+
+```bash
+perl backend.pl minion job -w                              # running workers and their queues
+perl backend.pl minion job -q validation -l 10             # last jobs of a queue
+perl backend.pl minion job -t validation_synth_task -l 5   # last synthetic-letter batches
+perl backend.pl minion job 670428                          # details of one job, including the error
+```
+
+**When to restart**
+
+| Change | Restart |
+| :--- | :--- |
+| `backend.pl` (routes only) | Hypnotoad (hot deploy is enough) |
+| `backend.pl` (anything a job runs) | Hypnotoad and all workers |
+| `.env` | Stop and start Hypnotoad (a hot deploy keeps the old environment) and restart all workers |
+| `migrations/ontotrial.sql` | Hypnotoad; the migration runs on start |
+| Frontend files only | Nothing; reload the browser with Cmd + Shift + R |
+
+Restarting a worker aborts the jobs it is running. Wait until they are done, or clean up afterwards (regression runs: *Stop run*; data set preparation and synthetic batches: *Resume preparation* in the validation window).
 
 ---
 
