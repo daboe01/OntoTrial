@@ -323,7 +323,7 @@ var OVOpenDialogs = [];
 
     OVOpenDialogs.push(self);
     var dialog = self;
-    [_alert runModalWithDidEndBlock:function(alert, returnCode)
+    var didEnd = function(alert, returnCode)
     {
         var text = dialog._field ? [dialog._field stringValue] : nil;
         var idx = OVOpenDialogs.indexOf(dialog);
@@ -331,7 +331,41 @@ var OVOpenDialogs = [];
             OVOpenDialogs.splice(idx, 1);
         if (dialog._callback)
             window.setTimeout(function() { dialog._callback(returnCode, text); }, 0);
-    }];
+    };
+
+    // CPAlert zentriert sich am Schlüsselfenster. Ist das gerade geschlossen (etwa ein ausgeblendetes
+    // Panel), schlägt das fehl; dann zuerst ein sichtbares Fenster nach vorn holen.
+    var kw = [CPApp keyWindow];
+    if (!kw || ![kw isVisible])
+    {
+        var mw = [CPApp mainWindow];
+        if (mw && [mw isVisible])
+            [mw makeKeyAndOrderFront:nil];
+    }
+    try
+    {
+        [_alert runModalWithDidEndBlock:didEnd];
+    }
+    catch (e)
+    {
+        // Rückfall auf die Browser-Dialoge, damit eine Meldung nie verloren geht
+        var full = (aMessage || "") + (anInfo ? "\n\n" + anInfo : "");
+        var code = 0;
+        if (_field)
+        {
+            var t = window.prompt(full, [_field stringValue]);
+            if (t === null)
+                code = 1;
+            else
+                [_field setStringValue:t];
+        }
+        else if (titles.length > 1)
+            code = window.confirm(full) ? 0 : 1;
+        else
+            window.alert(full);
+        didEnd(nil, code);
+        return;
+    }
     if (_field)
         [[_alert window] makeFirstResponder:_field];
 }
@@ -342,6 +376,16 @@ function OVAlert(aMessage, anInfo)
 {
     [OVDialog message:aMessage info:anInfo];
 }
+
+// Prompt im synthetischen Dialog bearbeitet, aber nicht gespeichert?
+function _synDirty()
+{
+    var vc = SharedValidationController;
+    if (!vc || !vc._synPrompt || !vc._synSystemView)
+        return NO;
+    return [vc._synSystemView string] !== (vc._synPrompt.system_prompt || "") || [vc._synTemplateView string] !== (vc._synPrompt.user_template || "");
+}
+
 
 // Eintragstabelle mit Tastatursteuerung: Eingabe = Ensemble-Urteil bestätigen,
 // K = korrekt, F = Fehler …, D = Dublette, U = unklar
@@ -462,6 +506,26 @@ function OVAlert(aMessage, anInfo)
     CPCheckBox      _nsReextract;
     id              _prepTimer;
     CPTextField     _nsConfirm;
+
+    // Synthetischer Datensatz
+    CPWindow        _synPanel;
+    CPTextField     _synConfigLabel;
+    CPTextField     _synFewSeed;
+    CPTextField     _synFewLabel;
+    CPTextField     _synApprovalLabel;
+    CPTextView      _synSystemView;
+    CPTextView      _synTemplateView;
+    CPTextField     _synName;
+    CPTextField     _synCount;
+    CPTextField     _synSeed;
+    CPTextField     _synModel;
+    CPTextField     _synFrom;
+    CPTextField     _synSources;
+    CPTextField     _synConfirm;
+    CPButton        _synStartButton;
+    id              _synConfig;
+    id              _synPrompt;
+    id              _synTimer;
 
     // Referenz & Regression
     CPTextView      _statusView;
@@ -792,7 +856,7 @@ function OVAlert(aMessage, anInfo)
                     }
                     var msg = pr.state === "inactive" ? "wartet auf einen Worker für die Warteschlange „validation“ (perl backend.pl minion worker -q validation -j 4)" :
                               (pr.current ? "Brief " + pr.current + " von " + (pr.total || r.n_items) + (pr.current_s !== undefined && pr.current_s !== null ? " (" + pr.current_s + " s)" : "") : "läuft") +
-                              (pr.failed ? ", " + pr.failed + " nicht extrahierbar" : "");
+                              (pr.failed ? ", " + pr.failed + ((r.params && r.params.synthetic) ? " verworfen" : " nicht extrahierbar") : "");
                     [self _hudTask:hid name:"Datensatz vorbereiten: " + setName state:"active" message:msg progress:pr.progress || 0];
                     if (_currentSet && _currentSet.id === setId)
                         [_setInfoLabel setStringValue:r.n_items + " Briefe · wird vorbereitet: " + msg];
@@ -809,6 +873,12 @@ function OVAlert(aMessage, anInfo)
                     _item = nil;
                     [self loadItems:nil];
                 }
+                if (ex.mode === "synthetic")
+                    OVAlert("Datensatz „" + r.name + "“ ist fertig.",
+                            (ex.n_ok || 0) + " synthetische Briefe mit " + (ex.model || "?") + " erzeugt" +
+                            (ex.n_failed ? ", " + ex.n_failed + " Ziele verworfen (Belege fehlerhaft)" : "") +
+                            ". Die Referenz ist eingefroren; Läufe sind jetzt möglich.");
+                else
                 OVAlert("Datensatz „" + r.name + "“ ist vorbereitet.",
                         (ex.n_ok || 0) + " Briefe mit " + (ex.model || "dem Standardmodell") + " extrahiert" +
                         (ex.n_failed ? ", " + ex.n_failed + " nicht extrahierbare Briefe entfernt" : "") + ".");
@@ -831,7 +901,7 @@ function OVAlert(aMessage, anInfo)
 {
     if (!_newPanel)
     {
-        _newPanel = [[CPPanel alloc] initWithContentRect:CGRectMake(0, 0, 480, 492)
+        _newPanel = [[CPPanel alloc] initWithContentRect:CGRectMake(0, 0, 480, 534)
                                                 styleMask:CPTitledWindowMask | CPClosableWindowMask];
         [_newPanel setFloatingPanel:YES];
         [_newPanel setTitle:@"Neuen Validierungsdatensatz ziehen"];
@@ -884,6 +954,8 @@ function OVAlert(aMessage, anInfo)
         _nsConfirm = OTField(CGRectMake(170, y, 120, 26), "", "ANLEGEN");
         [cv addSubview:_nsConfirm];
         [cv addSubview:OTButton(CGRectMake(310, y, 150, 26), "Stichprobe ziehen", self, @selector(createSet:))];
+        y += 42;
+        [cv addSubview:OTButton(CGRectMake(20, y, 440, 26), "Synthetischer Datensatz (Briefe aus Phenopackets generieren) …", self, @selector(showSyntheticPanel:))];
     }
     [self newSetPurposeChanged:nil];
     [_nsConfirm setStringValue:@""];
@@ -946,6 +1018,364 @@ function OVAlert(aMessage, anInfo)
         else
             OVAlert("Datensatz „" + res.name + "“ angelegt: " + res.n + " Briefe aus " + res.pool + " geeigneten, " + res.strata + " Schichten" +
                     (res.double ? ", " + res.double + " doppelt zu prüfen" : "") + (res.injected ? ", " + res.injected + " mit eingestreutem Fehler" : "") + ".");
+        _currentSet = { id: res.id };
+        [self loadSets:nil];
+    });
+}
+
+// ================================================================================
+// SYNTHETISCHER DATENSATZ
+// Few-Shot-Paare lokal erzeugen, Prompt prüfen und freigeben, Batch mit dem Generator
+// (Standard: Claude über die Anthropic-API) starten
+// ================================================================================
+
+- (void)showSyntheticPanel:(id)sender
+{
+    if (_newPanel)
+        [_newPanel orderOut:self];
+    if (!_synPanel)
+    {
+        _synPanel = [[CPPanel alloc] initWithContentRect:CGRectMake(0, 0, 960, 790)
+                                                styleMask:CPTitledWindowMask | CPClosableWindowMask | CPResizableWindowMask];
+        [_synPanel setFloatingPanel:YES];
+        [_synPanel setMinSize:CGSizeMake(820, 790)];
+        [_synPanel setTitle:@"Synthetischer Validierungsdatensatz"];
+        var cv = [_synPanel contentView];
+        var W = 920, WS = CPViewWidthSizable, y = 12;
+
+        _synConfigLabel = OVM(OTLabel(CGRectMake(20, y, W, 34), "Lade Konfiguration …", NO), WS);
+        [cv addSubview:_synConfigLabel];
+        y += 42;
+
+        // 1. Few-Shot-Paare
+        [cv addSubview:OTLabel(CGRectMake(20, y + 4, 330, 18), "1. Few-Shot-Paare (echte Briefe, manuell überarbeiten)", YES)];
+        [cv addSubview:OTLabel(CGRectMake(360, y + 4, 40, 18), "Seed:", NO)];
+        _synFewSeed = OTField(CGRectMake(400, y, 100, 26), "", "zufällig");
+        [cv addSubview:_synFewSeed];
+        [cv addSubview:OTButton(CGRectMake(510, y, 200, 26), "Few-Shot-Paare laden …", self, @selector(generateFewShots:))];
+        y += 30;
+        _synFewLabel = OVM(OTLabel(CGRectMake(20, y, W, 18), "", NO), WS);
+        [_synFewLabel setTextColor:[CPColor grayColor]];
+        [cv addSubview:_synFewLabel];
+        y += 26;
+
+        // 2. Prompt
+        [cv addSubview:OTLabel(CGRectMake(20, y + 4, 330, 18), "2. Prompt prüfen und freigeben", YES)];
+        _synApprovalLabel = OVM(OTLabel(CGRectMake(250, y + 4, W - 230, 18), "", YES), WS);
+        [cv addSubview:_synApprovalLabel];
+        y += 28;
+        [cv addSubview:OTLabel(CGRectMake(20, y, 400, 18), "Systemprompt (Regeln)", NO)];
+        y += 20;
+        var a1 = OVTextArea(CGRectMake(20, y, W, 170), YES);
+        [a1.scroll setAutoresizingMask:WS];
+        _synSystemView = a1.text;
+        [_synSystemView setEditable:YES];
+        [cv addSubview:a1.scroll];
+        y += 178;
+        [cv addSubview:OTLabel(CGRectMake(20, y, W, 18), "Few-Shot-Paare und Aufgabe (Platzhalter {{reference_date}}, {{sex}}, {{age}}, {{n_entries}}, {{entries}})", NO)];
+        y += 20;
+        var a2 = OVTextArea(CGRectMake(20, y, W, 250), YES);
+        [a2.scroll setAutoresizingMask:WS | CPViewHeightSizable];
+        _synTemplateView = a2.text;
+        [_synTemplateView setEditable:YES];
+        [cv addSubview:a2.scroll];
+        y += 258;
+        var bMask = CPViewMinYMargin;
+        [cv addSubview:OVM(OTButton(CGRectMake(20, y, 120, 26), "Neu laden", self, @selector(loadSyntheticPrompt:)), bMask)];
+        [cv addSubview:OVM(OTButton(CGRectMake(150, y, 140, 26), "Speichern", self, @selector(saveSyntheticPrompt:)), bMask)];
+        [cv addSubview:OVM(OTButton(CGRectMake(300, y, 170, 26), "Prompt freigeben …", self, @selector(approveSyntheticPrompt:)), bMask)];
+        var hint = OVM(OTLabel(CGRectMake(480, y + 4, W - 460, 18), "Freigegeben wird genau der gespeicherte Text; jede Änderung hebt die Freigabe auf.", NO), WS | bMask);
+        [hint setTextColor:[CPColor grayColor]];
+        [cv addSubview:hint];
+        y += 40;
+
+        // 3. Batch
+        [cv addSubview:OVM(OTLabel(CGRectMake(20, y + 4, 330, 18), "3. Batch starten", YES), bMask)];
+        y += 28;
+        [cv addSubview:OVM(OTLabel(CGRectMake(20, y + 4, 50, 18), "Name:", NO), bMask)];
+        _synName = OVM(OTField(CGRectMake(70, y, 230, 26), "", "z. B. synthetisch_2026_11"), bMask);
+        [cv addSubview:_synName];
+        [cv addSubview:OVM(OTLabel(CGRectMake(315, y + 4, 60, 18), "Anzahl:", NO), bMask)];
+        _synCount = OVM(OTField(CGRectMake(370, y, 70, 26), "400", nil), bMask);
+        [cv addSubview:_synCount];
+        [cv addSubview:OVM(OTLabel(CGRectMake(455, y + 4, 45, 18), "Seed:", NO), bMask)];
+        _synSeed = OVM(OTField(CGRectMake(495, y, 100, 26), "", "zufällig"), bMask);
+        [cv addSubview:_synSeed];
+        [cv addSubview:OVM(OTLabel(CGRectMake(610, y + 4, 60, 18), "Modell:", NO), bMask)];
+        _synModel = OVM(OTField(CGRectMake(665, y, 200, 26), "", nil), bMask);
+        [cv addSubview:_synModel];
+        y += 34;
+        [cv addSubview:OVM(OTLabel(CGRectMake(20, y + 4, 120, 18), "Briefe ab:", NO), bMask)];
+        _synFrom = OVM(OTField(CGRectMake(100, y, 110, 26), "2025-01-01", nil), bMask);
+        [cv addSubview:_synFrom];
+        [cv addSubview:OVM(OTLabel(CGRectMake(225, y + 4, 60, 18), "Quellen:", NO), bMask)];
+        _synSources = OVM(OTField(CGRectMake(285, y, 140, 26), "argos", nil), bMask);
+        [cv addSubview:_synSources];
+        [cv addSubview:OVM(OTLabel(CGRectMake(440, y + 4, 170, 18), "Zum Bestätigen ANLEGEN:", YES), bMask)];
+        _synConfirm = OVM(OTField(CGRectMake(610, y, 110, 26), "", "ANLEGEN"), bMask);
+        [cv addSubview:_synConfirm];
+        _synStartButton = OVM(OTButton(CGRectMake(730, y, 135, 26), "Batch starten", self, @selector(startSyntheticBatch:)), bMask);
+        [cv addSubview:_synStartButton];
+        y += 34;
+        var note = OVM(OTLabel(CGRectMake(20, y, W, 32),
+            "Je Brief wird nur der freigegebene Prompt mit den Einträgen eines Zielphenopackets gesendet (ein Patient höchstens einmal); echte Brieftexte werden nicht übertragen. " +
+            "Briefe, in denen ein Eintrag nicht wörtlich belegt ist oder ein Messwert fehlt, werden verworfen und ersetzt. Die Referenz wird danach eingefroren.", NO), WS | bMask);
+        [note setTextColor:[CPColor grayColor]];
+        [cv addSubview:note];
+    }
+    var d = new Date();
+    if (!OTTrim([_synName stringValue]).length)
+        [_synName setStringValue:"synthetisch_" + d.getFullYear() + "_" + ("0" + (d.getMonth() + 1)).slice(-2)];
+    [_synConfirm setStringValue:@""];
+    [self loadSyntheticConfig];
+    [self loadSyntheticPrompt:nil];
+    [_synPanel center];
+    [_synPanel makeKeyAndOrderFront:self];
+}
+
+- (void)loadSyntheticConfig
+{
+    OTGetJSON("/BBB/validation/synthetic/config", 30.0, function(conf, error)
+    {
+        if (!conf || conf.error)
+        {
+            [_synConfigLabel setStringValue:"Konfiguration nicht lesbar (Backend aktuell?)."];
+            return;
+        }
+        _synConfig = conf;
+        [_synFrom setStringValue:conf.from_date || "2025-01-01"];
+        [_synSources setStringValue:(conf.sources || ["argos"]).join(", ")];
+        if (!OTTrim([_synModel stringValue]).length)
+            [_synModel setStringValue:conf.model || ""];
+        var info = "Modell claude-…: Anthropic-API (extern). Andere Modellnamen wie gpt-oss-120b oder …-mlx laufen wie die Extraktion im Kliniknetz. " +
+                   "Voreinstellung: " + (conf.model || "") + " auf " + conf.host + ". ";
+        if (conf.external)
+            info += conf.allowed ? "Der Batch-Endpunkt liegt außerhalb des Kliniknetzes: Prompt und Zielphenopackets (Codes, Seiten, Daten, Werte, Geschlecht) werden dorthin übertragen."
+                                 : "Batch-Endpunkt außerhalb des Kliniknetzes ist nicht freigegeben (ONTOTRIAL_SYNTH_ALLOW_EXTERNAL=1 nach Klärung mit dem Datenschutz).";
+        if (conf.provider === "anthropic" && !conf.has_key)
+            info += " Kein API-Schlüssel gesetzt (ONTOTRIAL_SYNTH_API_KEY).";
+        [_synConfigLabel setStringValue:info];
+        [self _updateSyntheticButtons];
+    });
+}
+
+- (void)_updateSyntheticButtons
+{
+    var c = _synConfig || {}, p = _synPrompt || {};
+    // Freigabe und Schlüssel hängen vom eingetragenen Modell ab; das prüft das Backend beim Start
+    var ok = p.approved && !_synDirty();
+    [_synStartButton setEnabled:ok ? YES : NO];
+}
+
+- (void)loadSyntheticPrompt:(id)sender
+{
+    var reload = function()
+    {
+        OTGetJSON("/BBB/validation/synthetic/prompt", 30.0, function(res, error)
+        {
+            if (!res || res.error)
+            {
+                [_synApprovalLabel setStringValue:"Prompt nicht lesbar: " + (res && res.error ? res.error : "keine Antwort")];
+                return;
+            }
+            [self _showSyntheticPrompt:res];
+        });
+    };
+    if (sender && _synDirty())
+        [OVDialog confirm:"Ungespeicherte Änderungen verwerfen?" info:"Der Prompt wird aus der Datenbank neu geladen." ok:"Verwerfen" then:function(yes) { if (yes) reload(); }];
+    else
+        reload();
+}
+
+- (void)_showSyntheticPrompt:(id)res
+{
+    _synPrompt = res;
+    [_synSystemView setString:res.system_prompt || ""];
+    [_synTemplateView setString:res.user_template || ""];
+    var a = res.approval || {};
+    var txt;
+    if (!res.in_db || !res.user_template)
+    {
+        txt = "Noch keine Few-Shot-Paare in der Datenbank. Bitte zuerst erzeugen.";
+        [_synApprovalLabel setTextColor:[CPColor colorWithHexString:"B26B00"]];
+    }
+    else if (res.approved)
+    {
+        txt = "Freigegeben von " + a.by + " am " + String(a.at).replace("T", " ") + " · " + res.n_shots + " Beispiele · Hash " + res.hash.substring(0, 10);
+        [_synApprovalLabel setTextColor:[CPColor colorWithHexString:"2E7D32"]];
+    }
+    else
+    {
+        txt = "NICHT freigegeben" + (a.hash ? " (seit der letzten Freigabe durch " + a.by + " geändert)" : "") + " · " + res.n_shots + " Beispiele · Hash " + res.hash.substring(0, 10);
+        [_synApprovalLabel setTextColor:[CPColor colorWithHexString:"C62828"]];
+    }
+    [_synApprovalLabel setStringValue:txt];
+
+    var j = res.fewshot_job;
+    if (j && (j.state === "active" || j.state === "inactive"))
+    {
+        [_synFewLabel setStringValue:(j.state === "inactive" ? "Few-Shot-Erzeugung wartet auf einen Worker der Warteschlange „validation“." : "Few-Shot-Erzeugung läuft: " + (j.message || "") + " (" + (j.progress || 0) + " %)")];
+        [self _hudTask:"validation_synth_fewshot" name:"Few-Shot-Paare erzeugen" state:"active" message:j.message || "läuft" progress:j.progress || 0];
+        if (!_synTimer)
+            _synTimer = window.setInterval(function() { [self _pollFewShots]; }, 5000);
+    }
+    else if (j && j.state === "failed")
+        [_synFewLabel setStringValue:"Letzte Few-Shot-Erzeugung fehlgeschlagen: " + (j.error || "")];
+    else if (j && j.state === "finished")
+        [_synFewLabel setStringValue:"Few-Shot-Paare zuletzt erzeugt (Job " + j.id + "). Bitte jedes Beispiel lesen: Einträge, Brief, Belege."];
+    else
+        [_synFewLabel setStringValue:""];
+    [self _updateSyntheticButtons];
+}
+
+- (void)_pollFewShots
+{
+    OTGetJSON("/BBB/validation/synthetic/prompt", 30.0, function(res, error)
+    {
+        if (!res || res.error)
+            return;
+        var j = res.fewshot_job || {};
+        if (j.state === "active" || j.state === "inactive")
+        {
+            [_synFewLabel setStringValue:"Few-Shot-Erzeugung läuft: " + (j.message || "") + " (" + (j.progress || 0) + " %)"];
+            [self _hudTask:"validation_synth_fewshot" name:"Few-Shot-Paare erzeugen" state:"active" message:j.message || "läuft" progress:j.progress || 0];
+            return;
+        }
+        window.clearInterval(_synTimer);
+        _synTimer = nil;
+        [self _hudTask:"validation_synth_fewshot" name:"" state:"finished" message:(j.state === "failed" ? "fehlgeschlagen" : "fertig") progress:100];
+        if (_synDirty())
+            OVAlert("Few-Shot-Erzeugung beendet.", "Deine ungespeicherten Änderungen im Prompt bleiben angezeigt. Mit „Neu laden“ siehst du die neuen Paare.");
+        else
+            [self _showSyntheticPrompt:res];
+        if (j.state === "failed")
+            OVAlert("Few-Shot-Erzeugung fehlgeschlagen.", j.error || "");
+    });
+}
+
+- (void)generateFewShots:(id)sender
+{
+    if (![self reviewer].length)
+    {
+        OVAlert("Bitte oben einen Prüfernamen eintragen.");
+        return;
+    }
+    [OVDialog confirm:"Fünf echte Few-Shot-Paare laden?"
+                 info:"Fünf ARGOS-Briefe verschiedener Subspezialitäten werden mit ihren Einträgen in den Prompt geladen; Namen, Geburtsdaten, Nummern und Adressen sind nur grob vormaskiert. " +
+                      "Bitte jedes Beispiel von Hand überarbeiten (Daten, seltene Details, Restangaben zur Person) und erst dann freigeben. " +
+                      "Der gespeicherte Prompt wird überschrieben; nichts verlässt das Kliniknetz vor der Freigabe."
+                   ok:"Laden" then:function(yes)
+    {
+        if (!yes)
+            return;
+        var payload = { by: [self reviewer] };
+        var seed = OTTrim([_synFewSeed stringValue]);
+        if (seed.length)
+            payload.seed = parseInt(seed, 10);
+        OTPostJSON("/BBB/validation/synthetic/fewshot", payload, 60.0, function(res, error)
+        {
+            if (!res || res.error)
+            {
+                OVAlert("Nicht geladen.", res && res.error ? res.error : "Keine Antwort vom Server.");
+                return;
+            }
+            [self _showSyntheticPrompt:res];
+            [_synFewLabel setStringValue:"Fünf echte Paare geladen (Seed " + res.seed + ": " + (res.buckets || []).join(", ") + "). Jetzt im Textfeld unten überarbeiten, speichern und freigeben."];
+        });
+    }];
+}
+
+- (void)saveSyntheticPrompt:(id)sender
+{
+    var payload = { system_prompt: [_synSystemView string], user_template: [_synTemplateView string], by: [self reviewer] };
+    OTPostJSON("/BBB/validation/synthetic/prompt", payload, 60.0, function(res, error)
+    {
+        if (!res || res.error)
+        {
+            OVAlert("Nicht gespeichert.", res && res.error ? res.error : "Keine Antwort vom Server.");
+            return;
+        }
+        [self _showSyntheticPrompt:res];
+    });
+}
+
+- (void)approveSyntheticPrompt:(id)sender
+{
+    if (![self reviewer].length)
+    {
+        OVAlert("Bitte oben einen Prüfernamen eintragen.");
+        return;
+    }
+    var p = _synPrompt || {};
+    if (_synDirty())
+    {
+        OVAlert("Bitte zuerst speichern.", "Freigegeben wird nur der gespeicherte Text.");
+        return;
+    }
+    if (!p.in_db || !p.user_template)
+    {
+        OVAlert("Es gibt noch keinen Prompt mit Few-Shot-Paaren.", "Bitte zuerst die Few-Shot-Paare erzeugen.");
+        return;
+    }
+    [OVDialog confirm:"Prompt freigeben?"
+                 info:"Du gibst " + p.n_shots + " Beispiele und den Systemprompt (Hash " + p.hash.substring(0, 10) + ") als " + [self reviewer] + " frei. " +
+                      "Bitte nur freigeben, wenn du jedes Beispiel gelesen hast: Wirkt der Brief wie einer aus der Klinik, stimmen Brief und Einträge überein " +
+                      "(Seite, Datum, Verneinung, Werte), und enthält er keinen Rest echter Patientendaten?"
+                   ok:"Freigeben" then:function(yes)
+    {
+        if (!yes)
+            return;
+        OTPostJSON("/BBB/validation/synthetic/prompt/approve", { by: [self reviewer], hash: p.hash }, 60.0, function(res, error)
+        {
+            if (!res || res.error)
+            {
+                OVAlert("Nicht freigegeben.", res && res.error ? res.error : "Keine Antwort vom Server.");
+                return;
+            }
+            [self _showSyntheticPrompt:res];
+        });
+    }];
+}
+
+- (void)startSyntheticBatch:(id)sender
+{
+    if (OTTrim([_synConfirm stringValue]) !== "ANLEGEN")
+    {
+        OVAlert("Bitte zum Bestätigen ANLEGEN eintragen.");
+        return;
+    }
+    if (_synDirty())
+    {
+        OVAlert("Der angezeigte Prompt ist nicht gespeichert.", "Bitte speichern und freigeben oder neu laden.");
+        return;
+    }
+    var payload = {
+        confirm: "ANLEGEN",
+        name: OTTrim([_synName stringValue]),
+        n: parseInt([_synCount stringValue], 10) || 400,
+        from_date: OTTrim([_synFrom stringValue]),
+        sources: OTTrim([_synSources stringValue]).split(/[\s,;]+/).filter(function(x) { return x.length > 0; }),
+        model: OTTrim([_synModel stringValue]),
+        prompt_hash: (_synPrompt || {}).hash,
+        created_by: [self reviewer]
+    };
+    var seed = OTTrim([_synSeed stringValue]);
+    if (seed.length)
+        payload.seed = parseInt(seed, 10);
+    [_synStartButton setEnabled:NO];
+    OTPostJSON("/BBB/validation/sets/synthetic", payload, 120.0, function(res, error)
+    {
+        [self _updateSyntheticButtons];
+        if (!res || res.error)
+        {
+            OVAlert("Datensatz nicht angelegt.", res && res.error ? res.error : "Keine Antwort vom Server.");
+            return;
+        }
+        [_synPanel orderOut:self];
+        OVAlert("Datensatz „" + res.name + "“ angelegt: " + res.n + " synthetische Briefe mit " + res.model + ".",
+                "Ziele aus " + res.patients + " Patienten (Seed " + res.seed + "). Der Fortschritt steht im Panel Hintergrundprozesse; " +
+                "die Referenz wird nach dem letzten Brief automatisch eingefroren.");
+        [self _hudTask:"validation_prepare_" + res.id name:"Synthetische Briefe: " + res.name state:"active" message:"gestartet" progress:0];
         _currentSet = { id: res.id };
         [self loadSets:nil];
     });

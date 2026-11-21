@@ -390,8 +390,51 @@ helper store_phenopacket => sub {
 
     eval { $self->notify_change('candidates', $candidate_id + 0, 'UPDATE', \%set); 1 }
         or $self->app->log->warn("[PHENOPACKET NOTIFY] Kandidat $candidate_id: $@");
+    eval { $self->enqueue_document_ready($candidate_id) if defined $set{phenopacket_json}; 1 }
+        or $self->app->log->warn("[DOCUMENT READY] Kandidat $candidate_id: $@");
     return $rows;
 };
+
+# ---------------------------------------------------------
+# PATCH 2026-11-12: Rückmeldung an das Quellsystem, sobald ein Phenopacket
+# gespeichert ist (Extraktion, Neu-Extraktion, Recompute). Nur für Quellen mit
+# ONTOTRIAL_NOTIFY_URL_<QUELLE> in der .env, z. B.
+#   ONTOTRIAL_NOTIFY_URL_ARGOS=http://augimageserver:3018/BK/ontotrial_ready
+# Eigener Minion-Job (Queue default) mit Wiederholung, damit weder die
+# Extraktion noch ein Web-Request auf das Quellsystem warten.
+# ---------------------------------------------------------
+helper enqueue_document_ready => sub {
+    my ($self, $candidate_id) = @_;
+    my $row = $self->pg->db->query(q{
+        SELECT doc_source, doc_id::text AS doc_id, pseudonym,
+               to_char(reference_date::date, 'YYYY-MM-DD') AS day
+          FROM candidates WHERE id = ?
+    }, $candidate_id)->hash or return;
+    my $src = $row->{doc_source} // '';
+    return unless length $src && length($row->{doc_id} // '');
+    (my $tag = uc $src) =~ s/[^A-Z0-9]/_/g;
+    my $url = $ENV{"ONTOTRIAL_NOTIFY_URL_$tag"};
+    return unless defined $url && length $url;
+    return $self->minion->enqueue(notify_document_ready_task => [{
+        url => $url, source => $src, doc_id => $row->{doc_id}, candidate_id => $candidate_id + 0,
+        pseudonym => $row->{pseudonym}, reference_date => $row->{day},
+    }] => { attempts => 5 });
+};
+
+app->minion->add_task(notify_document_ready_task => sub {
+    my ($job, $p) = @_;
+    my $ua  = Mojo::UserAgent->new->connect_timeout(10)->request_timeout(30);
+    my $tx  = $ua->post($p->{url} => json => { map { $_ => $p->{$_} } qw(source doc_id candidate_id pseudonym reference_date) });
+    my $res = eval { $tx->result };
+    my $msg = "[DOCUMENT READY] $p->{source}:$p->{doc_id} -> " . ($res ? $res->code : "keine Antwort ($@)");
+    if ($res && $res->is_success) {
+        $job->app->log->info($msg);
+        return $job->finish($res->code);
+    }
+    # attempts => 5: Minion wiederholt fehlgeschlagene Jobs selbst (mit wachsendem Abstand)
+    $job->app->log->warn($msg);
+    return $job->fail($msg);
+});
 
 # =========================================================
 # PATCHBAY CONCURRENCY THROTTLING QUEUE HELPERS
@@ -1207,6 +1250,45 @@ sub build_cataract_op_measurements {
         };
     }
     return @m;
+}
+
+# PATCH 2026-11-09: Nachtrag der Katarakt-OP-Parameter in bestehende Phenopackets.
+# Derselbe regelbasierte Dokumentscan wie bei der Extraktion (seit 22.10.2026), ohne
+# Sprachmodell. Briefe, deren Paket schon einen der lokalen Codes trägt, bleiben
+# unverändert (idempotent). Liefert die Zahl der ergänzten Messwerte.
+our $CAT_LOCAL_CODE_RE = qr/^LOINC:(?:9532[78]|6481[789]|64820)-A$/;
+sub _cat_packet_side {
+    my $pp = shift;
+    my %s;
+    my @proc = (@{ ref $pp->{procedures} eq 'ARRAY' ? $pp->{procedures} : [] },
+                map { $_->{procedure} } grep { ref $_ eq 'HASH' && ref $_->{procedure} eq 'HASH' }
+                    @{ ref $pp->{medicalActions} eq 'ARRAY' ? $pp->{medicalActions} : [] });
+    for my $p (grep { ref $_ eq 'HASH' } @proc) {
+        my $code = $p->{code} // {};
+        next unless ($code->{id} // '') =~ /^OPS:5-14[3-5]/
+                 || ($code->{label} // '') =~ /phako|phaco|hinterkammerlinse|intraokularlinse|\b(?:hkl|iol)\b/i;
+        next if ($code->{label} // '') =~ /luxat|luxiert|disloz|bergung|explant|entfernung|austausch|wechsel/i;
+        my $site = (($p->{bodySite} // {})->{id}) // '';
+        $s{R}++ if $site eq 'HP:0012834';
+        $s{L}++ if $site eq 'HP:0012835';
+    }
+    my @k = keys %s;
+    return @k == 1 ? $k[0] : undef;
+}
+sub cataract_backfill_packet {
+    my ($pp, $text, $ref_date) = @_;
+    return 0 unless ref $pp eq 'HASH' && defined $text && length $text;
+    my $ms = ref $pp->{measurements} eq 'ARRAY' ? $pp->{measurements} : [];
+    return 0 if grep { ref $_ eq 'HASH' && ((($_->{assay} // {})->{id}) // '') =~ $CAT_LOCAL_CODE_RE } @$ms;
+    my $date = _cat_doc_date($text, $ref_date) // $ref_date;
+    # Ersatz für die Seite, wenn der Text keine eindeutige nennt (z. B. Stationsbriefe
+    # "Zielrefraktion: ± 0 D (…)" mit Befunden beider Augen): Seite der Linsen-/Phako-
+    # Prozedur im selben Paket, falls genau eine. Entspricht dem Item-Fallback der Pipeline.
+    my @m = build_cataract_op_measurements([ extract_cataract_op_parameters($text,
+                                               fallback_side => _cat_packet_side($pp)) ], $date);
+    return 0 unless @m;
+    $pp->{measurements} = [ @$ms, @m ];
+    return scalar @m;
 }
 
 # =========================================================================
@@ -7039,6 +7121,24 @@ helper generate_phenopacket_impl => sub {
             }
             @final_features = @deduped_features;
 
+            # PATCH 2026-11-17: Katarakt-OP-Parameter, denen weder Dokument noch Item eine Seite
+            # geben konnte (OP-Bericht: "LA" allein unter der Diagnose, "(L)" am Ende der OPS-Zeile),
+            # bekommen die Seite der Linsen-/Phako-Prozedur dieses Pakets, falls genau eine.
+            # Wie der Nachtrag cataract_backfill_packet; nur für Arten, die noch fehlen.
+            if (my @cat_miss = grep { !$cat_done{$_} } sort keys %CATARACT_OP_LOINC) {
+                my %miss = map { $_ => 1 } @cat_miss;
+                if (my $pside = _cat_packet_side({ procedures => \@final_procedures })) {
+                    my @cat_p = grep { $miss{ $_->{kind} } }
+                                extract_cataract_op_parameters($text_content, fallback_side => $pside);
+                    if (my @cat_m = build_cataract_op_measurements(\@cat_p, $cat_date // $reference_date)) {
+                        $cat_done{ $_->{kind} } = 1 for @cat_p;
+                        push @final_measurements, @cat_m;
+                        $self->app->log->info("[CATARACT OP] Seite $pside aus der Linsen-OP: " . join(', ',
+                            map { "$_->{assay}{id} = $_->{value}{quantity}{value}" } @cat_m));
+                    }
+                }
+            }
+
             print STDERR "\n=======================================================\n";
             print STDERR ">>> [PHENOPACKET GENERATION SUMMARY]\n";
             print STDERR "    - Features:     " . scalar(@final_features) . "\n";
@@ -7280,8 +7380,8 @@ post '/BBB/import_and_extract_letter' => sub {
         unless $mode =~ /^(?:hard|soft)$/;
     if (defined $prio && !ref $prio && length $prio) {
         return $c->render(json => { status => 'rejected',
-            error => "Ungültige Priorität '$prio' (ganze Zahl von -100 bis 100)." }, status => 400)
-            unless $prio =~ /^-?\d{1,3}$/ && abs($prio) <= 100;
+            error => "Ungültige Priorität '$prio' (ganze Zahl von -1000 bis 1000)." }, status => 400)
+            unless $prio =~ /^-?\d{1,3}$/ && abs($prio) <= 1000;
         $prio += 0;
     } else {
         $prio = undef;    # Standard je Quelle (enqueue_letter_extraction)
@@ -10659,6 +10759,13 @@ post '/BBB/export/anonymized_phenopackets' => sub {
 #                     Filtern angewendet, unabhängig von from/to, sources und tag_scope.
 #   has_tag_match=    any (Default) | all  – bei mehreren has_tag-Werten
 #   has_code=...      Patient hat (nicht negiert) einen Code unterhalb, z. B. OPS:5-125
+#                     PATCH 2026-11-09: ATC/ICD10/OPS per Präfix direkt im SQL
+#                     (ATC:D11AH11, ATC:D11AH, ICD10:H40, OPS:5-125), nur HP/LOINC
+#                     weiter über is_subclass_of()
+#   has_text=...      PATCH 2026-11-09: Patient hat einen Brief, dessen Text einen der
+#                     Begriffe enthält (ohne Groß/Klein, Teilstring, mind. 4 Zeichen),
+#                     z. B. has_text=corectim,delgocitinib. Grundgesamtheit wie has_tag,
+#                     unabhängig von from/to und sources. Verneinungen werden NICHT erkannt.
 #   pseudonyms=...    explizite Pseudonyme
 #   from=, to=        Briefdatum (JJJJ-MM-TT oder TT.MM.JJJJ), inklusiv
 #   event_from=, event_to=  Ereignisdatum (nur events); keep_undated=1 (Default)
@@ -10700,6 +10807,14 @@ our %LX_NUMERIC = map { $_ => 1 } qw(candidate_id value n_mentions);
 
 # jsonb-Feld nur entpacken, wenn es wirklich ein Array ist (sonst SQL-Fehler)
 sub _lx_arr { my ($e) = @_; return "CASE WHEN jsonb_typeof($e) = 'array' THEN $e ELSE '[]'::jsonb END" }
+# PATCH 2026-11-09: IOL-Modell aus dem Modifier "IOL model: …" der IOL-Stärke
+# (64819-A/64820-A). Ältere Pakete haben keinen eigenen Modell-Eintrag (64825-A/64826-A),
+# das Modell steht dort nur im Modifier; der Export gibt es als value_text aus.
+sub _lx_iol_model {
+    my ($e) = @_;
+    return "(SELECT regexp_replace(mm->>'label', '^IOL model:\\s*', '') FROM jsonb_array_elements(" . _lx_arr($e) . ") mm "
+         . "WHERE jsonb_typeof(mm) = 'object' AND mm->>'label' LIKE 'IOL model:%' LIMIT 1)";
+}
 sub _lx_flag { my ($e) = @_; return "(lower(COALESCE($e, '')) IN ('true', 't', '1', 'yes'))" }
 sub _lx_lat {
     my ($e) = @_;
@@ -10755,7 +10870,7 @@ sub _lx_branch {
              . "THEN ($q->>'value')::numeric END AS value, "
              . "COALESCE($q->'unit'->>'label', CASE WHEN jsonb_typeof($q->'unit') = 'string' THEN $q->>'unit' END) AS unit, "
              . "$q->>'comparator' AS comparator, "
-             . "m->'value'->'ontologyClass'->>'label' AS value_text")
+             . "COALESCE(m->'value'->'ontologyClass'->>'label', " . _lx_iol_model("m->'modifiers'") . ") AS value_text")
              . " FROM jsonb_array_elements(" . _lx_arr("$b.pp->'measurements'") . ") m WHERE jsonb_typeof(m) = 'object'";
     }
     die "unbekannte Domäne $dom\n";
@@ -10805,6 +10920,7 @@ helper long_export_query => sub {
     my $hmatch = lc($c->param('has_tag_match') // 'any');
     my $tscope = lc($c->param('tag_scope') // 'patient');
     my @codes  = _lx_list($c->every_param('has_code'));
+    my @texts  = map { lc } _lx_list($c->every_param('has_text'));   # PATCH 2026-11-09
     my @pseud  = _lx_list($c->every_param('pseudonyms'), $c->every_param('pseudonym'));
     my @srcs   = map { lc } _lx_list($c->every_param('sources'), $c->every_param('source'));
     my @doms   = map { lc } _lx_list($c->every_param('domains'), $c->every_param('domain'));
@@ -10825,6 +10941,8 @@ helper long_export_query => sub {
     return $bad->("limit_patients muss eine positive Zahl sein.")            if defined $limit && $limit !~ /^[1-9]\d{0,6}$/;
     return $bad->("Zu viele Werte (tag/has_tag/has_code max. 50, pseudonyms max. 100000).")
         if @tags > 50 || @htags > 50 || @codes > 50 || @pseud > 100000;
+    return $bad->("has_text: max. 20 Begriffe mit je 4 bis 80 Zeichen.")
+        if @texts > 20 || grep { length($_) < 4 || length($_) > 80 } @texts;
 
     my %day;
     for my $k (qw(from to event_from event_to)) {
@@ -10833,11 +10951,16 @@ helper long_export_query => sub {
         $day{$k} = normalize_reference_day($v) // return $bad->("$k: ungültiges Datum '$v' (JJJJ-MM-TT oder TT.MM.JJJJ).");
     }
 
-    unless (@tags || @htags || @codes || @pseud || to_bool($c->param('all'))) {
-        return $bad->("Kein Kohortenfilter gesetzt. tag, has_tag, has_code oder pseudonyms angeben, oder all=1 für den Gesamtbestand.");
+    unless (@tags || @htags || @codes || @texts || @pseud || to_bool($c->param('all'))) {
+        return $bad->("Kein Kohortenfilter gesetzt. tag, has_tag, has_code, has_text oder pseudonyms angeben, oder all=1 für den Gesamtbestand.");
     }
 
     my @bind;
+    # PATCH 2026-11-09: Suchbegriffe für has_text (LIKE-Sonderzeichen maskiert);
+    # Spalte text_hit markiert im patients-Export die Briefe mit Treffer
+    my @text_pat = map { my $t = $_; $t =~ s/([\\%_])/\\$1/g; "%$t%" } @texts;
+    my $text_sel = 'NULL::boolean';
+    if (@texts) { $text_sel = 'COALESCE(c.narrative_report ILIKE ANY(?), false)'; push @bind, [@text_pat] }
 
     # --- 1. Briefe (mit Briefebene-Deduplizierung) ---
     my @lw = ("c.phenopacket_json IS NOT NULL", "c.pseudonym IS NOT NULL",
@@ -10864,12 +10987,21 @@ helper long_export_query => sub {
         }
         push @lw, "$pop)";
     }
+    if (@texts) {
+        # PATCH 2026-11-09: Volltextsuche im Brieftext, Grundgesamtheit wie has_tag
+        push @lw, "c.pseudonym IN (
+        SELECT ht.pseudonym
+          FROM candidates ht
+         WHERE ht.pseudonym IS NOT NULL
+           AND ht.narrative_report ILIKE ANY(?))";
+        push @bind, [@text_pat];
+    }
     my $tag_match = "EXISTS (SELECT 1 FROM unnest(string_to_array(COALESCE(%s.tags, ''), ',')) tt(t) WHERE lower(trim(tt.t)) = ANY(?))";
     if (@tags && $tscope eq 'letter') { push @lw, sprintf($tag_match, 'c'); push @bind, [@tags] }
 
     my $sql = "WITH letters_all AS (
   SELECT c.id AS candidate_id, c.pseudonym, c.reference_date::date AS packet_date,
-         c.doc_source, c.tags, c.phenopacket_json AS pp,
+         c.doc_source, c.tags, c.phenopacket_json AS pp, $text_sel AS text_hit,
          'cand-' || c.id AS packet_id,
          c.phenopacket_json->>'id' AS phenopacket_id,
          c.phenopacket_json->'metaData'->>'created' AS packet_created,
@@ -10896,7 +11028,12 @@ letters AS (
         FROM letters h,
              LATERAL ($code_union) x
        WHERE x.code IS NOT NULL AND NOT x.excluded
-         AND EXISTS (SELECT 1 FROM unnest(?::text[]) q(code) WHERE is_subclass_of(x.code, q.code)))";
+         AND EXISTS (SELECT 1 FROM unnest(?::text[]) q(code)
+                      WHERE CASE WHEN q.code ~* '^(ATC|ICD10|OPS):'
+                                 THEN upper(split_part(x.code, ':', 1)) = upper(split_part(q.code, ':', 1))
+                                  AND regexp_replace(upper(substr(x.code, strpos(x.code, ':') + 1)), '[.-]', '', 'g')
+                                      LIKE regexp_replace(upper(substr(q.code, strpos(q.code, ':') + 1)), '[.-]', '', 'g') || '%'
+                                 ELSE is_subclass_of(x.code, q.code) END))";
         push @bind, [@codes];
     }
     $sql .= "
@@ -10918,10 +11055,11 @@ SELECT b.pseudonym, b.packet_id, b.packet_created, to_char(b.packet_date, 'YYYY-
        b.candidate_id, b.phenopacket_id, b.doc_source,
        b.pp->'subject'->>'sex' AS sex,
        b.pp->'subject'->'timeAtLastEncounter'->'age'->>'iso8601duration' AS age_last_iso,
-       b.tags
+       b.tags, b.text_hit
   FROM base b
  ORDER BY b.pseudonym, b.packet_date NULLS LAST, b.candidate_id";
-        return { sql => $sql, bind => \@bind, cols => \@LX_PATIENT_COLS, label => 'patients' };
+        my @pcols = (@LX_PATIENT_COLS, @texts ? ('text_hit') : ());   # PATCH 2026-11-09
+        return { sql => $sql, bind => \@bind, cols => \@pcols, label => 'patients' };
     }
 
     # --- 3b. Ereignisse (mit Elementebene-Deduplizierung) ---
@@ -11068,6 +11206,20 @@ helper long_export_stream => sub {
     $next->();
 };
 
+# PATCH 2026-11-09: Nachtrag der Katarakt-OP-Parameter starten
+#   curl -X POST 'http://…:3015/BBB/admin/cataract_backfill?dry_run=1'
+post '/BBB/admin/cataract_backfill' => sub {
+    my $c = shift;
+    if (my $tok = $ENV{ONTOTRIAL_EXPORT_TOKEN}) {
+        my $given = $c->req->headers->header('X-Export-Token') // $c->param('token') // '';
+        return $c->render(json => { error => 'Token fehlt oder ist falsch.' }, status => 403) unless $given eq $tok;
+    }
+    my $dry = $c->param('dry_run') ? 1 : 0;
+    my $id  = $c->minion->enqueue(cataract_backfill_task => [{ dry_run => $dry }], { queue => 'backfill' });
+    $c->render(json => { job_id => $id, dry_run => $dry,
+                         hinweis => "Status: perl backend.pl minion job $id" });
+};
+
 get '/BBB/export/long/:what' => [what => [qw(events patients)]] => sub {
     my $c = shift;
     $c->inactivity_timeout(3600);
@@ -11087,6 +11239,233 @@ get '/BBB/export/long/:what' => [what => [qw(events patients)]] => sub {
 
     $c->app->log->info("[LONG EXPORT] $q->{label}: " . $c->req->url->query->to_string =~ s/token=[^&]*/token=***/r);
     $c->long_export_stream($q, $format);
+};
+
+# =========================================================================
+# PATCH 2026-11-12: CODES EINES DOKUMENTS FÜR ANDERE SYSTEME (ARGOS-Patchbay)
+#
+# Ersetzt die Phi-4-HPO-Pipelines in ARGOS (HPO_Fundus_Outer_RA/LA,
+# HPO_VAA_Outer_RA/LA). ARGOS schickt jeden Brief ohnehin über
+# /BBB/import_and_extract_letter; diese Route liefert aus dem gespeicherten
+# Phenopacket die Codes für ein Auge und einen Augenabschnitt, im Format, das
+# der ARGOS-Block "OrderWriter" erwartet (JSON-Array von Codes).
+# Die Extraktion selbst bleibt unverändert; es wird nur gelesen.
+#
+#   GET /BBB/document_codes?source=argos&doc_id=<idbrief>&side=R&region=posterior
+#
+#   source     Quelle wie beim Import (Default argos)
+#   doc_id     Pflicht (ARGOS: id des Arztbriefs)
+#   side       R | L | all (auch RA/LA/OD/OS). Beidseitige Einträge zählen für beide Augen.
+#   region     posterior (= fundus) | anterior (= vaa) | other | all (Default all)
+#   domains    hpo | icd10 | hpo,icd10 (Default hpo)
+#   history    marked (Default: nur als Vorgeschichte markierte Einträge weglassen)
+#              | dated (zusätzlich alles mit Datum vor dem Briefdatum weglassen) | keep
+#   excluded   0 (Default: verneinte Befunde weglassen) | 1
+#   unsided    0 (Default: Einträge ohne Seitenangabe weglassen) | 1
+#   hpo_prefix 1 (Default: "HP:0000541") | 0 ("0000541"); ICD immer ohne "ICD10:" ("H35.3")
+#   format     ids (Default: JSON-Array) | json (Status + Einträge mit Begründung, zum Prüfen)
+#   wait       0..600 Sekunden auf eine laufende/wartende Extraktion warten (Default 0)
+#
+# format=ids: 200 + JSON-Array, wenn ein Phenopacket vorliegt (auch "[]");
+# sonst LEERER Body (202 wartend/läuft, 404 unbekannt, 409 ohne Ergebnis), damit
+# der OrderWriter in ARGOS nichts überschreibt. Status steht im Header
+# X-OntoTrial-Status. Optionaler Schutz: ONTOTRIAL_CODES_TOKEN (Header
+# X-Codes-Token oder Parameter token).
+#
+# Augenabschnitt: HPO über die Hierarchie (Wurzeln per .env änderbar),
+# ICD-10 über Kategoriebereiche. Ein Code kann in beiden Abschnitten liegen.
+# =========================================================================
+sub _dc_list { [ grep { length } map { s/^\s+|\s+$//gr } split /,/, ($_[0] // '') ] }
+
+our %DOC_REGION_HPO = (
+    posterior => _dc_list($ENV{ONTOTRIAL_REGION_HPO_POSTERIOR}
+        // 'HP:0004329,HP:0000479,HP:0000610,HP:0004327,HP:0000587'),
+    anterior  => _dc_list($ENV{ONTOTRIAL_REGION_HPO_ANTERIOR}
+        // 'HP:0004328,HP:0000481,HP:0000525,HP:0000517,HP:0000492,HP:0000502,HP:0000591'),
+);
+our %DOC_REGION_ICD = (
+    posterior => _dc_list($ENV{ONTOTRIAL_REGION_ICD_POSTERIOR} // 'H30-H36,H43,H46-H47'),
+    anterior  => _dc_list($ENV{ONTOTRIAL_REGION_ICD_ANTERIOR}  // 'H00-H03,H10-H13,H15-H22,H25-H28'),
+);
+
+sub _dc_icd_in_ranges {
+    my ($code, $ranges) = @_;
+    my $cat = uc($code // '');
+    $cat =~ s/^ICD10://i;
+    return 0 unless $cat =~ /^([A-Z]\d{2})/;
+    $cat = $1;
+    for my $r (@$ranges) {
+        my ($lo, $hi) = map { uc } split /\s*-\s*/, $r, 2;
+        $hi //= $lo;
+        return 1 if $cat ge $lo && $cat le $hi;
+    }
+    return 0;
+}
+
+# 1, wenn ein Zeitstempel sicher vor dem Briefdatum liegt (Teildaten wie "2019-UK-UK" erlaubt)
+sub _dc_before_day {
+    my ($ts, $ref) = @_;
+    return 0 unless defined $ts && $ts =~ /^(\d{4})(?:-(\d{2}|UK))?(?:-(\d{2}|UK))?/i;
+    my @t = ($1, $2, $3);
+    return 0 unless ($ref // '') =~ /^(\d{4})-(\d{2})-(\d{2})/;
+    my @r = ($1, $2, $3);
+    for my $i (0 .. 2) {
+        last unless defined $t[$i] && $t[$i] =~ /^\d+$/;
+        return 1 if $t[$i] < $r[$i];
+        return 0 if $t[$i] > $r[$i];
+    }
+    return 0;
+}
+
+helper document_code_entries => sub {
+    my ($c, $pp, $ref_day) = @_;
+    my @e;
+    my $onset = sub { my $o = shift; ref $o eq 'HASH' ? ($o->{timestamp} // '') : '' };
+    for my $d (@{ ref $pp->{diseases} eq 'ARRAY' ? $pp->{diseases} : [] }) {
+        next unless ref $d eq 'HASH' && ref $d->{term} eq 'HASH' && length($d->{term}{id} // '');
+        push @e, { domain => 'icd10', code => $d->{term}{id}, label => $d->{term}{label} // '',
+                   side => _ppd_side($d->{primarySite}), excluded => to_bool($d->{excluded}),
+                   onset => $onset->($d->{onset}) };
+    }
+    for my $p (@{ ref $pp->{phenotypicFeatures} eq 'ARRAY' ? $pp->{phenotypicFeatures} : [] }) {
+        next unless ref $p eq 'HASH' && ref $p->{type} eq 'HASH' && ($p->{type}{id} // '') =~ /^HP:/i;
+        push @e, { domain => 'hpo', code => $p->{type}{id}, label => $p->{type}{label} // '',
+                   side => _ppd_side_of_mods($p->{modifiers}), excluded => to_bool($p->{excluded}),
+                   onset => $onset->($p->{onset}) };
+    }
+    for my $x (@e) {
+        my @reg;
+        for my $r (qw(posterior anterior)) {
+            my $hit = $x->{domain} eq 'hpo'
+                ? scalar(grep { $c->is_subclass_of($x->{code}, $_) } @{ $DOC_REGION_HPO{$r} })
+                : _dc_icd_in_ranges($x->{code}, $DOC_REGION_ICD{$r});
+            push @reg, $r if $hit;
+        }
+        $x->{regions}      = @reg ? \@reg : ['other'];
+        $x->{history_mark} = $x->{onset} =~ /^PAST/i ? 1 : 0;
+        $x->{dated_before} = _dc_before_day($x->{onset}, $ref_day);
+    }
+    return \@e;
+};
+
+helper document_codes_state => sub {
+    my ($c, $source, $doc_id) = @_;
+    my $row = $c->pg->db->query(q{
+        SELECT id, phenopacket_json, extract_job_id,
+               to_char(reference_date::date, 'YYYY-MM-DD') AS day
+          FROM candidates
+         WHERE doc_source = ? AND doc_id = ?
+         ORDER BY id LIMIT 1
+    }, $source, $doc_id)->hash;
+    return { status => 'missing' } unless $row;
+    my %base = (candidate_id => $row->{id}, reference_date => $row->{day});
+    if (defined $row->{phenopacket_json}) {
+        my $pp = _ppd_parse_json($row->{phenopacket_json});
+        return { %base, status => 'ready', phenopacket => $pp } if $pp;
+        return { %base, status => 'failed', reason => 'unlesbares Phenopacket' };
+    }
+    return { %base, status => 'pending' } if $c->extraction_pending($row->{extract_job_id});
+    return { %base, status => 'failed', reason => 'kein Phenopacket und kein laufender Job' };
+};
+
+get '/BBB/document_codes' => sub {
+    my $c = shift;
+
+    if (my $tok = $ENV{ONTOTRIAL_CODES_TOKEN}) {
+        my $given = $c->req->headers->header('X-Codes-Token') // $c->param('token') // '';
+        return $c->render(json => { error => 'Token fehlt oder ist falsch.' }, status => 403)
+            unless $given eq $tok;
+    }
+
+    my $source = lc($c->param('source') // 'argos');
+    my $doc_id = $c->param('doc_id') // '';
+    return $c->render(json => { error => "Ungültige Quelle '$source'." }, status => 400)
+        unless $source =~ /^[a-z0-9_]{1,20}$/;
+    return $c->render(json => { error => "Parameter 'doc_id' fehlt." }, status => 400)
+        unless length $doc_id;
+
+    my %side_alias = (r => 'R', ra => 'R', od => 'R', right => 'R',
+                      l => 'L', la => 'L', os => 'L', left => 'L', all => '', '' => '');
+    my $side = $side_alias{ lc($c->param('side') // '') };
+    return $c->render(json => { error => "side muss R, L oder all sein." }, status => 400)
+        unless defined $side;
+
+    my %region_alias = (posterior => 'posterior', fundus => 'posterior', anterior => 'anterior',
+                        vaa => 'anterior', other => 'other', all => '', '' => '');
+    my $region = $region_alias{ lc($c->param('region') // '') };
+    return $c->render(json => { error => "region muss posterior, anterior, other oder all sein." }, status => 400)
+        unless defined $region;
+
+    my %domains = map { ($_ eq 'icd' ? 'icd10' : $_) => 1 } @{ _dc_list(lc($c->param('domains') // 'hpo')) };
+    return $c->render(json => { error => "domains muss hpo und/oder icd10 sein." }, status => 400)
+        if !%domains || grep { !/^(?:hpo|icd10)$/ } keys %domains;
+
+    my $history = lc($c->param('history') // 'marked');
+    return $c->render(json => { error => "history muss marked, dated oder keep sein." }, status => 400)
+        unless $history =~ /^(?:marked|dated|keep)$/;
+
+    my $format     = lc($c->param('format') // 'ids');
+    return $c->render(json => { error => "format muss ids oder json sein." }, status => 400)
+        unless $format =~ /^(?:ids|json)$/;
+    my $with_excl  = to_bool($c->param('excluded')   // 0);
+    my $unsided    = to_bool($c->param('unsided')    // 0);
+    my $hpo_prefix = to_bool($c->param('hpo_prefix') // 1);
+    my $wait       = $c->param('wait') // 0;
+    $wait = ($wait =~ /^\d{1,3}$/) ? List::Util::min($wait + 0, 600) : 0;
+
+    my $label = "$source:$doc_id side=" . ($side || 'all') . " region=" . ($region || 'all');
+
+    my $answer = sub {
+        my $st = shift;
+        $c->res->headers->header('X-OntoTrial-Status' => $st->{status});
+
+        if ($st->{status} ne 'ready') {
+            $c->app->log->info("[DOCUMENT CODES] $label -> $st->{status}");
+            my %http = (pending => 202, missing => 404, failed => 409);
+            return $c->render(json => { %$st }, status => 200) if $format eq 'json';
+            return $c->render(data => '', status => $http{ $st->{status} } // 409);
+        }
+
+        my $entries = $c->document_code_entries($st->{phenopacket}, $st->{reference_date});
+        my (@ids, %seen);
+        for my $x (@$entries) {
+            my $why = !$domains{ $x->{domain} }                                     ? 'domain'
+                    : ($x->{excluded} && !$with_excl)                                ? 'excluded'
+                    : ($history ne 'keep' && $x->{history_mark})                     ? 'history'
+                    : ($history eq 'dated' && $x->{dated_before})                    ? 'dated'
+                    : ($side && !length $x->{side} && !$unsided)                     ? 'unsided'
+                    : ($side && length $x->{side} && $x->{side} ne 'B' && $x->{side} ne $side) ? 'side'
+                    : ($region && !grep { $_ eq $region } @{ $x->{regions} })          ? 'region'
+                    : '';
+            $x->{dropped} = $why if length $why;
+            next if length $why;
+            my $id = $x->{code};
+            $id =~ s/^ICD10://i;
+            $id =~ s/^HP://i if $x->{domain} eq 'hpo' && !$hpo_prefix;
+            push @ids, $id unless $seen{ uc $id }++;
+        }
+        $c->app->log->info("[DOCUMENT CODES] $label -> " . scalar(@ids) . " Code(s)");
+        return $c->render(json => \@ids) if $format eq 'ids';
+        delete $st->{phenopacket};
+        return $c->render(json => { %$st, codes => \@ids, entries => $entries });
+    };
+
+    my $st = $c->document_codes_state($source, $doc_id);
+    return $answer->($st) unless $wait && $st->{status} eq 'pending';
+
+    # Auf die laufende Extraktion warten, ohne den Worker zu blockieren
+    $c->inactivity_timeout($wait + 60);
+    $c->render_later;
+    my $deadline = time + $wait;
+    my $tid;
+    $tid = Mojo::IOLoop->recurring(3 => sub {
+        my $now = eval { $c->document_codes_state($source, $doc_id) }
+               // { status => 'failed', reason => "Abfrage fehlgeschlagen: $@" };
+        return if $now->{status} eq 'pending' && time < $deadline;
+        Mojo::IOLoop->remove($tid);
+        $answer->($now);
+    });
+    $c->on(finish => sub { Mojo::IOLoop->remove($tid) if $tid });
 };
 
 # =========================================================
@@ -11520,7 +11899,8 @@ sub _val_reference_info {
     my ($set) = @_;
     return undef unless $set->{frozen_at};
     my $src = $set->{reference_source} // 'human';
-    my $label = $src =~ /^judge:(.+)$/ ? "KI-Judge $1" : $src =~ /^pipeline:(.+)$/ ? "Pipeline $1" : 'Ärzte';
+    my $label = $src =~ /^judge:(.+)$/ ? "KI-Judge $1" : $src =~ /^pipeline:(.+)$/ ? "Pipeline $1"
+              : $src =~ /^synthetic:(.+)$/ ? "Synthetisch $1" : 'Ärzte';
     return { source => $src, label => $label, frozen_at => "$set->{frozen_at}", frozen_by => $set->{frozen_by} // '',
              id => "$src\@$set->{frozen_at}" };
 }
@@ -11574,7 +11954,9 @@ sub _val_fingerprint {
     my $prov = lc($ENV{LLM_PROVIDER} // 'vllm');
     $fp{model} = $run_model || resolve_llm_config(undef)->{model} || ($prov eq 'ollama' ? ($ENV{OLLAMA_MODEL} // '') : ($ENV{VLLM_MODEL} // ''));
     for my $t (qw(llm_prompts ontology_intercepts filter_rules catalog_versions)) {
-        my $h = eval { $db->query("SELECT md5(coalesce(string_agg(x::text, '|' ORDER BY x::text), '')) AS h FROM $t x")->hash->{h} };
+        # Prompts des synthetischen Generators gehören nicht zur Extraktions-Pipeline
+        my $w = $t eq 'llm_prompts' ? q{ WHERE x.name NOT LIKE 'validation\_synth%'} : '';
+        my $h = eval { $db->query("SELECT md5(coalesce(string_agg(x::text, '|' ORDER BY x::text), '')) AS h FROM $t x$w")->hash->{h} };
         $fp{$t} = $h if $h;
     }
     $fp{env} = { map { $_ => $ENV{$_} } grep { /^ONTOTRIAL_(?:RERANK|OCULAR|ICD|LABEL|BLOCK|INTERCEPT|PARENT|GROUND|TRANSLATION)/ } sort keys %ENV };
@@ -11598,7 +11980,7 @@ get '/BBB/validation/sets' => sub {
     if (grep { ($_->{status} // '') eq 'preparing' } @$rows) {
         my %alive = map { $_->{id} => 1 } @{ $c->minion->backend->list_workers(0, 1000)->{workers} // [] };
         my %job;
-        my $jobs = $c->minion->jobs({ tasks => ['validation_prepare_task'], states => [qw(inactive active)] });
+        my $jobs = $c->minion->jobs({ tasks => ['validation_prepare_task', 'validation_synth_task'], states => [qw(inactive active)] });
         while (my $j = $jobs->next) { $job{ $j->{args}[0]{set_id} // 0 } = $j }
         for my $r (grep { ($_->{status} // '') eq 'preparing' } @$rows) {
             my $j = $job{ $r->{id} };
@@ -11752,13 +12134,19 @@ post '/BBB/validation/sets/:id/prepare' => sub {
     my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
     return $c->render(json => { error => 'Der Datensatz ist bereits vorbereitet.' }, status => 409) unless ($set->{status} // '') eq 'preparing';
     my %alive = map { $_->{id} => 1 } @{ $c->minion->backend->list_workers(0, 1000)->{workers} // [] };
-    my $jobs = $c->minion->jobs({ tasks => ['validation_prepare_task'], states => [qw(inactive active)] });
+    my $jobs = $c->minion->jobs({ tasks => ['validation_prepare_task', 'validation_synth_task'], states => [qw(inactive active)] });
     while (my $j = $jobs->next) {
         next unless ($j->{args}[0]{set_id} // 0) == $set->{id};
         if ($j->{state} eq 'active' && !$alive{ $j->{worker} // 0 }) { $c->minion->job($j->{id})->fail('Worker beendet'); next }
         return $c->render(json => { error => 'Die Vorbereitung läuft bereits.' }, status => 409);
     }
     my $p = $set->{params} // {};
+    if ($p->{synthetic}) {      # synthetischer Datensatz: Generator fortsetzen
+        return $c->render(json => { error => 'Der Generator-Endpunkt ist nicht freigegeben (ONTOTRIAL_SYNTH_ALLOW_EXTERNAL).' }, status => 403)
+            unless _synth_conf(($p->{synthetic} // {})->{model})->{allowed};
+        my $sid = $c->minion->enqueue(validation_synth_task => [{ set_id => $set->{id} }], { attempts => 1, queue => 'validation', priority => -5 });
+        return $c->render(json => { ok => 1, job => $sid, synthetic => 1 });
+    }
     my $id = $c->minion->enqueue(validation_prepare_task => [{ set_id => $set->{id}, model => ($p->{extraction} // {})->{model},
                                                                seed => $p->{seed}, inject => $p->{inject_fraction} // 0,
                                                                ensemble => $p->{ensemble_after_prepare} ? 1 : 0 }],
@@ -12125,6 +12513,15 @@ post '/BBB/validation/sets/:id/freeze' => sub {
     return $c->render(json => { error => 'Referenz ist bereits eingefroren.' }, status => 409) if $set->{frozen_at};
     return $c->render(json => { error => 'Zum Einfrieren den Namen des Datensatzes eingeben.' }, status => 400)
         unless _val_confirm_ok($set, $p->{confirm});
+    if (my $sp = $set->{params}{synthetic}) {   # synthetisch: Referenz ist das vorgegebene Phenopacket
+        my $items = _val_load_items($db, $set->{id});
+        my $model = $sp->{model} // 'unbekannt';
+        my $tx = $db->begin;
+        $db->update('validation_items', { reference => to_json(_synth_reference($_->{entries}, $model)) }, { id => $_->{id} }) for @$items;
+        $db->update('validation_sets', { frozen_at => \'now()', frozen_by => $p->{by} // '', reference_source => "synthetic:$model" }, { id => $set->{id} });
+        $tx->commit;
+        return $c->render(json => { ok => 1, items => scalar @$items, synthetic => 1 });
+    }
     my $items = _val_load_items($db, $set->{id});
     my $revs  = _val_reviews_by_item($db, $set->{id});
     my $judge = 0;   # eine KI-Judge-Referenz gibt es nicht mehr; Quellen: Ärzte oder Pipeline-Lauf
@@ -12199,6 +12596,8 @@ post '/BBB/validation/sets/:id/runs' => sub {
     return if _val_preparing($c, $set);
     # ohne eingefrorene Referenz: Lauf speichert nur die Extraktionen (z. B. als künftige Pipeline-Referenz)
     my $mode = ($p->{mode} // '') eq 'stored' ? 'stored' : 'reextract';
+    return $c->render(json => { error => 'Synthetische Briefe stehen nicht im Bestand. Bitte „Lauf starten (neu extrahieren)“ verwenden.' }, status => 400)
+        if $mode eq 'stored' && $set->{params}{synthetic};
     # bei Neu-Extraktion das gewählte Extraktionsmodell verwenden und im Pipeline-Stand vermerken
     my $model  = $mode eq 'reextract' && defined $p->{model} && length $p->{model} ? $p->{model} : undef;
     my $fp     = _val_fingerprint($c->app, $model);
@@ -12399,6 +12798,51 @@ sub _val_regression_compare {
 }
 
 # Neu-Extraktion eines frisch gezogenen Datensatzes mit der aktuellen Pipeline
+# PATCH 2026-11-09: Katarakt-OP-Parameter in bestehende Phenopackets nachtragen
+# (Briefe, die vor dem 22.10.2026 extrahiert wurden). Kein Sprachmodell; fortsetzbar,
+# weil schon ergänzte Briefe übersprungen werden. dry_run => 1 zählt nur.
+app->minion->add_task(cataract_backfill_task => sub {
+    my ($job, $p) = @_;
+    my $app  = $job->app;
+    my $db   = $app->pg->db;
+    my $dry  = $p->{dry_run} ? 1 : 0;
+    my $task = 'cataract_backfill';
+    my $rx   = 'phako|phaco|katarakt|cataract|hinterkammerlinse|kunstlinse|\miol\M|\mhkl\M';
+    my $n    = $db->query(q{SELECT count(*) FROM candidates WHERE phenopacket_json IS NOT NULL AND narrative_report ~* ?}, $rx)->array->[0];
+    my ($last, $k, $upd, $added, $skipped_race) = (0, 0, 0, 0, 0);
+    $app->log->info("[CATARACT BACKFILL] Start: $n Briefe mit Katarakt-Kontext" . ($dry ? ' (Probelauf)' : ''));
+    while (1) {
+        my $rows = $db->query(q{
+            SELECT id, narrative_report, to_char(reference_date::date, 'YYYY-MM-DD') AS rd,
+                   phenopacket_json::text AS pp, md5(phenopacket_json::text) AS h
+              FROM candidates
+             WHERE id > ? AND phenopacket_json IS NOT NULL AND narrative_report ~* ?
+             ORDER BY id LIMIT 500}, $last, $rx)->hashes->to_array;
+        last unless @$rows;
+        for my $r (@$rows) {
+            $last = $r->{id}; $k++;
+            my $pp = eval { from_json($r->{pp}) } or next;
+            my $m  = eval { cataract_backfill_packet($pp, $r->{narrative_report}, $r->{rd}) };
+            if ($@) { $app->log->warn("[CATARACT BACKFILL] Kandidat $r->{id}: $@"); next; }
+            next unless $m;
+            unless ($dry) {
+                # nur schreiben, wenn das Paket seit dem Lesen unverändert ist
+                my $ok = $db->query('UPDATE candidates SET phenopacket_json = ? WHERE id = ? AND md5(phenopacket_json::text) = ?',
+                                    to_json($pp), $r->{id}, $r->{h})->rows;
+                unless ($ok) { $skipped_race++; next; }
+            }
+            $upd++; $added += $m;
+        }
+        my $pct = int(100 * $k / ($n || 1));
+        $job->note(progress => $pct, checked => $k, total => $n, updated => $upd, measurements => $added);
+        $app->notify_task_progress($task, 'backfill', $pct, "Katarakt-Nachtrag: $k/$n Briefe, $upd ergänzt");
+    }
+    my $msg = "$k Briefe geprüft, $upd " . ($dry ? 'würden ergänzt' : 'ergänzt') . " ($added Messwerte)"
+            . ($skipped_race ? ", $skipped_race wegen gleichzeitiger Änderung übersprungen" : '');
+    $app->log->info("[CATARACT BACKFILL] Fertig: $msg");
+    $job->finish({ checked => $k, updated => $upd, measurements => $added, dry_run => $dry, skipped_race => $skipped_race });
+});
+
 app->minion->add_task(validation_prepare_task => sub {
     my ($job, $payload) = @_;
     my $app   = $job->app;
@@ -12457,6 +12901,1053 @@ app->minion->add_task(validation_prepare_task => sub {
     }
     $app->log->info("[VALIDATION] Datensatz \"$set->{name}\" vorbereitet: $ok Briefe extrahiert, $failed entfernt.");
     $job->finish({ ok => $ok, failed => $failed });
+});
+
+# ---------------------------------------------------------
+# Synthetischer Validierungsdatensatz
+# ---------------------------------------------------------
+# Ablauf:
+#   1. Few-Shot-Paare laden: fünf echte ARGOS-Briefe ab 2025 aus verschiedenen Subspezialitäten
+#      mit ihren Einträgen werden (grob vormaskiert) als Prompt 'validation_synth' in llm_prompts
+#      gespeichert. Sie verlassen das Kliniknetz erst nach Schritt 2.
+#   2. Prompt im Validierungsfenster prüfen, bei Bedarf bearbeiten und freigeben. Die
+#      Freigabe gilt für genau diesen Text (MD5); jede Änderung hebt sie auf.
+#   3. Batch: Für jedes Zielphenopacket wird nur der freigegebene Prompt mit den Einträgen
+#      des Ziels an den Generator (Standard: Claude über die Anthropic-API) geschickt.
+#      Echte Brieftexte werden nicht übertragen.
+#   Die Referenz ist das Zielphenopacket und wird nach dem Batch eingefroren.
+#
+# Konfiguration (.env):
+#   Generator je Modell (Feld "Modell" im Dialog): claude-* über die Anthropic-API, alle anderen
+#   Modellnamen wie in der Extraktion über vLLM bzw. Ollama (-mlx, ollama) im Kliniknetz.
+#   ONTOTRIAL_SYNTH_NUM_CTX         Kontextlänge für Ollama-Modelle (Standard 32768)
+#   ONTOTRIAL_SYNTH_URL             Standard https://api.anthropic.com/v1/messages
+#   ONTOTRIAL_SYNTH_API_KEY         Schlüssel (Rückfall: ANTHROPIC_API_KEY)
+#   ONTOTRIAL_SYNTH_MODEL           Standard claude-opus-5-5
+#   ONTOTRIAL_SYNTH_ALLOW_EXTERNAL  muss 1 sein, wenn der Batch-Endpunkt außerhalb des Kliniknetzes liegt
+#   ONTOTRIAL_SYNTH_LOCAL_HOSTS     Regex für Hosts im Kliniknetz
+#   ONTOTRIAL_SYNTH_FROM_DATE       Standard 2025-01-01;  ONTOTRIAL_SYNTH_SOURCES  Standard argos
+#   ONTOTRIAL_SYNTH_MAX_TOKENS (8000), ONTOTRIAL_SYNTH_TEMPERATURE, ONTOTRIAL_SYNTH_ATTEMPTS (3),
+#   ONTOTRIAL_SYNTH_MAX_OVERLAP (0.15)
+#   ONTOTRIAL_SYNTH_NOISE_VALUES    1 (Standard): Messwerte der Zielphenopackets verrauschen (Visus ±1 Stufe, Tensio ±2 mmHg, dpt ±0,25, Achse ±5°, µm ±10, Zellen ±100)
+#   ONTOTRIAL_SYNTH_KEEP_KEYS       1: Zuordnung Ziel-ID -> synthetischer Brief nach Abschluss behalten (Standard 0: löschen)
+#   ONTOTRIAL_SYNTH_DUMP_DIR        Diagnose: Anfrage und Antwort jedes Aufrufs als Datei in dieses Verzeichnis
+#   ONTOTRIAL_SYNTH_PROMPT_CACHE    1 (Standard): Systemprompt und Few-Shot-Beispiele bei Anthropic zwischenspeichern
+#   ONTOTRIAL_SYNTH_STRICT          1: Belege zusätzlich auf Seite, Datum und Verneinung prüfen (Standard 0)
+
+our $SYNTH_PROMPT_NAME   = 'validation_synth';
+our $SYNTH_APPROVAL_NAME = 'validation_synth_approval';
+our $SYNTH_N_SHOTS       = 5;
+
+our $SYNTH_SYSTEM = <<'EOT';
+Du bist Oberärztin oder Oberarzt einer Universitäts-Augenklinik und schreibst Arztbriefe.
+Du erhältst Beispiele aus kodierten Einträgen und dem passenden Arztbrief und danach eine neue
+Liste kodierter Einträge. Schreibe dazu einen Arztbrief, der sich in Stil, Gliederung,
+Abkürzungen und Umfang nicht von den Beispielen unterscheidet, so wie ihn eine Ärztin oder ein
+Arzt der Klinik im Alltag schreiben würde.
+
+Dabei gilt:
+1. Jeder Eintrag der Liste kommt im Brief vor, mit der angegebenen Seite (RA, LA, bds.), dem
+   Datum in der angegebenen Genauigkeit und, falls verneint, als Verneinung. Einträge mit dem
+   Briefdatum sind aktuelle Befunde; Einträge mit "Datum: keins" bekommen kein Datum. Messwerte
+   mit Zahl und Einheit wie angegeben.
+2. Erfinde keine weiteren Diagnosen, krankhaften Befunde, Eingriffe, Medikamente oder Messwerte.
+   Unauffällige Befunde und übliche Formulierungen, wie sie in den Beispielen vorkommen, sind
+   erlaubt.
+3. Nenne keine Personen, Orte oder Einrichtungen und übernimm keine Sätze aus den Beispielen.
+   Für Namen schreibe [Name]. Alter und Geschlecht stehen in der Aufgabe; übernimm sie von dort.
+4. Der Brief endet mit den Befunden. Schreibe keinen Abschnitt Procedere, Empfehlung oder
+   weiteres Vorgehen und keine Empfehlungen zur Therapie, Kontrolle oder Wiedervorstellung.
+
+Antwortformat:
+<brief>
+vollständiger Brieftext
+</brief>
+<belege>
+E1 | kurzes wörtliches Zitat aus deinem Brief, in dem Eintrag E1 vorkommt
+E2 | ...
+</belege>
+Die Belege dienen nur der Kontrolle und gehören nicht in den Brief.
+EOT
+
+our $SYNTH_TASK_TEMPLATE = <<'EOT';
+Neue Aufgabe
+Briefdatum: {{reference_date}}
+Geschlecht: {{sex}}
+Alter: {{age}}
+Einträge ({{n_entries}}):
+{{entries}}
+
+Schreibe jetzt den Arztbrief zu genau diesen Einträgen im Antwortformat.
+EOT
+
+sub _synth_local_hosts { return $ENV{ONTOTRIAL_SYNTH_LOCAL_HOSTS} // '^(?:localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|.*\.local|.*\.uniklinik-freiburg\.de|.*\.uni-freiburg\.de)$' }
+
+# Generator je Modell: Modellnamen, die mit "claude" beginnen, gehen an die Anthropic-API;
+# alle anderen werden wie die Extraktion geroutet (vLLM/OpenAI-kompatibel oder Ollama, z. B. *-mlx).
+sub _synth_conf {
+    my ($model) = @_;
+    $model = $ENV{ONTOTRIAL_SYNTH_MODEL} // 'glm-53' unless defined $model && length $model;
+    my ($prov, $url, $key, %hdr);
+    if ($model =~ /^claude/i) {
+        $prov = 'anthropic';
+        $url  = $ENV{ONTOTRIAL_SYNTH_URL} // 'https://api.anthropic.com/v1/messages';
+        $key  = $ENV{ONTOTRIAL_SYNTH_API_KEY} // $ENV{ANTHROPIC_API_KEY} // '';
+    } else {
+        my $lc = resolve_llm_config($model);
+        $prov = $lc->{is_ollama} ? 'ollama' : 'openai';
+        $url  = $lc->{endpoint} // '';
+        %hdr  = %{ $lc->{headers} // {} };
+        delete $hdr{'Content-Type'};
+        $key  = '';
+    }
+    my $host = eval { Mojo::URL->new($url)->host } // '';
+    my $loc  = _synth_local_hosts();
+    my $external = ($host =~ /$loc/i) ? 0 : 1;
+    my @src = grep { length } map { lc s/^\s+|\s+$//gr } split /,/, ($ENV{ONTOTRIAL_SYNTH_SOURCES} // 'argos');
+    return {
+        provider => $prov, url => $url, host => $host, external => $external, headers => \%hdr,
+        allowed  => (!$external || ($ENV{ONTOTRIAL_SYNTH_ALLOW_EXTERNAL} // '') eq '1') ? 1 : 0,
+        key      => $key, model => $model,
+        from     => $ENV{ONTOTRIAL_SYNTH_FROM_DATE} // '2025-01-01',
+        sources  => \@src,
+        attempts => int($ENV{ONTOTRIAL_SYNTH_ATTEMPTS} // 3) || 1,
+        overlap  => ($ENV{ONTOTRIAL_SYNTH_MAX_OVERLAP} // 0.15) + 0,
+    };
+}
+
+# Grobe Vormaskierung der echten Beispielbriefe. Ersetzt NICHT die manuelle Überarbeitung vor der Freigabe.
+sub _synth_scrub {
+    my $t = shift // '';
+    $t =~ s/\b(?:Prof\.|Dr\.|PD)(?:\s*(?:Dr\.|med\.|univ\.|rer\.\s*nat\.|habil\.|h\.\s*c\.))*\s+(?:[A-ZÄÖÜ]\.\s*)*[A-ZÄÖÜ][\w\-äöüß]+(?:\s+[A-ZÄÖÜ][\w\-äöüß]+)?/[Ärztin oder Arzt]/g;
+    $t =~ s/\b(Herrn?|Frau)\s+(?!Kolleg|Prof\b|Dr\b|\[)(?:[A-ZÄÖÜ]\.\s*)*[A-ZÄÖÜ][\w\-äöüß]+(?:[\s\-]+[A-ZÄÖÜ][\w\-äöüß]+)?/$1 [Name]/g;
+    $t =~ s/\b(geb(?:oren|\.)?\s*(?:am)?\s*)\d{1,2}\.\s?\d{1,2}\.\s?\d{2,4}/$1\[Datum]/gi;
+    $t =~ s/\b\d{6,}\b/[Nr]/g;
+    $t =~ s/(?:\+49|\b0)\s?\d{2,5}[\s\/\-]?\d{3,}(?:[\s\-]?\d+)*/[Telefon]/g;
+    $t =~ s/\b\d{5}\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+(?:im|am|an der)\s+[A-ZÄÖÜ][\w]+)?/[Ort]/g;
+    $t =~ s/\b[A-ZÄÖÜ][a-zäöüß]+(?:straße|strasse|weg|platz|allee|gasse)\s+\d+\w?/[Adresse]/g;
+    return $t;
+}
+
+# Prompt direkt aus der Datenbank (ohne den 30-s-Cache von get_llm_prompt)
+sub _synth_load_prompt {
+    my ($db) = @_;
+    my $row  = eval { $db->query('SELECT system_prompt, user_template FROM llm_prompts WHERE name = ? AND active = TRUE ORDER BY 1 LIMIT 1', $SYNTH_PROMPT_NAME)->hash };
+    my $sys  = ($row && length($row->{system_prompt} // '')) ? $row->{system_prompt} : $SYNTH_SYSTEM;
+    my $tpl  = $row ? ($row->{user_template} // '') : '';
+    my $appr = eval { $db->query('SELECT system_prompt FROM llm_prompts WHERE name = ? LIMIT 1', $SYNTH_APPROVAL_NAME)->hash };
+    $appr = $appr ? (eval { from_json($appr->{system_prompt}) } // undef) : undef;
+    my $hash = md5_hex(encode('UTF-8', "$sys\x{1}$tpl"));
+    my $n_shots = () = $tpl =~ /<brief>/g;
+    return { system_prompt => $sys, user_template => $tpl, hash => $hash, in_db => $row ? 1 : 0, n_shots => $n_shots,
+             approval => $appr, approved => ($appr && ($appr->{hash} // '') eq $hash) ? 1 : 0,
+             placeholders_ok => ($tpl =~ /\{\{entries\}\}/ && $tpl =~ /\{\{reference_date\}\}/) ? 1 : 0 };
+}
+
+sub _synth_store_row {
+    my ($db, $name, $sys, $tpl) = @_;
+    my $n = $db->query('UPDATE llm_prompts SET system_prompt = ?, user_template = ?, active = TRUE WHERE name = ?', $sys, $tpl, $name)->rows;
+    $db->query('INSERT INTO llm_prompts (name, system_prompt, user_template, active) VALUES (?, ?, ?, TRUE)', $name, $sys, $tpl) unless $n;
+}
+
+sub _synth_entry_lines {
+    my ($entries) = @_;
+    my %dom  = (disease => 'Diagnose', phenotype => 'Befund', procedure => 'Eingriff', treatment => 'Medikation', measurement => 'Messwert');
+    my %side = (R => 'RA', L => 'LA', B => 'beidseits', '' => 'keine');
+    my (@lines, @used);
+    my $n = 0;
+    for my $e (grep { !_val_is_derived($_) } @$entries) {
+        $n++;
+        my $val = defined $e->{value} && length $e->{value}
+            ? ' | Wert: ' . ($e->{comparator} && $e->{comparator} ne '=' ? "$e->{comparator} " : '') . ($e->{value} =~ tr/./,/r)
+              . (length($e->{unit} // '') ? " $e->{unit}" : '')
+            : (length($e->{value_text} // '') ? " | Wert: $e->{value_text}" : '');
+        push @lines, sprintf('E%d | %s | %s | Seite: %s | Datum: %s | %s%s', $n, $dom{ $e->{domain} } // $e->{domain},
+                             $e->{code} . (length($e->{label} // '') ? " $e->{label}" : ''), $side{ $e->{side} // '' } // $e->{side},
+                             length($e->{date} // '') ? $e->{date} : 'keins', $e->{excluded} ? 'verneint' : 'vorhanden', $val);
+        push @used, $e;
+    }
+    return (join("\n", @lines), \@used);
+}
+
+sub _synth_sex {
+    my $pp = shift;
+    my $s  = uc((ref $pp eq 'HASH' && ref $pp->{subject} eq 'HASH') ? ($pp->{subject}{sex} // '') : '');
+    return $s eq 'FEMALE' ? 'weiblich' : $s eq 'MALE' ? 'männlich' : 'unbekannt';
+}
+
+# Datumsverschiebung der Zielphenopackets: alle Datumswerte um denselben Monatsversatz verschieben
+# (Genauigkeit und Abstände bleiben erhalten). Volle ISO-Daten und Zeitstempel überall, reine
+# Jahreszahlen nur in Feldern, deren Name auf ein Datum hinweist. Platzhalter wie PAST-UK-UK bleiben.
+sub _synth_shift_value {
+    my ($v, $m, $key) = @_;
+    return $v unless defined $v && !ref $v;
+    if ($v =~ /^(\d{4}-\d{2}(?:-\d{2})?)(T.*)?$/) { return _synth_shift_date($1, $m) . ($2 // '') }
+    if ($v =~ /^\d{4}$/ && ($key // '') =~ /time|date|onset|stamp/i) { return _synth_shift_date($v, $m) }
+    return $v;
+}
+
+sub _synth_shift_pp {
+    my ($node, $m, $key) = @_;
+    if (ref $node eq 'HASH') {
+        return { map { $_ => _synth_shift_pp($node->{$_}, $m, $_) } keys %$node };
+    }
+    if (ref $node eq 'ARRAY') {
+        return [ map { _synth_shift_pp($_, $m, $key) } @$node ];
+    }
+    return _synth_shift_value($node, $m, $key);
+}
+
+# Zufälliger Versatz ±1–12 Monate je Zielbrief (nicht aus dem Seed ableitbar, wird nicht gespeichert).
+# Läge das verschobene Briefdatum in der Zukunft, wird in die Vergangenheit verschoben.
+sub _synth_month_offset {
+    my ($rdate) = @_;
+    my $m = (1 + int(rand(12))) * (rand() < 0.5 ? -1 : 1);
+    my $today = POSIX::strftime('%Y-%m-%d', localtime);
+    $m = -abs($m) if $m > 0 && length($rdate // '') && _synth_shift_date($rdate, $m) gt $today;
+    return $m;
+}
+
+# Tage unabhängig neu würfeln: Jedes verschiedene Tagesdatum bekommt einen zufälligen Tag in seinem
+# (bereits verschobenen) Monat. Gleiche Daten bleiben gleich (Briefdatum = Datum aktueller Befunde),
+# die Reihenfolge der Daten innerhalb eines Monats bleibt erhalten, kein Datum liegt in der Zukunft.
+# Abstände zwischen Daten ändern sich dadurch um bis zu einen Monat.
+sub _synth_collect_days {
+    my ($node, $acc) = @_;
+    if    (ref $node eq 'HASH')  { _synth_collect_days($_, $acc) for values %$node }
+    elsif (ref $node eq 'ARRAY') { _synth_collect_days($_, $acc) for @$node }
+    elsif (defined $node && $node =~ /^(\d{4}-\d{2}-\d{2})(?:T.*)?$/) { $acc->{$1} = 1 }
+}
+
+sub _synth_apply_days {
+    my ($node, $map) = @_;
+    return { map { $_ => _synth_apply_days($node->{$_}, $map) } keys %$node } if ref $node eq 'HASH';
+    return [ map { _synth_apply_days($_, $map) } @$node ] if ref $node eq 'ARRAY';
+    return $node unless defined $node && $node =~ /^(\d{4}-\d{2}-\d{2})(T.*)?$/;
+    return ($map->{$1} // $1) . ($2 // '');
+}
+
+sub _synth_jitter_days {
+    my ($pp, $rdate) = @_;
+    my %days;
+    _synth_collect_days($pp, \%days);
+    $days{$rdate} = 1 if ($rdate // '') =~ /^\d{4}-\d{2}-\d{2}$/;
+    my (%by_month, %map);
+    push @{ $by_month{ substr($_, 0, 7) } }, $_ for keys %days;
+    my $today = POSIX::strftime('%Y-%m-%d', localtime);
+    for my $ym (keys %by_month) {
+        my @orig = sort @{ $by_month{$ym} };
+        my ($y, $m) = split /-/, $ym;
+        my $max = DateTime->last_day_of_month(year => $y, month => $m)->day;
+        $max = substr($today, 8, 2) + 0 if $ym eq substr($today, 0, 7);
+        next if @orig > $max;    # mehr Daten als Tage: unverändert lassen
+        my %pick;
+        $pick{ 1 + int(rand($max)) } = 1 while keys %pick < @orig;
+        my @new = sort { $a <=> $b } keys %pick;
+        $map{ $orig[$_] } = sprintf('%s-%02d', $ym, $new[$_]) for 0 .. $#orig;
+    }
+    return (_synth_apply_days($pp, \%map), (length($rdate // '') ? ($map{$rdate} // $rdate) : $rdate));
+}
+
+# Alter in Jahren aus subject.timeAtLastEncounter (ISO-8601-Dauer, z. B. P69Y); '' wenn unbekannt
+sub _synth_age {
+    my $pp  = shift;
+    my $iso = eval { $pp->{subject}{timeAtLastEncounter}{age}{iso8601duration} } // '';
+    return $iso =~ /^P(\d+)Y/ ? $1 + 0 : '';
+}
+
+# Nachbearbeitung des erzeugten Briefs vor der Prüfung:
+#  - Platzhalter [Alter] durch das Alter aus dem Phenopacket ersetzen
+#  - Abschnitt Procedere/Empfehlung entfernen (bis zum nächsten Abschnittskopf, zur Grußformel oder zum Ende)
+sub _synth_postprocess {
+    my ($text, $age) = @_;
+    my ($letter) = ($text // '') =~ m{<brief>\s*(.*?)\s*</brief>}s;
+    return $text unless defined $letter;
+    $letter =~ s/\[\s*(?:Alter|Lebensalter)\s*\]/$age/gi if length $age;
+    my (@out, $skip);
+    for my $line (split /\n/, $letter, -1) {
+        if ($line =~ /^\s*(?:procedere|prozedere|empfehlung(?:en)?|weiteres\s+vorgehen|therapieempfehlung)\b\s*(?:[A-Z]\b)?\s*[:\-]?/i) { $skip = 1; next }
+        if ($skip) {
+            if ($line =~ /^\s*$/ || $line =~ /^\s*(?:mit\s+(?:freundlichen|kollegialen)|freundliche\s+gr|viele\s+gr)/i
+                || $line =~ /^\s*[A-Za-zÄÖÜäöüß][\wÄÖÜäöüß\-\. ]{1,30}?(?:\s+[RLB])?\s*:/) { $skip = 0 }
+            else { next }
+        }
+        push @out, $line;
+    }
+    $letter = join "\n", @out;
+    $letter =~ s/\s+$//;
+    $text =~ s{<brief>\s*.*?\s*</brief>}{<brief>\n$letter\n</brief>}s;
+    return $text;
+}
+
+sub _synth_norm {
+    my $t = lc(shift // '');
+    $t =~ tr/„“”‚‘’»«/"""'''""/;
+    $t =~ s/[–—]/-/g;
+    $t =~ s/\s+/ /g;
+    $t =~ s/^\s+|\s+$//g;
+    return $t;
+}
+
+# Belegsuche mit Toleranz: exakt (normalisiert), ohne Satzzeichen, Auslassungen ("...") als
+# Lücken, zuletzt ein Fenster im Brief, das mindestens 90 % der Wörter des Zitats enthält.
+sub _synth_hardnorm {
+    my $t = lc(shift // '');
+    $t =~ s/[^\p{L}\p{N},]+/ /g;
+    $t =~ s/(?<!\d),|,(?!\d)/ /g;       # Kommas nur als Dezimalzeichen behalten
+    $t =~ s/\s+/ /g;
+    $t =~ s/^\s+|\s+$//g;
+    return $t;
+}
+
+sub _synth_quote_found {
+    my ($letter, $quote) = @_;
+    my $nl = _synth_norm($letter);
+    my $nq = _synth_norm($quote);
+    return 0 if length($nq) < 3;
+    return 1 if index($nl, $nq) >= 0;
+    my $hl = _synth_hardnorm($letter);
+    my $hq = _synth_hardnorm($quote);
+    return 0 unless length $hq;
+    return 1 if index($hl, $hq) >= 0;
+    my @parts = grep { length >= 3 } map { _synth_hardnorm($_) } split /\.{3}|…/, $quote;
+    if (@parts > 1) {
+        my $pos = 0;
+        my $ok  = 1;
+        for my $p (@parts) { my $i = index($hl, $p, $pos); if ($i < 0) { $ok = 0; last } $pos = $i + length $p }
+        return 1 if $ok;
+    }
+    my @q = split / /, $hq;
+    my @l = split / /, $hl;
+    return 0 if !@q || @l < @q;
+    my $w = @q + 3;
+    for my $s (0 .. List::Util::max(0, @l - $w)) {
+        my %bag;
+        $bag{$_}++ for @l[$s .. List::Util::min($#l, $s + $w - 1)];
+        my $hit = 0;
+        for my $tok (@q) { if ($bag{$tok}) { $bag{$tok}--; $hit++ } }
+        return 1 if $hit >= 0.9 * @q;
+    }
+    return 0;
+}
+
+sub _synth_shingles {
+    my ($t, $k) = @_;
+    my @w = grep { length } split /[^\w]+/, lc($t // '');
+    my %s;
+    $s{ join ' ', @w[$_ .. $_ + $k - 1] } = 1 for 0 .. $#w - $k + 1;
+    return \%s;
+}
+
+# Datum um ganze Monate verschieben, Genauigkeit bleibt erhalten
+sub _synth_shift_date {
+    my ($d, $m) = @_;
+    return $d unless defined $d && $d =~ /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/;
+    my ($y, $mo, $da) = ($1, $2, $3);
+    return sprintf('%04d', $y + int(($m + ($m < 0 ? -6 : 6)) / 12)) unless defined $mo;
+    my $t = $y * 12 + ($mo - 1) + $m;
+    my ($ny, $nm) = (int($t / 12), $t % 12 + 1);
+    return sprintf('%04d-%02d', $ny, $nm) unless defined $da;
+    my $dim = DateTime->last_day_of_month(year => $ny, month => $nm)->day;
+    return sprintf('%04d-%02d-%02d', $ny, $nm, $da > $dim ? $dim : $da);
+}
+
+my %SYNTH_MONTHS = (januar => 1, jan => 1, februar => 2, feb => 2, 'märz' => 3, maerz => 3, mrz => 3, april => 4, apr => 4, mai => 5,
+                    juni => 6, jun => 6, juli => 7, jul => 7, august => 8, aug => 8, september => 9, sep => 9, sept => 9,
+                    oktober => 10, okt => 10, november => 11, nov => 11, dezember => 12, dez => 12);
+
+# Daten in einem Zitat finden: Liste von [Jahr, Monat|undef, Tag|undef]
+sub _synth_dates_in {
+    my $q = shift // '';
+    my @d;
+    my $yy = sub { my $y = shift; return length($y) == 2 ? 2000 + $y : $y + 0 };
+    while ($q =~ /\b(\d{1,2})\.\s?(\d{1,2})\.\s?(\d{4}|\d{2})\b/g) { push @d, [ $yy->($3), $2 + 0, $1 + 0 ] }
+    my $q2 = $q =~ s/\b\d{1,2}\.\s?\d{1,2}\.\s?(?:\d{4}|\d{2})\b/ /gr;
+    while ($q2 =~ /\b(\d{1,2})\s?[\/.]\s?(\d{4}|\d{2})\b/g) { push @d, [ $yy->($2), $1 + 0, undef ] if $1 >= 1 && $1 <= 12 }
+    while ($q2 =~ /\b([A-Za-zäÄ]+)\.?\s+(\d{4})\b/g) { my $m = $SYNTH_MONTHS{ lc $1 }; push @d, [ $2 + 0, $m, undef ] if $m }
+    while ($q2 =~ /\b((?:19|20)\d{2})\b/g) { push @d, [ $1 + 0, undef, undef ] }
+    return \@d;
+}
+
+sub _synth_date_ok {
+    my ($q, $date, $refdate) = @_;
+    return 1 if !length($date // '') || ($date eq ($refdate // ''));
+    my ($y, $m, $d) = $date =~ /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/ or return 1;
+    for my $x (@{ _synth_dates_in($q) }) {
+        next unless $x->[0] == $y;
+        return 1 unless defined $m;
+        next unless defined $x->[1] && $x->[1] == $m;
+        return 1 unless defined $d;
+        return 1 if defined $x->[2] && $x->[2] == $d;
+    }
+    return 0;
+}
+
+sub _synth_side_ok {
+    my ($q, $side) = @_;
+    my $r = $q =~ /(?:\bRA\b|\brechts\b|\brechte[nmrs]?\b|\bre\.|\bOD\b)/ ? 1 : 0;
+    my $l = $q =~ /(?:\bLA\b|\blinks\b|\blinke[nmrs]?\b|\bli\.|\bOS\b)/ ? 1 : 0;
+    my $b = $q =~ /(?:\bbds\.?|\bbeidseit\w*|\bbeide[nr]?\s+Augen|\bBA\b|\bOU\b)/i ? 1 : 0;
+    return $side eq 'R' ? ($r && !$l && !$b) : $side eq 'L' ? ($l && !$r && !$b) : $side eq 'B' ? ($b || ($r && $l)) : !($r || $l || $b);
+}
+
+our $SYNTH_NEG = qr/\b(?:kein(?:e[nmrs]?)?|ohne|nicht|ausgeschlossen|negativ|frei\s+von|Ausschluss)\b/i;
+our $SYNTH_FALSE_NEG = qr/(?:\b(?:kein(?:e[nmrs]?)?\s+(?:Anhalt|Hinweis|Nachweis)|ausgeschlossen|Verdacht|fraglich|geplant|empfohlen)\b|\bV\.\s?a\.|\bDD\b)/i;
+
+# Antwort prüfen. Liefert ({ letter, quotes, overlap }, undef) oder (undef, Grund)
+sub _synth_check {
+    my ($text, $used, $examples, $conf, $refdate) = @_;
+    my ($letter) = ($text // '') =~ m{<brief>\s*(.*?)\s*</brief>}s;
+    return (undef, 'kein <brief>-Block') unless defined $letter && length($letter) >= 150;
+    my $strict = ($ENV{ONTOTRIAL_SYNTH_STRICT} // '0') eq '1';
+    my ($bl) = $text =~ m{<belege>\s*(.*?)\s*</belege>}s;
+    my %quote;
+    for my $line (split /\n/, $bl // '') {
+        $quote{$1} = $2 if $line =~ /^\s*E(\d+)\s*\|\s*(.+?)\s*$/;
+    }
+    my $nl = _synth_norm($letter);
+    my @miss;
+    for my $k (1 .. scalar @$used) {
+        my $raw = $quote{$k} // '';
+        $raw =~ s/^["„“]|["“”]$//g;
+        unless (_synth_quote_found($letter, $raw)) { push @miss, "E$k (kein wörtlicher Beleg)"; next; }
+        my $e = $used->[ $k - 1 ];
+        if ($strict) {
+            push @miss, "E$k (Seite)" unless _synth_side_ok($raw, $e->{side} // '');
+            push @miss, "E$k (Datum)" unless _synth_date_ok($raw, $e->{date}, $refdate);
+            if ($e->{excluded}) { push @miss, "E$k (Verneinung fehlt)" unless $raw =~ $SYNTH_NEG }
+            else                { push @miss, "E$k (verneint/Verdacht/geplant)" if $raw =~ $SYNTH_FALSE_NEG }
+        }
+        if ($e->{domain} eq 'measurement' && defined $e->{value} && length $e->{value}) {
+            my ($v1, $v2) = ("$e->{value}", ($e->{value} =~ tr/./,/r));
+            push @miss, "E$k (Wert)" unless index($raw, $v1) >= 0 || index($raw, $v2) >= 0;
+        }
+    }
+    return (undef, 'Belege fehlerhaft: ' . join(', ', @miss)) if @miss;
+    my $ls = _synth_shingles($letter, 8);
+    my %ex;
+    for my $x (@{ $examples // [] }) { my $s = _synth_shingles($x, 8); $ex{$_} = 1 for keys %$s }
+    my $n  = scalar keys %$ls;
+    my $ov = $n ? scalar(grep { $ex{$_} } keys %$ls) / $n : 0;
+    return (undef, sprintf('zu viel Text aus den Beispielen übernommen (%.0f %%)', 100 * $ov)) if $ov > $conf->{overlap};
+    my %qs = map { $_ => $quote{$_} } 1 .. scalar @$used;
+    return ({ letter => $letter, quotes => \%qs, overlap => $ov }, undef);
+}
+
+sub _synth_reference {
+    my ($entries, $model) = @_;
+    return { entries => [ map { { %$_, src => 'synthetic' } } grep { !_val_is_derived($_) } @{ $entries // [] } ],
+             tolerated => [], source => "Synthetisch $model", reviewers => [] };
+}
+
+sub _synth_fill {
+    my ($tpl, %v) = @_;
+    $tpl =~ s/\{\{(\w+)\}\}/exists $v{$1} ? $v{$1} : "{{$1}}"/ge;
+    return $tpl;
+}
+
+# Ein Aufruf des Generators; liefert (Text, Usage) oder stirbt mit Fehlermeldung.
+# $user ist ein Text oder [konstanter Teil, variabler Teil]. Bei Anthropic wird der konstante Teil
+# (Systemprompt + Few-Shot-Beispiele) per Prompt-Caching zwischengespeichert: Folgeaufrufe innerhalb
+# von 5 Minuten lesen ihn zum Bruchteil des Eingabepreises aus dem Cache.
+sub _synth_call {
+    my ($conf, $model, $system, $user) = @_;
+    my ($u_fix, $u_var, $prev, $feedback) = ref $user eq 'ARRAY' ? @$user : ('', $user);
+    my @followup = (defined $prev && defined $feedback)
+        ? ({ role => 'assistant', content => $prev }, { role => 'user', content => $feedback }) : ();
+    die "Kein API-Schlüssel gesetzt (ONTOTRIAL_SYNTH_API_KEY).\n" if $conf->{provider} eq 'anthropic' && !length $conf->{key};
+    my $maxtok = int($ENV{ONTOTRIAL_SYNTH_MAX_TOKENS} // 8000);
+    my $temp   = $ENV{ONTOTRIAL_SYNTH_TEMPERATURE} // '';
+    my ($body, %hdr);
+    if ($conf->{provider} eq 'anthropic') {
+        my $cache = ($ENV{ONTOTRIAL_SYNTH_PROMPT_CACHE} // '1') ne '0';
+        my @content = length $u_fix
+            ? ({ type => 'text', text => $u_fix, ($cache ? (cache_control => { type => 'ephemeral' }) : ()) },
+               { type => 'text', text => $u_var })
+            : ({ type => 'text', text => $u_var });
+        my $sys_block = { type => 'text', text => $system, (($cache && !length $u_fix) ? (cache_control => { type => 'ephemeral' }) : ()) };
+        $body = { model => $model, max_tokens => $maxtok, system => [ $sys_block ], messages => [ { role => 'user', content => \@content }, @followup ] };
+        %hdr  = ('x-api-key' => $conf->{key}, 'anthropic-version' => '2023-06-01');
+    } elsif ($conf->{provider} eq 'ollama') {
+        $body = { model => $model, stream => Mojo::JSON->false,
+                  messages => [ { role => 'system', content => $system }, { role => 'user', content => $u_fix . $u_var }, @followup ],
+                  options  => { num_predict => $maxtok, num_ctx => int($ENV{ONTOTRIAL_SYNTH_NUM_CTX} // 32768),
+                                (length $temp ? (temperature => $temp + 0) : ()) } };
+        %hdr  = %{ $conf->{headers} // {} };
+    } else {
+        $body = { model => $model, max_tokens => $maxtok,
+                  messages => [ { role => 'system', content => $system }, { role => 'user', content => $u_fix . $u_var }, @followup ] };
+        $body->{temperature} = $temp + 0 if length $temp;
+        llm_apply_extra($body, $model);    # ONTOTRIAL_LLM_EXTRA_<MODELL>, z. B. reasoning_effort oder stream
+        %hdr  = %{ $conf->{headers} // {} };
+    }
+    $body->{temperature} = $temp + 0 if length $temp && $conf->{provider} eq 'anthropic';
+    my $ua = Mojo::UserAgent->new(connect_timeout => 30, inactivity_timeout => 900, request_timeout => 900);
+    $ua->proxy->detect if $conf->{provider} eq 'anthropic';    # lokale Modelle (vLLM, Ollama) immer direkt, ohne Proxy
+    # Diagnose: jeder Aufruf mit Dauer und Ergebnis ins Log; optional Anfrage und Antwort als Datei
+    my $log   = app->log;
+    my $proxy = $ua->proxy->https // 'kein Proxy';
+    my $chars = length(to_json($body));
+    my $dump  = $ENV{ONTOTRIAL_SYNTH_DUMP_DIR} // '';
+    my $stamp = POSIX::strftime('%Y%m%d-%H%M%S', localtime) . "-$$-" . int(rand(1e6));
+    if (length $dump) {
+        eval { Mojo::File->new($dump)->make_path; Mojo::File->new($dump, "$stamp-request.json")->spew(encode('UTF-8', to_json($body))) };
+    }
+    my $last = '';
+    for my $try (1 .. 4) {
+        $log->info("[SYNTH] Aufruf $model über $conf->{host} ($proxy), Versuch $try, Anfrage $chars Zeichen");
+        my $t0  = Time::HiRes::time();
+        my $tx  = $ua->post($conf->{url} => \%hdr => json => $body);
+        $tx = llm_sse_to_json($tx) if $conf->{provider} eq 'openai' && $body->{stream};
+        my $res = $tx->res;
+        my $dt  = sprintf('%.1f', Time::HiRes::time() - $t0);
+        eval { Mojo::File->new($dump, "$stamp-response-$try.txt")->spew(($res->code // 'keine Antwort') . "\n" . ($res->body // '')) } if length $dump;
+        if (my $err = $tx->error) {
+            my $code = $err->{code} // 0;
+            $last = $code ? "HTTP $code: " . substr($res->body // '', 0, 300) : "Verbindung: $err->{message}";
+            $log->warn("[SYNTH] Fehler nach $dt s (Versuch $try): $last");
+            die "$last\n" if $code && $code < 500 && $code != 429;
+            sleep(($res->headers->header('retry-after') // 0) + 15 * $try);
+            next;
+        }
+        my $j = $res->json // {};
+        my ($text, %usage);
+        if ($conf->{provider} eq 'anthropic') {
+            $text  = join '', map { $_->{text} // '' } grep { ($_->{type} // '') eq 'text' } @{ $j->{content} // [] };
+            %usage = (input_tokens => $j->{usage}{input_tokens} // 0, output_tokens => $j->{usage}{output_tokens} // 0,
+                      cache_write_tokens => $j->{usage}{cache_creation_input_tokens} // 0,
+                      cache_read_tokens  => $j->{usage}{cache_read_input_tokens} // 0);
+            die "Antwort abgeschnitten (ONTOTRIAL_SYNTH_MAX_TOKENS erhöhen).\n" if ($j->{stop_reason} // '') eq 'max_tokens';
+        } elsif ($conf->{provider} eq 'ollama') {
+            $text  = $j->{message}{content} // '';
+            die "Antwort abgeschnitten (ONTOTRIAL_SYNTH_MAX_TOKENS oder ONTOTRIAL_SYNTH_NUM_CTX erhöhen).\n" if ($j->{done_reason} // '') eq 'length';
+            %usage = (input_tokens => $j->{prompt_eval_count} // 0, output_tokens => $j->{eval_count} // 0);
+        } else {
+            my $ch = $j->{choices}[0] // {};
+            $text  = $ch->{message}{content} // '';
+            die "Antwort abgeschnitten (ONTOTRIAL_SYNTH_MAX_TOKENS erhöhen).\n" if ($ch->{finish_reason} // '') eq 'length';
+            %usage = (input_tokens => $j->{usage}{prompt_tokens} // 0, output_tokens => $j->{usage}{completion_tokens} // 0);
+        }
+        $log->info("[SYNTH] Antwort nach $dt s: ein $usage{input_tokens}, aus $usage{output_tokens}"
+                   . (defined $usage{cache_read_tokens} ? ", Cache gelesen $usage{cache_read_tokens}, geschrieben $usage{cache_write_tokens}" : ''));
+        return ($text, \%usage);
+    }
+    die "Generator nicht erreichbar: $last\n";
+}
+
+# Few-Shot-Beispiel als Text im Antwortformat
+sub _synth_shot_block {
+    my ($k, $rdate, $sex, $lines, $res, $n) = @_;
+    my $bel = join "\n", map { "E$_ | $res->{quotes}{$_}" } 1 .. $n;
+    return "Beispiel $k\nBriefdatum: $rdate\nGeschlecht: $sex\nEinträge ($n):\n$lines\n\nAntwort:\n<brief>\n$res->{letter}\n</brief>\n<belege>\n$bel\n</belege>";
+}
+
+# Subspezialität eines Phenopackets für die Auswahl der Few-Shot-Quellen
+sub _synth_bucket {
+    my ($entries) = @_;
+    my @icd = map { $_->{code} =~ s/^ICD-?10(?:-GM)?://ir } grep { $_->{domain} eq 'disease' } @$entries;
+    return 'cornea'   if grep { /^H1[6-9]/ || /^T86\.8/ } @icd;
+    return 'lens'     if grep { /^H2[5-8]/ || /^Z96\.1/ } @icd;
+    return 'retina'   if grep { /^H3[0-6]/ || /^E1[0-4]\.3/ } @icd;
+    return 'glaucoma' if grep { /^H4[0-2]/ } @icd;
+    return 'other';
+}
+
+get '/BBB/validation/synthetic/config' => sub {
+    my $c = shift;
+    my $conf = _synth_conf($c->param('model'));
+    $c->render(json => { provider => $conf->{provider}, host => $conf->{host}, external => $conf->{external}, allowed => $conf->{allowed},
+                         has_key => length($conf->{key}) ? 1 : 0, model => $conf->{model},
+                         from_date => $conf->{from}, sources => $conf->{sources}, n_shots => $SYNTH_N_SHOTS });
+};
+
+# Prompt lesen (mit Freigabestatus und Stand der Few-Shot-Erzeugung)
+get '/BBB/validation/synthetic/prompt' => sub {
+    my $c  = shift;
+    $c->render(json => _synth_load_prompt($c->pg->db));
+};
+
+# Prompt speichern (hebt eine Freigabe auf, weil sich der Hash ändert)
+post '/BBB/validation/synthetic/prompt' => sub {
+    my $c  = shift;
+    my $p  = $c->req->json // {};
+    my $db = $c->pg->db;
+    my ($sys, $tpl) = ($p->{system_prompt} // '', $p->{user_template} // '');
+    s/\r\n/\n/g for $sys, $tpl;
+    return $c->render(json => { error => 'Systemprompt und Vorlage dürfen nicht leer sein.' }, status => 400) unless length $sys && length $tpl;
+    return $c->render(json => { error => 'Die Vorlage braucht die Platzhalter {{entries}} und {{reference_date}}.' }, status => 400)
+        unless $tpl =~ /\{\{entries\}\}/ && $tpl =~ /\{\{reference_date\}\}/;
+    eval { _synth_store_row($db, $SYNTH_PROMPT_NAME, $sys, $tpl); 1 }
+        or return $c->render(json => { error => "Speichern fehlgeschlagen: $@" }, status => 500);
+    $c->app->log->info('[SYNTH] Prompt validation_synth gespeichert von ' . ($p->{by} // '?'));
+    $c->render(json => _synth_load_prompt($db));
+};
+
+# Prompt freigeben: genau der angezeigte Stand (Hash) wird freigegeben
+post '/BBB/validation/synthetic/prompt/approve' => sub {
+    my $c  = shift;
+    my $p  = $c->req->json // {};
+    my $db = $c->pg->db;
+    my $pr = _synth_load_prompt($db);
+    my $by = $p->{by} // '';
+    $by =~ s/^\s+|\s+$//g;
+    return $c->render(json => { error => 'Bitte oben einen Prüfer-Namen eintragen.' }, status => 400) unless length $by;
+    return $c->render(json => { error => 'Der Prompt wurde inzwischen geändert. Bitte neu laden und erneut prüfen.' }, status => 409)
+        unless ($p->{hash} // '') eq $pr->{hash};
+    return $c->render(json => { error => 'Der Prompt ist noch nicht in der Datenbank oder ohne Platzhalter.' }, status => 400)
+        unless $pr->{in_db} && $pr->{placeholders_ok};
+    my $appr = { hash => $pr->{hash}, by => $by, at => POSIX::strftime('%Y-%m-%dT%H:%M:%S', localtime), n_shots => $pr->{n_shots} };
+    _synth_store_row($db, $SYNTH_APPROVAL_NAME, to_json($appr), '');
+    $c->app->log->info("[SYNTH] Prompt freigegeben von $by (Hash $pr->{hash})");
+    $c->render(json => _synth_load_prompt($db));
+};
+
+# Few-Shot-Paare aus echten Briefen laden. Sie landen nur im (noch nicht freigegebenen) Prompt in der
+# Datenbank; erst nach manueller Überarbeitung und Freigabe gehen sie mit dem Batch hinaus.
+post '/BBB/validation/synthetic/fewshot' => sub {
+    my $c    = shift;
+    my $p    = $c->req->json // {};
+    my $db   = $c->pg->db;
+    my $conf = _synth_conf();
+    my $seed = defined $p->{seed} && $p->{seed} =~ /^\d+$/ ? $p->{seed} + 0 : int(rand(1e9));
+    my $rows = $db->query(q{
+        SELECT c.id, c.pseudonym, c.narrative_report, c.reference_date::text AS reference_date, c.phenopacket_json::text AS pp
+        FROM candidates c
+        WHERE c.narrative_report IS NOT NULL AND length(c.narrative_report) BETWEEN 600 AND 6000
+          AND c.phenopacket_json IS NOT NULL AND length(c.phenopacket_json::text) > 20
+          AND c.reference_date >= ?::date AND lower(COALESCE(c.doc_source, '')) = ANY(?)
+        ORDER BY md5(?::text || ':fs:' || c.id) LIMIT 600
+    }, $conf->{from}, $conf->{sources}, $seed)->hashes->to_array;
+
+    # je Subspezialität ein Brief, verschiedene Patienten
+    my (%cand, %seen_pat);
+    for my $r (@$rows) {
+        my $pat = $r->{pseudonym} // "id$r->{id}";
+        next if $seen_pat{$pat};
+        my $pp = _ppd_parse_json($r->{pp}) or next;
+        my $entries = [ grep { !_val_is_derived($_) } @{ _val_entries($pp) } ];
+        next unless @$entries >= 4 && @$entries <= 25;
+        $r->{ppx} = $pp;
+        $r->{entries} = $entries;
+        $seen_pat{$pat} = 1;
+        push @{ $cand{ _synth_bucket($entries) } }, $r;
+    }
+    my @order = qw(cornea lens retina glaucoma other);
+    my @pick;
+    for my $b (@order) { my $r = shift @{ $cand{$b} // [] }; push @pick, [ $b, $r ] if $r }
+    for my $b ((@order) x 3) { last if @pick >= $SYNTH_N_SHOTS; my $r = shift @{ $cand{$b} // [] }; push @pick, [ $b, $r ] if $r }
+    return $c->render(json => { error => 'Nur ' . scalar(@pick) . " geeignete Briefe ab $conf->{from} gefunden." }, status => 422)
+        if @pick < $SYNTH_N_SHOTS;
+    @pick = @pick[0 .. $SYNTH_N_SHOTS - 1];
+
+    my @shots;
+    my $k = 0;
+    for my $x (@pick) {
+        my ($b, $r) = @$x;
+        my ($lines, $used) = _synth_entry_lines($r->{entries});
+        my $age = _synth_age($r->{ppx});
+        push @shots, sprintf("Beispiel %d\nBriefdatum: %s\nGeschlecht: %s\nAlter: %s\nEinträge (%d):\n%s\n\nAntwort:\n<brief>\n%s\n</brief>",
+                             ++$k, _val_date($r->{reference_date}), _synth_sex($r->{ppx}), (length $age ? "$age Jahre" : 'unbekannt'),
+                             scalar @$used, $lines, _synth_scrub($r->{narrative_report}));
+    }
+    my $sys = _synth_load_prompt($db)->{system_prompt};
+    my $tpl = "Die folgenden Beispiele zeigen Einträge und den passenden Brief. Die Belege sind in den Beispielen weggelassen; "
+            . "in deiner Antwort sind sie Pflicht.\n\n" . join("\n\n", @shots) . "\n\n" . $SYNTH_TASK_TEMPLATE;
+    eval { _synth_store_row($db, $SYNTH_PROMPT_NAME, $sys, $tpl); 1 }
+        or return $c->render(json => { error => "Speichern fehlgeschlagen: $@" }, status => 500);
+    $c->app->log->info("[SYNTH] $SYNTH_N_SHOTS echte Few-Shot-Paare geladen (Seed $seed, Subspezialitäten " . join(',', map { $_->[0] } @pick)
+                       . ') von ' . ($p->{by} || '?') . '; Freigabe ausstehend.');
+    $c->render(json => { %{ _synth_load_prompt($db) }, seed => $seed, buckets => [ map { $_->[0] } @pick ] });
+};
+
+post '/BBB/validation/sets/synthetic' => sub {
+    my $c  = shift;
+    my $p  = $c->req->json // {};
+    my $db = $c->pg->db;
+    my $conf = _synth_conf($p->{model});
+    my $pr   = _synth_load_prompt($db);
+
+    return $c->render(json => { error => "Zum Anlegen \"ANLEGEN\" bestätigen." }, status => 400)
+        unless ($p->{confirm} // '') eq 'ANLEGEN';
+    return $c->render(json => { error => 'Der Prompt ist nicht freigegeben oder wurde nach der Freigabe geändert.' }, status => 409)
+        unless $pr->{approved} && $pr->{placeholders_ok};
+    return $c->render(json => { error => 'Der freigegebene Prompt hat sich geändert. Bitte neu laden.' }, status => 409)
+        if defined $p->{prompt_hash} && $p->{prompt_hash} ne $pr->{hash};
+    return $c->render(json => { error => "Der Generator-Endpunkt $conf->{host} liegt außerhalb des Kliniknetzes. "
+                                       . 'Freigabe erst nach Klärung mit dem Datenschutz über ONTOTRIAL_SYNTH_ALLOW_EXTERNAL=1.' }, status => 403)
+        unless $conf->{allowed};
+    return $c->render(json => { error => 'Kein API-Schlüssel gesetzt (ONTOTRIAL_SYNTH_API_KEY).' }, status => 400)
+        if $conf->{provider} eq 'anthropic' && !length $conf->{key};
+    return $c->render(json => { error => "Für das Modell $conf->{model} ist kein Endpunkt konfiguriert (VLLM_ENDPOINT bzw. OLLAMA_ENDPOINT)." }, status => 400)
+        unless length $conf->{url};
+    my $name = $p->{name} // '';
+    $name =~ s/^\s+|\s+$//g;
+    return $c->render(json => { error => 'Name fehlt.' }, status => 400) unless length $name;
+    return $c->render(json => { error => "Datensatz \"$name\" existiert bereits." }, status => 409)
+        if $db->query('SELECT 1 FROM validation_sets WHERE name = ?', $name)->array;
+
+    my $n      = int($p->{n} // 400);
+    return $c->render(json => { error => 'Stichprobengröße muss zwischen 5 und 2000 liegen.' }, status => 400) unless $n >= 5 && $n <= 2000;
+    my $seed   = defined $p->{seed} && $p->{seed} =~ /^\d+$/ ? $p->{seed} + 0 : int(rand(1e9));
+    my $from   = ($p->{from_date} // $conf->{from}) =~ /^(\d{4}-\d{2}-\d{2})$/ ? $1 : $conf->{from};
+    my @src    = ref $p->{sources} eq 'ARRAY' ? (grep { length } map { lc } @{ $p->{sources} }) : @{ $conf->{sources} };
+    return $c->render(json => { error => 'Mindestens eine Quelle (doc_source) angeben.' }, status => 400) unless @src;
+    my $model  = $conf->{model};
+    my $reserve = int($n * 0.25) + 10;    # Ersatz für Briefe, die die Prüfung nicht bestehen
+
+    # Zielphenopackets: Briefe ab $from aus den Quellen, höchstens einer je Patient. Ihr Text wird nicht verwendet.
+    my $pool = $db->query(q{
+        SELECT DISTINCT ON (md5(c.narrative_report))
+               c.id, c.pseudonym, md5(?::text || ':synth:' || c.id) AS r
+        FROM candidates c
+        WHERE c.narrative_report IS NOT NULL AND length(c.narrative_report) >= 300
+          AND c.phenopacket_json IS NOT NULL AND length(c.phenopacket_json::text) > 20
+          AND c.reference_date >= ?::date
+          AND lower(COALESCE(c.doc_source, '')) = ANY(?)
+        ORDER BY md5(c.narrative_report), c.id
+    }, $seed, $from, \@src)->hashes->to_array;
+    my %best;
+    for my $r (@$pool) {
+        my $k = $r->{pseudonym} // "id$r->{id}";
+        $best{$k} = $r if !$best{$k} || $r->{r} lt $best{$k}{r};
+    }
+    my @targets = sort { $a->{r} cmp $b->{r} } values %best;
+    return $c->render(json => { error => 'Nur ' . scalar(@targets) . " Patienten mit geeigneten Briefen ab $from gefunden, $n angefordert." }, status => 422)
+        if @targets < $n;
+    @targets = @targets[0 .. List::Util::min($#targets, $n + $reserve - 1)];
+
+    my $set_id = $db->insert('validation_sets', {
+        name => $name, purpose => 'regression', created_by => $p->{created_by} // '',
+        notes => $p->{notes} // "Synthetische Briefe ($model), Referenz = vorgegebenes Phenopacket",
+        status => 'preparing',
+        params => to_json({ n => $n, seed => $seed, one_per_patient => 1,
+                            extraction => { mode => 'synthetic', model => $model },
+                            synthetic  => { model => $model, provider => $conf->{provider}, host => $conf->{host}, external => $conf->{external},
+                                            from_date => $from, sources => \@src, prompt_hash => $pr->{hash}, n_shots => $pr->{n_shots},
+                                            approved_by => $pr->{approval}{by}, approved_at => $pr->{approval}{at},
+                                            max_overlap => $conf->{overlap}, pool_patients => scalar keys %best,
+                                            targets => [ map { $_->{id} + 0 } @targets ], done => {}, rejected => [] } }),
+    }, { returning => 'id' })->hash->{id};
+    $c->minion->enqueue(validation_synth_task => [{ set_id => $set_id }], { attempts => 1, queue => 'validation', priority => -5 });
+    $c->app->log->info("[VALIDATION] Synthetischer Datensatz \"$name\" angelegt: $n Briefe mit $model, Prompt $pr->{hash}, Seed $seed.");
+    $c->render(json => { id => $set_id, name => $name, n => $n, seed => $seed, patients => scalar keys %best,
+                         preparing => 1, model => $model, external => $conf->{external} });
+};
+
+app->minion->add_task(validation_synth_task => sub {
+    my ($job, $payload) = @_;
+    my $app  = $job->app;
+    my $db   = $app->pg->db;
+    my $set  = _val_load_set($db, $payload->{set_id}) or return $job->fail('Datensatz fehlt');
+    my $sp   = $set->{params}{synthetic} // return $job->fail('Kein synthetischer Datensatz');
+    return $job->fail('Zuordnung zu den Originalbriefen wurde nach Abschluss gelöscht; Fortsetzen nicht möglich.') unless ref $sp->{targets} eq 'ARRAY';
+    my $conf = _synth_conf($sp->{model});
+    my $task = "validation_synth_$set->{id}";
+    return $job->fail("Endpunkt $conf->{host} außerhalb des Kliniknetzes ist nicht freigegeben (ONTOTRIAL_SYNTH_ALLOW_EXTERNAL).")
+        unless $conf->{allowed};
+    # nur mit genau dem beim Anlegen freigegebenen Prompt
+    my $pr = _synth_load_prompt($db);
+    unless ($pr->{hash} eq ($sp->{prompt_hash} // '') && $pr->{approved}) {
+        $app->notify_task_progress($task, 'failed', 0, 'Prompt seit dem Anlegen geändert oder nicht mehr freigegeben');
+        return $job->fail('Prompt seit dem Anlegen geändert oder nicht mehr freigegeben.');
+    }
+    my ($sys, $tpl) = ($pr->{system_prompt}, $pr->{user_template});
+    my @shot_letters = $tpl =~ m{<brief>\s*(.*?)\s*</brief>}sg;
+    my $model = $sp->{model};
+    my $n     = $set->{params}{n};
+    my %done  = %{ $sp->{done} // {} };
+    my @rej   = @{ $sp->{rejected} // [] };
+    my %rej   = map { $_->{id} => 1 } @rej;
+    my $pos   = $db->query('SELECT coalesce(max(position), 0) AS m FROM validation_items WHERE set_id = ?', $set->{id})->hash->{m};
+    my %usage = (input_tokens => $sp->{usage}{input_tokens} // 0, output_tokens => $sp->{usage}{output_tokens} // 0);
+    my %why_count = %{ $sp->{reject_reasons} // {} };
+    my @ov;
+
+    my $save = sub {
+        my $params = _val_load_set($db, $set->{id})->{params} // {};
+        $params->{synthetic} = { %{ $params->{synthetic} // {} }, done => \%done, rejected => \@rej, usage => \%usage,
+                                 reject_reasons => \%why_count };
+        $db->query('UPDATE validation_sets SET params = ?::jsonb WHERE id = ?', to_json($params), $set->{id});
+    };
+
+    my %seq;
+    @seq{ @{ $sp->{targets} // [] } } = (1 .. scalar @{ $sp->{targets} // [] });   # laufende Nummer fürs Log, keine Kandidaten-ID
+    my $ntg = scalar @{ $sp->{targets} // [] };
+    for my $tid (@{ $sp->{targets} }) {
+        last if $pos >= $n;
+        next if $done{$tid} || $rej{$tid};
+        return $job->finish({ cancelled => 1 }) unless $db->query('SELECT 1 FROM validation_sets WHERE id = ?', $set->{id})->array;
+        $job->note(current => $pos + 1, total => $n, current_since => time);
+        my $t  = $db->query(q{SELECT id, reference_date::text AS reference_date, phenopacket_json::text AS pp FROM candidates WHERE id = ?}, $tid)->hash;
+        my $pp = $t ? _ppd_parse_json($t->{pp}) : undef;
+        unless ($t && $pp) { push @rej, { id => $tid + 0, why => 'Phenopacket leer oder fehlt' }; $rej{$tid} = 1; next; }
+        # echte Daten verlassen den Job nicht: Phenopacket und Briefdatum gemeinsam verschieben;
+        # Brief, Schnappschuss, Einträge und Referenz beruhen nur auf den verschobenen Werten
+        my $shift = _synth_month_offset(_val_date($t->{reference_date}));
+        $pp = _synth_shift_pp($pp, $shift);
+        my $rdate = _synth_shift_date(_val_date($t->{reference_date}), $shift);
+        ($pp, $rdate) = _synth_jitter_days($pp, $rdate);    # Tage zusätzlich unabhängig neu würfeln
+        my $entries = _val_entries($pp);
+        my ($lines, $used) = _synth_entry_lines($entries);
+        unless (@$used) { push @rej, { id => $tid + 0, why => 'Phenopacket leer oder fehlt' }; $rej{$tid} = 1; next; }
+        $pp = _synth_noise_measurements($pp) if ($ENV{ONTOTRIAL_SYNTH_NOISE_VALUES} // '1') ne '0';    # Messwerte leicht verrauschen
+        $entries = _val_entries($pp);
+        ($lines, $used) = _synth_entry_lines($entries);
+        my $age   = _synth_age($pp);
+        # Alter zufällig um -1, 0 oder +1 Jahr verändern (nicht gespeichert); Phenopacket entsprechend anpassen
+        if (length $age) {
+            $age = List::Util::max(0, $age + int(rand(3)) - 1);
+            $pp->{subject}{timeAtLastEncounter} = { age => { iso8601duration => "P${age}Y" } } if ref $pp->{subject} eq 'HASH';
+        }
+        my $tplx  = $tpl;
+        # ältere Vorlagen ohne {{age}}: Alterszeile hinter der letzten Geschlechtszeile ergänzen
+        $tplx =~ s/(.*Geschlecht: \{\{sex\}\})/$1\nAlter: {{age}}/s unless $tplx =~ /\{\{age\}\}/;
+        my ($fix, $var) = ('', $tplx);
+        my $ph = index($tplx, '{{');
+        if ($ph > 0) {
+            my $cut = rindex($tplx, "\n\n", $ph);
+            ($fix, $var) = (substr($tplx, 0, $cut + 2), substr($tplx, $cut + 2)) if $cut > 0;
+        }
+        my $user  = [ $fix, _synth_fill($var, reference_date => $rdate, sex => _synth_sex($pp), age => (length $age ? "$age Jahre" : 'unbekannt'),
+                                        n_entries => scalar @$used, entries => $lines) ];
+
+        my ($res, $why);
+        my ($last_text, $last_why);
+        for my $try (1 .. $conf->{attempts}) {
+            # nach fehlenden Belegen: vorherige Antwort mit Hinweis zurückgeben, statt neu zu würfeln
+            my $req = $user;
+            if (defined $last_text && ($last_why // '') =~ /^Belege fehlerhaft/) {
+                my @e = $last_why =~ /\b(E\d+)\b/g;
+                $req = [ @$user, $last_text,
+                         'Zu diesen Einträgen fehlt ein Zitat, das Zeichen für Zeichen in deinem Brief steht: ' . join(', ', @e) . '. '
+                       . 'Nimm die Einträge in den Brief auf, falls sie fehlen, und zitiere sie wörtlich. '
+                       . 'Gib den vollständigen Brief mit allen Belegen erneut im Antwortformat aus.' ];
+            }
+            my ($text, $u) = eval { _synth_call($conf, $model, $sys, $req) };
+            if (!defined $text) {
+                (my $e = $@ // '') =~ s/\s+$//;
+                # Schlüssel, Modellname oder Anfrage falsch: abbrechen, Ziel bleibt offen (Fortsetzen möglich)
+                if ($e =~ /^(?:Kein API|HTTP 4\d\d)/ && $e !~ /^HTTP 429/) {
+                    $save->();
+                    $app->notify_task_progress($task, 'failed', int(100 * $pos / ($n || 1)), "Abbruch: $e");
+                    return $job->fail("Generator: $e");
+                }
+                $why = "API: $e";
+                next;
+            }
+            $usage{$_} += $u->{$_} // 0 for keys %$u;
+            $text = _synth_postprocess($text, $age);
+            ($res, $why) = _synth_check($text, $used, \@shot_letters, $conf, $rdate);
+            last if $res;
+            ($last_text, $last_why) = ($text, $why);
+            $app->log->warn("[SYNTH] Ziel $seq{$tid} von $ntg, Versuch $try: $why");
+        }
+        if (!$res) {
+            push @rej, { id => $tid + 0, why => $why };
+            $rej{$tid} = 1;
+            $why_count{$_}++ for ($why // '') =~ /\((Seite|Datum|Verneinung fehlt|verneint\/Verdacht\/geplant|Wert|kein wörtlicher Beleg)\)/g;
+                        $save->();
+            next;
+        }
+        $pos++;
+        $db->insert('validation_items', {
+            set_id => $set->{id}, position => $pos, candidate_id => undef, pseudonym => sprintf('SYN-%04d', $pos),
+            doc_source => 'synthetic', reference_date => $rdate || undef, stratum => 'synthetic|' . (substr($rdate, 0, 4) || 'unbekannt'),
+            narrative => $res->{letter}, narrative_md5 => md5_hex(encode('UTF-8', $res->{letter})),
+            snapshot => to_json($pp), entries => to_json($entries), injected => undef, double_review => 0,
+            reference => to_json(_synth_reference($entries, $model)),
+        });
+        $done{$tid} = $pos;
+        push @ov, $res->{overlap};
+        $save->();
+        my $pct = int(100 * $pos / ($n || 1));
+        $job->note(progress => $pct, done => $pos, failed => scalar @rej);
+        $app->notify_task_progress($task, 'running', $pct, "Synthetischer Brief $pos von $n erzeugt" . (@rej ? ', ' . scalar(@rej) . ' verworfen' : ''));
+    }
+
+    my $params = _val_load_set($db, $set->{id})->{params} // {};
+    # Zuordnung zu den Originalbriefen löschen: nur Anzahlen und Gründe bleiben (Fortsetzen danach nicht mehr möglich)
+    if (($ENV{ONTOTRIAL_SYNTH_KEEP_KEYS} // '0') ne '1') {
+        my $s = $params->{synthetic} // {};
+        $s->{n_targets}  = scalar @{ $s->{targets} // [] };
+        $s->{n_rejected} = scalar @{ $s->{rejected} // [] };
+        delete @{$s}{qw(targets done rejected)};
+        $s->{keys_removed_at} = POSIX::strftime('%Y-%m-%dT%H:%M:%S', localtime);
+        $params->{synthetic} = $s;
+    }
+    $params->{extraction} = { %{ $params->{extraction} // {} }, mode => 'synthetic', model => $model,
+                              finished_at => POSIX::strftime('%Y-%m-%dT%H:%M:%S', localtime), n_ok => $pos + 0, n_failed => scalar @rej,
+                              mean_overlap => @ov ? sprintf('%.4f', List::Util::sum(@ov) / @ov) + 0 : undef };
+    $db->query(q{UPDATE validation_sets SET status = 'ready', params = ?::jsonb, frozen_at = now(), frozen_by = 'synthetic',
+                 reference_source = ? WHERE id = ?}, to_json($params), "synthetic:$model", $set->{id});
+    my $msg = $pos >= $n ? "$pos synthetische Briefe erzeugt, Referenz eingefroren"
+                         : "nur $pos von $n Briefen erzeugt (Ersatz aufgebraucht), Referenz eingefroren";
+    $app->notify_task_progress($task, 'finished', 100, $msg);
+    $app->log->info("[VALIDATION] Datensatz \"$set->{name}\": $msg; " . scalar(@rej) . " verworfen, Tokens ein $usage{input_tokens}, aus $usage{output_tokens}, "
+                    . "Cache geschrieben " . ($usage{cache_write_tokens} // 0) . ", Cache gelesen " . ($usage{cache_read_tokens} // 0) . '.');
+    $job->finish({ ok => $pos, rejected => scalar @rej, usage => \%usage });
+});
+
+# ---------------------------------------------------------
+# Messwerte verrauschen (Zielphenopackets) und Verknüpfbarkeit prüfen
+# ---------------------------------------------------------
+our @SYNTH_VISUS_STEPS = (0.05, 0.063, 0.08, 0.1, 0.125, 0.16, 0.2, 0.25, 0.32, 0.4, 0.5, 0.63, 0.8, 1.0, 1.25, 1.6, 2.0);
+
+# Art eines Messwerts aus Einheit und Bezeichnung: visus, iop, dpt, axis, um, cells, other
+sub _synth_meas_kind {
+    my ($unit, $label) = @_;
+    my $u = lc($unit // '');
+    my $l = lc($label // '');
+    return 'visus' if $u =~ /dec/ || $l =~ /visual acuity|visus/;
+    return 'iop'   if $u =~ /mm\s*\[?hg/;
+    return 'dpt'   if $u =~ /diopt|dpt|^d$/;
+    return 'axis'  if $u =~ /deg|°/;
+    return 'um'    if $u =~ /^(?:um|µm|μm|micro)/;
+    return 'cells' if $u =~ /mm2|mm\^2|mm²|cells/;
+    return 'other';
+}
+
+# Toleranz, die ein Abgleich mindestens braucht, um das Original trotz Rauschen zu finden
+sub _synth_meas_tol {
+    my ($kind, $v) = @_;
+    return $kind eq 'visus' ? List::Util::max(0.02, 0.3 * abs($v)) : $kind eq 'iop' ? 2 : $kind eq 'dpt' ? 0.25
+         : $kind eq 'axis' ? 5 : $kind eq 'um' ? 10 : $kind eq 'cells' ? 100 : List::Util::max(0.03 * abs($v), 0.01);
+}
+
+sub _synth_noise_value {
+    my ($v, $unit, $label) = @_;
+    return $v unless defined $v && "$v" =~ /^-?\d+(?:\.(\d+))?$/;
+    my $dec  = length($1 // '');
+    my $kind = _synth_meas_kind($unit, $label);
+    my $step = int(rand(3)) - 1;    # -1, 0, +1
+    if ($kind eq 'visus') {
+        return $v if $v < 0.05 || $main::VAL_LOWVISION{ $v + 0 };
+        my ($i) = sort { abs($SYNTH_VISUS_STEPS[$a] - $v) <=> abs($SYNTH_VISUS_STEPS[$b] - $v) } 0 .. $#SYNTH_VISUS_STEPS;
+        $i = List::Util::max(0, List::Util::min($#SYNTH_VISUS_STEPS, $i + $step));
+        return $SYNTH_VISUS_STEPS[$i] + 0;
+    }
+    return List::Util::max(1, $v + int(rand(5)) - 2) + 0                    if $kind eq 'iop';
+    return sprintf('%.2f', $v + 0.25 * $step) + 0                           if $kind eq 'dpt';
+    return (($v + 5 * $step) % 180 || 180) + 0                              if $kind eq 'axis';
+    return List::Util::max(0, $v + int(rand(21)) - 10) + 0                  if $kind eq 'um';
+    return List::Util::max(0, $v + 50 * (int(rand(5)) - 2)) + 0             if $kind eq 'cells';
+    my $nv = $v + $v * 0.03 * (2 * rand() - 1);
+    return sprintf("%.${dec}f", $nv) + 0;
+}
+
+# Alle Messwerte eines (bereits verschobenen) Zielphenopackets verrauschen; abgeleitete Werte entfernen
+sub _synth_noise_measurements {
+    my ($pp) = @_;
+    return $pp unless ref $pp eq 'HASH' && ref $pp->{measurements} eq 'ARRAY';
+    my @keep;
+    for my $m (@{ $pp->{measurements} }) {
+        my $id = ref $m->{assay} eq 'HASH' ? ($m->{assay}{id} // '') : '';
+        next if $VAL_DERIVED_CODES{$id} || $VAL_DERIVED_CODES{ _val_code($id) };
+        my $q = (ref $m->{value} eq 'HASH' && ref $m->{value}{quantity} eq 'HASH') ? $m->{value}{quantity} : undef;
+        if ($q && defined $q->{value} && (($q->{comparator} // '') eq '' || $q->{comparator} eq '=')) {
+            my $u = ref $q->{unit} eq 'HASH' ? ($q->{unit}{label} // $q->{unit}{id}) : $q->{unit};
+            $q->{value} = _synth_noise_value($q->{value}, $u, $m->{assay}{label});
+        }
+        push @keep, $m;
+    }
+    $pp->{measurements} = \@keep;
+    return $pp;
+}
+
+# --- Verknüpfbarkeitsprüfung: wie viele Patienten im Bestand passen zu jedem synthetischen Brief? ---
+sub _synth_date_num {
+    my $d = shift // '';
+    return undef unless $d =~ /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?/;
+    return [ $1 * 372 + (($2 // 7) - 1) * 31 + ($3 // 15), defined $2 ? 400 : 560 ];   # Tage (grob), Toleranz
+}
+
+sub _synth_link_match {
+    my ($ref, $sex, $age, $cand) = @_;
+    my $csex = _synth_sex($cand);
+    return 0 if $sex ne 'unbekannt' && $csex ne 'unbekannt' && $sex ne $csex;
+    my $cage = _synth_age($cand);
+    return 0 if length($age) && length($cage) && abs($age - $cage) > 1;
+    my %by;
+    push @{ $by{"$_->{domain}|$_->{code}|" . ($_->{side} // '') . "|$_->{excluded}"} }, $_ for grep { !_val_is_derived($_) } @{ _val_entries($cand) };
+    ENTRY: for my $e (@$ref) {
+        my $list = $by{"$e->{domain}|$e->{code}|" . ($e->{side} // '') . "|$e->{excluded}"} or return 0;
+        for my $c (@$list) {
+            if (length($e->{date} // '') && length($c->{date} // '')) {
+                my ($a, $b) = (_synth_date_num($e->{date}), _synth_date_num($c->{date}));
+                next if $a && $b && abs($a->[0] - $b->[0]) > List::Util::max($a->[1], $b->[1]);
+            }
+            if ($e->{domain} eq 'measurement' && defined $e->{value} && "$e->{value}" =~ /^-?[\d.]+$/) {
+                next unless defined $c->{value} && "$c->{value}" =~ /^-?[\d.]+$/;
+                my $tol = _synth_meas_tol(_synth_meas_kind($e->{unit}, $e->{label}), $e->{value});
+                next if abs($e->{value} - $c->{value}) > $tol + 1e-9;
+            }
+            next ENTRY;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+post '/BBB/validation/sets/:id/linkage' => sub {
+    my $c   = shift;
+    my $set = _val_load_set($c->pg->db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    return $c->render(json => { error => 'Kein synthetischer Datensatz.' }, status => 400) unless $set->{params}{synthetic};
+    my $id = $c->minion->enqueue(validation_synth_linkage_task => [{ set_id => $set->{id} }], { attempts => 1, queue => 'validation', priority => -10 });
+    $c->render(json => { ok => 1, job => $id });
+};
+
+get '/BBB/validation/sets/:id/linkage' => sub {
+    my $c   = shift;
+    my $set = _val_load_set($c->pg->db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    $c->render(json => ($set->{params}{synthetic} // {})->{linkage} // { error => 'Noch keine Prüfung gelaufen.' });
+};
+
+app->minion->add_task(validation_synth_linkage_task => sub {
+    my ($job, $payload) = @_;
+    my $app   = $job->app;
+    my $db    = $app->pg->db;
+    my $set   = _val_load_set($db, $payload->{set_id}) or return $job->fail('Datensatz fehlt');
+    my $items = _val_load_items($db, $set->{id});
+    my $task  = "validation_synth_linkage_$set->{id}";
+    my (%per, %bucket);
+    my $k = 0;
+    for my $it (@$items) {
+        $k++;
+        my $pp  = ref $it->{snapshot} eq 'HASH' ? $it->{snapshot} : _ppd_parse_json($it->{snapshot});
+        my $ref = [ grep { !_val_is_derived($_) } @{ ($it->{reference} // {})->{entries} // $it->{entries} // [] } ];
+        next unless @$ref;
+        # Vorauswahl: bis zu vier Codes, bevorzugt Diagnosen und Eingriffe, müssen im Originalpaket vorkommen
+        my %dom = (disease => 1, procedure => 2, phenotype => 3, treatment => 4, measurement => 5);
+        my @codes = List::Util::uniq(map { $_->{code} } sort { $dom{ $a->{domain} } <=> $dom{ $b->{domain} } || length($b->{code}) <=> length($a->{code}) } @$ref);
+        @codes = @codes[0 .. List::Util::min(3, $#codes)];
+        my $where = join ' AND ', map { 'c.phenopacket_json::text LIKE ?' } @codes;
+        my $rows  = $db->query("SELECT c.pseudonym, c.phenopacket_json::text AS pp FROM candidates c
+                                WHERE c.phenopacket_json IS NOT NULL AND $where LIMIT 20000",
+                               map { '%"' . $_ . '"%' } @codes)->hashes;
+        my %pat;
+        for my $r (@$rows) {
+            next if $pat{ $r->{pseudonym} // '' };
+            my $cpp = _ppd_parse_json($r->{pp}) or next;
+            $pat{ $r->{pseudonym} // '' } = 1 if _synth_link_match($ref, _synth_sex($pp), _synth_age($pp), $cpp);
+        }
+        my $n = scalar keys %pat;
+        $per{ $it->{position} } = $n;
+        my $b = $n == 0 ? '0' : $n == 1 ? '1' : $n <= 4 ? '2-4' : $n <= 9 ? '5-9' : '10+';
+        $bucket{$b}++;
+        $job->note(progress => int(100 * $k / @$items));
+        $app->notify_task_progress($task, 'running', int(100 * $k / @$items), "Verknüpfbarkeit: Brief $k von " . scalar(@$items));
+    }
+    my $nn  = List::Util::sum(values %bucket) || 0;
+    my $res = { checked_at => POSIX::strftime('%Y-%m-%dT%H:%M:%S', localtime), n_items => $nn, buckets => \%bucket,
+                unique_share => $nn ? sprintf('%.3f', ($bucket{1} // 0) / $nn) + 0 : undef, per_position => \%per,
+                note => 'Anzahl verschiedener Patienten im Bestand, deren Phenopacket zu allen Einträgen des Briefs passt (Codes, Seite, Status; Daten, Alter und Messwerte innerhalb der Rauschgrenzen).' };
+    my $params = _val_load_set($db, $set->{id})->{params} // {};
+    $params->{synthetic}{linkage} = $res;
+    $db->query('UPDATE validation_sets SET params = ?::jsonb WHERE id = ?', to_json($params), $set->{id});
+    my $txt = join ', ', map { "$_: " . ($bucket{$_} // 0) } qw(0 1 2-4 5-9 10+);
+    $app->notify_task_progress($task, 'finished', 100, "Verknüpfbarkeit geprüft ($txt)");
+    $app->log->info("[SYNTH] Verknüpfbarkeit \"$set->{name}\": $txt");
+    $job->finish($res);
 });
 
 # Ein Lauf; mit resume => 1 nur die Briefe ohne Ergebnis (Fortsetzen nach Hänger oder Abbruch).
@@ -13002,7 +14493,9 @@ sub _val_local_json_call {
         if !$ollama && ($ENV{ONTOTRIAL_JUDGE_LOCAL_THINKING} // '1') eq '0';
 
     my $ua = Mojo::UserAgent->new(connect_timeout => 30, inactivity_timeout => 1800, request_timeout => 1800);
-    $ua->proxy->detect;
+    # lokale Modelle (vLLM, Ollama) immer direkt, ohne Proxy: ein für externe Dienste gesetztes
+    # HTTPS_PROXY im Worker würde Anfragen ins Kliniknetz sonst über den Proxy schicken
+    $ua->proxy->detect if ($ENV{ONTOTRIAL_JUDGE_USE_PROXY} // '0') eq '1';
     llm_apply_extra($body, $model) unless $ollama;
     my $last = '';
     my $downgraded = 0;
@@ -13306,6 +14799,298 @@ post '/BBB/validation/sets/:id/ensemble' => sub {
                                  { attempts => 1, queue => 'validation', priority => -5 });
     $c->render(json => { ok => 1, job => $id, models => \@models, min_votes => $min });
 };
+
+# =========================================================
+# Abweichungsprüfung: nur die Unterschiede zwischen einem Lauf und der Referenz prüfen
+# ---------------------------------------------------------
+# Für jeden Brief mit Abweichungen (fehlend, überzählig, abweichende Seite/Datum/Status/Wert)
+# fragen lokale Modelle in einem kurzen Aufruf, was im Brief steht (mit wörtlichem Beleg).
+# Mehrheitsentscheid je Abweichung. Danach entsteht eine korrigierte, eingefrorene Kopie des
+# Datensatzes mit dem neu bewerteten Lauf; Original-Datensatz und -Lauf bleiben unverändert.
+# Gedacht für synthetische Datensätze, deren Referenz vom Generator stammt.
+#   POST /BBB/validation/runs/:id/discrepancy_check  {models:[...], min_votes:2, shards:4}
+#   GET  /BBB/validation/runs/:id/discrepancy_check  Stand und Ergebnis
+# =========================================================
+our $VAL_DISC_SYSTEM = <<'EOT';
+Du prüfst Einträge gegen einen augenärztlichen Arztbrief. Maßgeblich ist allein der Brieftext.
+
+Einträge mit F oder P: Steht dieser Befund, diese Diagnose, dieser Eingriff, dieses Medikament oder
+dieser Messwert im Brief, und zwar mit dem angegebenen Status (vorhanden oder verneint)? Kleine
+Unterschiede in der Formulierung oder Kodierung sind egal, es zählt die Bedeutung. Bei Messwerten
+muss auch der Wert stimmen. in_letter = true nur mit wörtlichem Zitat aus dem Brief als Beleg.
+Setze correct auf "n/a".
+
+Einträge mit A: Für ein Merkmal (Seite, Datum, Status oder Wert) stehen zwei Werte zur Auswahl,
+"Referenz" und "Extraktion". Gib in correct an, welchen der Brief stützt: "reference",
+"extraction" oder "neither", mit wörtlichem Zitat. Setze in_letter auf true.
+
+Prüfe jeden Eintrag einzeln und antworte nur im vorgegebenen JSON-Format, ein Objekt je Eintrag.
+EOT
+
+# Eigene Tabelle für die Ergebnisse (wird beim ersten Gebrauch angelegt; berührt die Ensemble-Tabellen nicht)
+sub _val_disc_table {
+    my ($db) = @_;
+    $db->query(q{CREATE TABLE IF NOT EXISTS validation_discrepancy_checks (
+                     run_id     integer NOT NULL,
+                     item_id    integer NOT NULL REFERENCES validation_items(id) ON DELETE CASCADE,
+                     job_id     bigint,
+                     payload    jsonb NOT NULL,
+                     created_at timestamptz NOT NULL DEFAULT now(),
+                     PRIMARY KEY (run_id, item_id))});
+}
+
+sub _val_disc_schema {
+    return { type => 'object', additionalProperties => Mojo::JSON->false, required => ['checks'],
+             properties => { checks => { type => 'array', items => { type => 'object', additionalProperties => Mojo::JSON->false,
+                 required => [qw(id in_letter quote correct)],
+                 properties => { id => { type => 'string' }, in_letter => { type => 'boolean' }, quote => { type => 'string' },
+                                 correct => { type => 'string', enum => ['reference', 'extraction', 'neither', 'n/a'] } } } } } };
+}
+
+my %VAL_DISC_DOM  = (disease => 'Diagnose', phenotype => 'Befund', procedure => 'Eingriff', treatment => 'Medikation', measurement => 'Messwert');
+my %VAL_DISC_SIDE = (R => 'RA', L => 'LA', B => 'bds.');
+
+sub _val_disc_line {
+    my ($e) = @_;
+    return join ' | ', $VAL_DISC_DOM{ $e->{domain} } // $e->{domain}, ($e->{label} // '') . ' (' . ($e->{code} // '') . ')',
+        'Seite ' . ($VAL_DISC_SIDE{ $e->{side} // '' } // 'keine'), 'Datum ' . (length($e->{date} // '') ? $e->{date} : 'keins'),
+        ($e->{excluded} ? 'verneint' : 'vorhanden'), (defined $e->{value} && length $e->{value} ? 'Wert ' . $e->{value} . (length($e->{unit} // '') ? " $e->{unit}" : '') : ());
+}
+
+# Abweichungen eines Briefs aus dem gespeicherten Abgleich
+sub _val_disc_checks {
+    my ($res, $ref_entries) = @_;
+    my %rk = map { ($_->{key} // '') => $_ } @{ $ref_entries // [] };
+    my (@c, $n);
+    $n = 0; push @c, { id => 'F' . ++$n, kind => 'fn', entry => $_ } for @{ $res->{fn} // [] };
+    $n = 0; push @c, { id => 'P' . ++$n, kind => 'fp', entry => $_ } for @{ $res->{fp} // [] };
+    $n = 0;
+    for my $ae (@{ $res->{attr_errors} // [] }) {
+        for my $attr (sort keys %{ $ae->{errors} // {} }) {
+            my $er = $ae->{errors}{$attr};
+            push @c, { id => 'A' . ++$n, kind => 'attr', attr => $attr, key => $ae->{key}, entry => $rk{ $ae->{key} } // $ae,
+                       ref_val => $er->{ref}, pred_val => $er->{pred} };
+        }
+    }
+    return \@c;
+}
+
+sub _val_disc_user {
+    my ($letter, $checks) = @_;
+    my %an = (side => 'Seite', date => 'Datum', status => 'Status', value => 'Wert');
+    my @l;
+    for my $c (@$checks) {
+        if ($c->{kind} eq 'attr') {
+            my $e = $c->{entry};
+            push @l, "$c->{id} | " . ($VAL_DISC_DOM{ $e->{domain} } // '') . ' | ' . ($e->{label} // '') . ' (' . ($e->{code} // '') . ') | '
+                     . "Merkmal $an{ $c->{attr} }: Referenz \"" . ($c->{ref_val} // '') . "\" oder Extraktion \"" . ($c->{pred_val} // '') . '"';
+        } else {
+            push @l, "$c->{id} | " . _val_disc_line($c->{entry});
+        }
+    }
+    return "Arztbrief:\n<<<\n$letter\n>>>\n\nZu prüfende Einträge (" . scalar(@l) . "):\n" . join("\n", @l)
+         . "\n\nAntworte mit {\"checks\": [...]} und genau einem Objekt je Eintrag.";
+}
+
+# Referenz eines Briefs nach den Entscheidungen korrigieren
+sub _val_disc_corrected_ref {
+    my ($ref, $decided) = @_;
+    my @entries = map { { %$_ } } @{ $ref->{entries} // [] };
+    my %by_key  = map { ($_->{key} // '') => $_ } @entries;
+    my %drop;
+    for my $d (@$decided) {
+        next unless $d->{decision} eq 'reference_wrong';
+        if ($d->{kind} eq 'fn') { $drop{ $d->{entry}{key} // '' } = 1 }
+        elsif ($d->{kind} eq 'fp') {
+            my $e = $d->{entry};
+            push @entries, { (map { $_ => $e->{$_} } qw(domain code label side date excluded value)),
+                             key => 'dc:' . md5_hex(encode('UTF-8', $e->{sig} // join('|', map { $e->{$_} // '' } qw(domain code side date excluded)))),
+                             src => 'discrepancy_check' };
+        } elsif ($d->{kind} eq 'attr' && (my $e = $by_key{ $d->{key} // '' })) {
+            if    ($d->{attr} eq 'status') { $e->{excluded} = ($d->{pred_val} // '') eq 'verneint' ? 1 : 0 }
+            else                           { $e->{ $d->{attr} } = $d->{pred_val} }
+            $e->{src_corrected} = 'discrepancy_check';
+        }
+    }
+    return { %$ref, entries => [ grep { !$drop{ $_->{key} // '' } } @entries ] };
+}
+
+post '/BBB/validation/runs/:id/discrepancy_check' => sub {
+    my $c   = shift;
+    my $p   = $c->req->json // {};
+    my $db  = $c->pg->db;
+    my $run = $db->query('SELECT id, set_id, status FROM validation_runs WHERE id = ?', $c->param('id'))->hash
+        or return $c->render(json => { error => 'Lauf nicht gefunden' }, status => 404);
+    return $c->render(json => { error => 'Nur fertige Läufe lassen sich prüfen.' }, status => 409) unless $run->{status} eq 'finished';
+    my @models = grep { length } @{ $p->{models} // [ split /\s*,\s*/, ($ENV{ONTOTRIAL_DISC_MODELS} // 'gpt-oss-120b,qwen38-27b,glm-53') ] };
+    return $c->render(json => { error => 'Keine Modelle angegeben.' }, status => 400) unless @models;
+    my $min    = int($p->{min_votes} // (@models >= 3 ? 2 : @models)) || 1;
+    my $shards = int($p->{shards} // 4); $shards = 1 if $shards < 1; $shards = 16 if $shards > 16;
+    _val_disc_table($db);
+    my $need = $db->query(q{SELECT count(*) FROM validation_run_items WHERE run_id = ? AND result IS NOT NULL
+                            AND (jsonb_array_length(COALESCE(result->'fn', '[]')) + jsonb_array_length(COALESCE(result->'fp', '[]'))
+                                 + jsonb_array_length(COALESCE(result->'attr_errors', '[]'))) > 0}, $run->{id})->array->[0];
+    my @jobs = map { $c->minion->enqueue(validation_discrepancy_task => [{ run_id => $run->{id} + 0, models => \@models, min_votes => $min,
+                                                                         shard => $_, shards => $shards, n_needed => $need + 0 }],
+                                        { attempts => 1, queue => 'validation', priority => -5 }) } 0 .. $shards - 1;
+    $c->app->log->info("[DISC] Abweichungsprüfung Lauf $run->{id}: $need Briefe, Modelle " . join(', ', @models) . ", Mehrheit $min, $shards Teil-Jobs");
+    $c->render(json => { ok => 1, run_id => $run->{id} + 0, letters => $need + 0, models => \@models, min_votes => $min, jobs => \@jobs });
+};
+
+get '/BBB/validation/runs/:id/discrepancy_check' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $rid = $c->param('id');
+    _val_disc_table($db);
+    my $done = $db->query(q{SELECT count(*) FROM validation_discrepancy_checks WHERE run_id = ?}, $rid)->array->[0];
+    my $sum  = $db->query(q{SELECT c->>'kind' AS art, c->>'decision' AS entscheidung, count(*) AS n
+                            FROM validation_discrepancy_checks d, jsonb_array_elements(d.payload->'checks') c
+                            WHERE d.run_id = ? GROUP BY 1, 2 ORDER BY 1, 2}, $rid)->hashes->to_array;
+    my $copy = $db->query(q{SELECT id, name, params->'discrepancy_check' AS info FROM validation_sets WHERE params->'discrepancy_check'->>'run_id' = ?}, "$rid")->expand->hash;
+    my $jobs = $c->minion->jobs({ tasks => ['validation_discrepancy_task'], states => [qw(inactive active)] });
+    my $open = 0;
+    while (my $j = $jobs->next) { $open++ if ref $j->{args} eq 'ARRAY' && ($j->{args}[0]{run_id} // 0) == $rid }
+    $c->render(json => { run_id => $rid + 0, letters_checked => $done + 0, open_jobs => $open, decisions => $sum, corrected_set => $copy });
+};
+
+sub _val_disc_build_copy {
+    my ($app, $run_id, $payload) = @_;
+    my $db  = $app->pg->db;
+    my $run = $db->query('SELECT * FROM validation_runs WHERE id = ?', $run_id)->hash;
+    my $set = _val_load_set($db, $run->{set_id});
+    my $items = _val_load_items($db, $set->{id});
+    my %ri = map { $_->{item_id} => $_ } @{ $db->query('SELECT item_id, phenopacket, result, error, seconds FROM validation_run_items WHERE run_id = ?', $run_id)->expand->hashes };
+    my %dec;
+    for my $s (@{ $db->query(q{SELECT d.item_id, d.payload FROM validation_discrepancy_checks d JOIN validation_items i ON i.id = d.item_id
+                               WHERE i.set_id = ? AND d.run_id = ?}, $set->{id}, $run_id)->expand->hashes }) {
+        $dec{ $s->{item_id} } = $s->{payload}{checks} // [];
+    }
+    my %sum;
+    for my $list (values %dec) {
+        for my $d (@$list) { $sum{ $d->{kind} }{ $d->{entry}{domain} // 'unbekannt' }{ $d->{decision} }++ }
+    }
+    my $name = "$set->{name} (korrigiert nach Lauf $run_id)";
+    my $tx = $db->begin;
+    my %params = (%{ $set->{params} // {} }, copied_from => { id => $set->{id} + 0, name => $set->{name} },
+                  discrepancy_check => { run_id => "$run_id", models => $payload->{models}, min_votes => $payload->{min_votes},
+                                         summary => \%sum, created_at => POSIX::strftime('%Y-%m-%dT%H:%M:%S', localtime) });
+    my $new = $db->insert('validation_sets', { name => $name, purpose => $set->{purpose}, params => to_json(\%params), created_by => 'discrepancy_check',
+                                               notes => "Referenz von $set->{name} nach Abweichungsprüfung von Lauf $run_id korrigiert" },
+                          { returning => 'id' })->hash->{id};
+    my (@results, @rows);
+    for my $i (@$items) {
+        my $ref = _val_disc_corrected_ref($i->{reference} // { entries => [] }, $dec{ $i->{id} } // []);
+        my $new_item = $db->query(q{INSERT INTO validation_items (set_id, position, candidate_id, pseudonym, doc_source, reference_date, stratum,
+                                     narrative, narrative_md5, snapshot, entries, injected, double_review, reference)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?::jsonb, ?, ?::jsonb) RETURNING id},
+                                  $new, @$i{qw(position candidate_id pseudonym doc_source reference_date stratum narrative narrative_md5)},
+                                  map({ defined $_ ? to_json($_) : undef } @$i{qw(snapshot entries injected)}), $i->{double_review} ? 1 : 0,
+                                  to_json($ref))->hash->{id};
+        my $r = $ri{ $i->{id} } or next;
+        my $res = defined $r->{phenopacket} ? _val_compare($app, $ref, _val_entries($r->{phenopacket})) : undef;
+        push @results, $res if $res;
+        push @rows, [ $new_item, $r, $res ];
+    }
+    my $metrics = _val_metrics(\@results);
+    $metrics->{n_items} = scalar @$items;
+    $metrics->{n_failed} = scalar(@$items) - scalar(@results);
+    my %rr = %$run;
+    delete $rr{id};
+    $rr{set_id}     = $new;
+    $rr{metrics}    = to_json($metrics);
+    $rr{comparison} = undef;
+    my $new_run = $db->insert('validation_runs', \%rr, { returning => 'id' })->hash->{id};
+    for my $x (@rows) {
+        my ($nid, $r, $res) = @$x;
+        $db->query(q{INSERT INTO validation_run_items (run_id, item_id, phenopacket, result, error, seconds) VALUES (?, ?, ?::jsonb, ?::jsonb, ?, ?)},
+                   $new_run, $nid, defined $r->{phenopacket} ? to_json($r->{phenopacket}) : undef, $res ? to_json($res) : undef, $r->{error}, $r->{seconds});
+    }
+    $db->query(q{UPDATE validation_sets SET frozen_at = now(), frozen_by = 'discrepancy_check', reference_source = ? WHERE id = ?},
+               ($set->{reference_source} // 'Referenz') . ' + Abweichungsprüfung', $new);
+    eval { $db->query(q{UPDATE validation_sets SET status = 'ready' WHERE id = ?}, $new) };
+    $tx->commit;
+    $app->log->info(sprintf('[DISC] Korrigierte Kopie "%s" (Datensatz %d, Lauf %d): F1 %s statt %s', $name, $new, $new_run,
+                            $metrics->{all}{f1} // '-', (eval { from_json($run->{metrics}) } // {})->{all}{f1} // '-'));
+    return ($new, $new_run, $metrics);
+}
+
+app->minion->add_task(validation_discrepancy_task => sub {
+    my ($job, $payload) = @_;
+    my $app = $job->app;
+    my $db  = $app->pg->db;
+    my ($rid, $shard, $shards) = @$payload{qw(run_id shard shards)};
+    my @models = @{ $payload->{models} // [] };
+    my $min    = $payload->{min_votes} // 2;
+    my $run    = $db->query('SELECT id, set_id FROM validation_runs WHERE id = ?', $rid)->hash or return $job->fail('Lauf fehlt');
+    my $items  = _val_load_items($db, $run->{set_id});
+    my %ri = map { $_->{item_id} => $_ } @{ $db->query('SELECT item_id, result FROM validation_run_items WHERE run_id = ? AND result IS NOT NULL', $rid)->expand->hashes };
+    my $effort = $ENV{ONTOTRIAL_DISC_REASONING_EFFORT} || 'low';
+    my $per    = ($ENV{ONTOTRIAL_DISC_MAX_PER_CALL} || 40) + 0;
+    _val_disc_table($db);
+    my ($k, $n_calls) = (0, 0);
+    for my $i (@$items) {
+        next unless $i->{position} % $shards == $shard;
+        my $res = $ri{ $i->{id} } or next;
+        my $checks = _val_disc_checks($res->{result}, ($i->{reference} // {})->{entries});
+        next unless @$checks;
+        next if $db->query(q{SELECT 1 FROM validation_discrepancy_checks WHERE run_id = ? AND item_id = ?}, $rid, $i->{id})->array;
+        $k++;
+        my $t0 = time;
+        my %votes;
+        for my $m (@models) {
+            for (my $o = 0; $o < @$checks; $o += $per) {
+                my @part = @$checks[ $o .. List::Util::min($o + $per - 1, $#$checks) ];
+                my ($out) = eval { _val_local_json_call($m, $VAL_DISC_SYSTEM, _val_disc_user($i->{narrative}, \@part), _val_disc_schema(), 'discrepancy_check', 'checks', $effort) };
+                $n_calls++;
+                unless ($out) { $app->log->warn("[DISC] Lauf $rid Brief $i->{position}, $m: " . ($@ =~ s/\s+$//r)); next }
+                for my $ck (@{ $out->{checks} // [] }) {
+                    next unless ref $ck eq 'HASH' && defined $ck->{id};
+                    my $quote_ok = _val_quote_ok($i->{narrative}, $ck->{quote}) ? 1 : 0;
+                    push @{ $votes{ $ck->{id} } }, { model => $m, in_letter => ($ck->{in_letter} && $quote_ok) ? 1 : 0,
+                                                      correct => $ck->{correct} // '', quote => $ck->{quote} // '', quote_ok => $quote_ok };
+                }
+            }
+        }
+        my @decided;
+        for my $c (@$checks) {
+            my $v = $votes{ $c->{id} } // [];
+            my $decision = 'unclear';
+            if ($c->{kind} eq 'fn') {           # Referenzeintrag nicht extrahiert: steht er überhaupt im Brief?
+                my $no  = grep { !$_->{in_letter} } @$v;
+                my $yes = grep { $_->{in_letter} } @$v;
+                $decision = $no >= $min ? 'reference_wrong' : $yes >= $min ? 'extraction_wrong' : 'unclear';
+            } elsif ($c->{kind} eq 'fp') {      # überzählig extrahiert: steht es doch im Brief?
+                my $yes = grep { $_->{in_letter} } @$v;
+                my $no  = grep { !$_->{in_letter} } @$v;
+                $decision = $yes >= $min ? 'reference_wrong' : $no >= $min ? 'extraction_wrong' : 'unclear';
+            } else {                            # Merkmal: welcher Wert stimmt?
+                my $ex = grep { $_->{correct} eq 'extraction' && $_->{quote_ok} } @$v;
+                my $rf = grep { $_->{correct} eq 'reference' && $_->{quote_ok} } @$v;
+                $decision = $ex >= $min ? 'reference_wrong' : $rf >= $min ? 'extraction_wrong' : 'unclear';
+            }
+            push @decided, { %$c, decision => $decision, votes => $v };
+        }
+        $db->query(q{INSERT INTO validation_discrepancy_checks (run_id, item_id, job_id, payload) VALUES (?, ?, ?, ?::jsonb)
+                     ON CONFLICT (run_id, item_id) DO UPDATE SET payload = EXCLUDED.payload, job_id = EXCLUDED.job_id, created_at = now()},
+                   $rid, $i->{id}, $job->id, to_json({ run_id => "$rid", models => \@models, min_votes => $min, checks => \@decided }));
+        $job->note(letters => $k, calls => $n_calls);
+        my %cnt; $cnt{ $_->{decision} }++ for @decided;
+        $app->log->info(sprintf('[DISC] Lauf %d, Brief %d: %d Abweichungen, %d Referenzfehler, %d Extraktionsfehler, %d unklar (%d s)',
+                                $rid, $i->{position}, scalar @decided, $cnt{reference_wrong} // 0, $cnt{extraction_wrong} // 0, $cnt{unclear} // 0, time - $t0));
+    }
+    # letzter fertiger Teil-Job baut die korrigierte Kopie
+    my $lock = 770_000_000 + $rid;
+    $db->query('SELECT pg_advisory_lock(?)', $lock);
+    my $done = $db->query(q{SELECT count(*) FROM validation_discrepancy_checks WHERE run_id = ?}, $rid)->array->[0];
+    my $exists = $db->query(q{SELECT id FROM validation_sets WHERE params->'discrepancy_check'->>'run_id' = ?}, "$rid")->array;
+    my @copy;
+    if ($done >= ($payload->{n_needed} // 0) && !$exists) {
+        @copy = eval { _val_disc_build_copy($app, $rid, $payload) };
+        $app->log->error("[DISC] Kopie für Lauf $rid fehlgeschlagen: $@") if $@;
+    }
+    $db->query('SELECT pg_advisory_unlock(?)', $lock);
+    $job->finish({ letters => $k, calls => $n_calls, letters_done_total => $done + 0, ($copy[0] ? (corrected_set => $copy[0], corrected_run => $copy[1]) : ()) });
+});
 
 app->minion->add_task(validation_ensemble_task => sub {
     my ($job, $payload) = @_;
