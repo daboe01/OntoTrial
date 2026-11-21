@@ -1,0 +1,2160 @@
+% =====================================================================
+%  OntoTrial – Handbuch Validierung der Extraktion und Betrieb
+%  Übersetzen mit:  pdflatex handbuch-validierung.tex  (zweimal, für das Inhaltsverzeichnis)
+% =====================================================================
+\documentclass[11pt,a4paper,parskip=half-,headings=standardclasses,toc=bibliography,open=any]{scrreprt}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[ngerman]{babel}
+\usepackage{lmodern}
+\usepackage{textcomp}
+\usepackage{microtype}
+\usepackage[margin=2.4cm,top=2.6cm,bottom=2.8cm]{geometry}
+\usepackage{xcolor}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric,fit}
+\usepackage[most]{tcolorbox}
+\usepackage[automark,headsepline]{scrlayer-scrpage}
+\usepackage[hidelinks,bookmarksnumbered]{hyperref}
+
+% ---------------------------------------------------------------------
+%  Farben und Gestaltung
+% ---------------------------------------------------------------------
+\definecolor{otblau}{HTML}{1F4E79}
+\definecolor{othell}{HTML}{E8F0F8}
+\definecolor{otgruen}{HTML}{2E7D32}
+\definecolor{otgruenhell}{HTML}{EAF5EA}
+\definecolor{otorange}{HTML}{B85C00}
+\definecolor{otorangehell}{HTML}{FFF3E0}
+\definecolor{otgrau}{HTML}{5F6368}
+\definecolor{otrot}{HTML}{C62828}
+\definecolor{otrothell}{HTML}{FDECEA}
+
+\addtokomafont{disposition}{\color{otblau}}
+\addtokomafont{chapter}{\Huge}
+\addtokomafont{part}{\Huge}
+\setkomafont{pageheadfoot}{\small\sffamily\color{otgrau}}
+\setkomafont{pagenumber}{\small\sffamily\color{otgrau}}
+\pagestyle{scrheadings}
+\clearpairofpagestyles
+\ihead{OntoTrial -- Validierung und Betrieb}
+\ohead{\headmark}
+\cfoot*{\pagemark}
+
+\setlist{itemsep=0.25em,topsep=0.4em}
+\setlist[enumerate]{label=\arabic*.}
+\renewcommand{\arraystretch}{1.25}
+\setcounter{tocdepth}{1}
+\setlength{\emergencystretch}{2em}
+
+% Knöpfe, Felder, Menüs der Oberfläche
+\newcommand{\btn}[1]{\tikz[baseline=(b.base)]\node[draw=otgrau!60,fill=black!4,rounded corners=2.5pt,inner xsep=4pt,inner ysep=2pt,font=\sffamily\small](b){#1};}
+\newcommand{\reiter}[1]{\textsf{\color{otblau}#1}}
+\newcommand{\feld}[1]{\textsf{\itshape #1}}
+% Code, Variablen, Pfade: wörtlich, mit Umbruchstellen nach _ / - , . :
+\ExplSyntaxOn
+\str_new:N \l__ot_code_str
+\cs_new_protected:Npn \code #1
+  {
+    \str_set:Nn \l__ot_code_str {#1}
+    \texttt { \str_map_inline:Nn \l__ot_code_str { ##1 \__ot_code_break:n {##1} } }
+  }
+\cs_new:Npn \__ot_code_break:n #1
+  {
+    \str_if_in:nnT { _/-,.: } {#1} { \allowbreak }
+  }
+\ExplSyntaxOff
+\newcommand{\taste}[1]{\tikz[baseline=(k.base)]\node[draw=otgrau,rounded corners=1.5pt,inner xsep=3pt,inner ysep=1pt,font=\sffamily\scriptsize](k){#1};}
+\newcommand{\queue}[1]{\tikz[baseline=(q.base)]\node[fill=otblau,text=white,rounded corners=2pt,inner xsep=4pt,inner ysep=1.5pt,font=\sffamily\scriptsize\bfseries](q){#1};}
+\newcommand{\neu}{\tikz[baseline=(n.base)]\node[fill=otgruen,text=white,rounded corners=2pt,inner xsep=3pt,inner ysep=1pt,font=\sffamily\scriptsize\bfseries](n){neu};}
+
+% Hinweiskästen
+\newtcolorbox{hinweis}[1][Hinweis]{enhanced,breakable,colback=othell,colframe=otblau,
+  boxrule=0pt,leftrule=3pt,arc=1pt,fonttitle=\sffamily\bfseries\color{otblau},
+  coltitle=otblau,colbacktitle=othell,title=#1,attach title to upper={\par\smallskip},
+  left=8pt,right=8pt,top=6pt,bottom=6pt}
+\newtcolorbox{achtung}[1][Achtung]{enhanced,breakable,colback=otorangehell,colframe=otorange,
+  boxrule=0pt,leftrule=3pt,arc=1pt,fonttitle=\sffamily\bfseries,
+  coltitle=otorange,colbacktitle=otorangehell,title=#1,attach title to upper={\par\smallskip},
+  left=8pt,right=8pt,top=6pt,bottom=6pt}
+\newtcolorbox{tipp}[1][Tipp]{enhanced,breakable,colback=otgruenhell,colframe=otgruen,
+  boxrule=0pt,leftrule=3pt,arc=1pt,fonttitle=\sffamily\bfseries,
+  coltitle=otgruen,colbacktitle=otgruenhell,title=#1,attach title to upper={\par\smallskip},
+  left=8pt,right=8pt,top=6pt,bottom=6pt}
+\newtcolorbox{gefahr}[1][Vorsicht]{enhanced,breakable,colback=otrothell,colframe=otrot,
+  boxrule=0pt,leftrule=3pt,arc=1pt,fonttitle=\sffamily\bfseries,
+  coltitle=otrot,colbacktitle=otrothell,title=#1,attach title to upper={\par\smallskip},
+  left=8pt,right=8pt,top=6pt,bottom=6pt}
+
+% Befehlszeilen
+\lstdefinestyle{shell}{basicstyle=\ttfamily\small,columns=fullflexible,keepspaces=true,
+  backgroundcolor=\color{black!4},frame=single,rulecolor=\color{black!12},framesep=6pt,
+  xleftmargin=6pt,xrightmargin=6pt,breaklines=true,showstringspaces=false,
+  literate={ä}{{\"a}}1 {ö}{{\"o}}1 {ü}{{\"u}}1 {Ä}{{\"A}}1 {Ö}{{\"O}}1 {Ü}{{\"U}}1 {ß}{{\ss}}1}
+\lstnewenvironment{befehl}{\lstset{style=shell}}{}
+
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\hypersetup{pdftitle={OntoTrial -- Handbuch Validierung der Extraktion und Betrieb},pdfauthor={Klinik für Augenheilkunde, Universitätsklinikum Freiburg}}
+
+% =====================================================================
+\begin{document}
+
+% ---------------------------------------------------------------------
+%  Titelseite
+% ---------------------------------------------------------------------
+\begin{titlepage}
+\begin{tikzpicture}[remember picture,overlay]
+  \fill[otblau] (current page.north west) rectangle ([yshift=-9cm]current page.north east);
+  \fill[otblau!80] ([yshift=-9cm]current page.north west) rectangle ([yshift=-9.25cm]current page.north east);
+  \node[anchor=north west,text=white,font=\sffamily\bfseries\fontsize{40}{44}\selectfont] at ([xshift=2.4cm,yshift=-3cm]current page.north west) {OntoTrial};
+  \node[anchor=north west,text=white!85!otblau,font=\sffamily\LARGE] at ([xshift=2.4cm,yshift=-4.7cm]current page.north west) {Validierung der Extraktion und Betrieb};
+  \node[anchor=north west,text=white!70!otblau,font=\sffamily\large,text width=15cm] at ([xshift=2.4cm,yshift=-6.1cm]current page.north west)
+    {Handbuch für Prüfung, Referenz, KI-Ensemble, Regressionstests,\\Validierungsstudie, synthetische Datensätze, Chart-Review\\und den Betrieb mit Minion};
+\end{tikzpicture}
+
+\vspace*{10.5cm}
+
+\begin{minipage}{\textwidth}
+\sffamily\large
+\begin{tabular}{@{}ll}
+\color{otgrau}Für      & Prüferinnen und Prüfer, Studienkoordination, Betrieb\\
+\color{otgrau}Stand    & 19. November 2026\\
+\color{otgrau}Pipeline & \code{OntoTrial2-DisjunctiveDeduplicatedStepEngine}, Version 2026-10-14\\
+\color{otgrau}Module   & Validierungsfenster (\textsf{Validierung …}), Chart-Review,\\ & Werkzeuge im Aktionsmenü, Minion-Worker\\
+\end{tabular}
+\end{minipage}
+
+\vfill
+{\sffamily\color{otgrau}Klinik für Augenheilkunde\\Universitätsklinikum Freiburg}
+\end{titlepage}
+
+\tableofcontents
+
+% =====================================================================
+\chapter*{Wegweiser}
+\addcontentsline{toc}{chapter}{Wegweiser}
+% =====================================================================
+
+Dieses Handbuch hat fünf Teile. Niemand muss alles lesen.
+
+\begin{tabularx}{\textwidth}{@{}P{4.4cm}L@{}}
+\toprule
+\textbf{Sie sind …} & \textbf{Lesen Sie}\\
+\midrule
+Prüferin, Prüfer & Kapitel~\ref{kap:pruefer} (Briefe prüfen), \ref{kap:ensemble} (KI-Ensemble beim Prüfen) und die Kurzreferenz in Anhang~\ref{anh:kurz}. Für Chart-Reviews Kapitel~\ref{kap:chartreview}.\\
+Studienkoordination & Teil~I und~II, Kapitel~\ref{kap:konsens} bis~\ref{kap:studie}, für retrospektive Studien Kapitel~\ref{kap:chartreview}, für Kohorten (Neu-Extraktion, Matching, anonymisierter Export) Kapitel~\ref{kap:werkzeuge}.\\
+Entwicklung, Pipeline-Pflege & Kapitel~\ref{kap:datensaetze}, \ref{kap:synth}, \ref{kap:regression}; die API in Anhang~\ref{anh:api}.\\
+Betrieb & Teil~V: Prozesse, Minion, Queues, Worker, Konfiguration, Datenbank, Fehlerbehebung; dazu der Spickzettel in Anhang~\ref{anh:minion}.\\
+\bottomrule
+\end{tabularx}
+
+\section*{Was gegenüber dem Stand vom Oktober 2026 neu ist}
+
+\begin{itemize}
+  \item \textbf{Vorbereitung mit Neu-Extraktion.} Neue Datensätze werden standardmäßig mit der aktuellen Pipeline neu extrahiert, bevor geprüft wird. Nicht extrahierbare Briefe werden entfernt. Eine unterbrochene Vorbereitung lässt sich fortsetzen.
+  \item \textbf{KI-Ensemble statt einzelner KI-Judges.} Mehrere lokale Modelle bewerten vor, mit wörtlichem Beleg, Mehrheitsentscheid und Vorschlägen für fehlende Einträge. Externe Judges (Anthropic-API) und die „KI-Referenz“ gibt es nicht mehr.
+  \item \textbf{Schnellprüfung und Zweitblick.} Bei Regressions-Datensätzen werden die Ensemble-Urteile mit \taste{Enter} bestätigt; bei Studien erscheinen sie erst nach der eigenen, unbeeinflussten Bewertung.
+  \item \textbf{Verdachtsdiagnosen.} Die Kodierung kennt keinen Verdachtsstatus mehr. „V.\,a.\ X“ als X kodiert ist korrekt; das Urteil „Verdacht als gesichert“ entfällt.
+  \item \textbf{Läufe.} Mehrere Läufe parallel, Läufe ohne Referenz, Pipeline-Referenz aus einem Lauf, Fortsetzen, Neu bewerten, Laufzeit je Brief, Modell und Deep Mode aus dem Hauptfenster.
+  \item \textbf{Kopieren und Referenzen vergleichen.} Ein Datensatz kann kopiert werden, damit jede Referenzquelle ihren eigenen Datensatz hat; zwei Referenzen lassen sich Brief für Brief vergleichen.
+  \item \textbf{Synthetische Datensätze} aus Phenopackets, mit Freigabe des Prompts, Belegprüfung, Datumsverschiebung, Verrauschung und Verknüpfbarkeitsprüfung.
+  \item \textbf{Abweichungsprüfung} eines Laufs durch lokale Modelle mit korrigierter Kopie der Referenz.
+  \item \textbf{Chart-Review} für retrospektive Studien: Fall-Listen als CSV, Urteile je Prüfer, Ergebnis-CSV mit Konsens.
+  \item \textbf{Werkzeuge im Aktionsmenü} beschrieben: Neu-Extraktion nach Tag, Propensity Matching, anonymisierter Export (Kapitel~\ref{kap:werkzeuge}).
+  \item \textbf{Betrieb}: drei Minion-Queues mit eigenen Workern, Prioritäten, eigene Minion-Datenbank möglich, Watchdog für hängende Extraktionen, Rückmeldung an Quellsysteme.
+\end{itemize}
+% =====================================================================
+\part{Grundlagen}
+% =====================================================================
+
+% =====================================================================
+\chapter{Überblick}
+% =====================================================================
+
+OntoTrial wandelt augenärztliche Arztbriefe automatisch in kodierte Phenopackets um: Diagnosen (ICD-10-GM), Befunde (HPO), Eingriffe (OPS), Medikation (ATC) und Messwerte (LOINC), jeweils mit Augenseite, Datum und Status (vorhanden oder verneint). Das Validierungsmodul beantwortet zwei Fragen:
+
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[Ist eine Änderung an der Pipeline unbedenklich? (Regressionstest)]
+  Nach jedem Update an Prompts, Intercepts, Filterregeln, Modell oder Code laufen die Briefe eines festen Referenzdatensatzes erneut durch die Pipeline. Das Ergebnis wird mit der Referenz und mit einem früheren Basis-Lauf verglichen. Verschlechtert sich etwas, ist das sichtbar, bevor die Änderung den ganzen Bestand betrifft.
+  \item[Wie gut ist die Extraktion? (Validierungsstudie)]
+  Ärztinnen und Ärzte bewerten eine repräsentative Stichprobe nach festen Regeln. Daraus entstehen Kennzahlen mit Konfidenzintervallen, die sich publizieren lassen: Richtigkeit je Domäne, Genauigkeit von Seite und Datum, Vollständigkeit, Übereinstimmung der Prüfer.
+\end{description}
+
+Beide Fragen nutzen dieselben Bausteine. Ein ärztlich geprüfter Studiendatensatz taugt anschließend auch als Referenz für Regressionstests. Dazu kommen zwei verwandte Werkzeuge: \emph{synthetische Datensätze}, deren Referenz nicht geprüft werden muss, weil die Briefe aus vorgegebenen Phenopackets geschrieben werden (Kapitel~\ref{kap:synth}), und der \emph{Chart-Review} für retrospektive Studien (Kapitel~\ref{kap:chartreview}).
+
+\section{Begriffe}
+
+\begin{longtable}{@{}P{3.4cm}p{11.2cm}@{}}
+\toprule
+\textbf{Begriff} & \textbf{Bedeutung}\\
+\midrule
+\endhead
+Datensatz & Stichprobe von Briefen mit Kopie von Brieftext und extrahiertem Phenopacket. Zweck \emph{Regressionstest} oder \emph{Validierungsstudie}. Sonderform: synthetischer Datensatz.\\
+Vorbereitung & Neu-Extraktion der Briefe eines frisch gezogenen Datensatzes mit der aktuellen Pipeline. Solange sie läuft, ist der Datensatz im Zustand \emph{wird vorbereitet}.\\
+Eintrag & Ein einzelnes kodiertes Element eines Phenopackets, zum Beispiel „Pseudophakie, ICD-10 Z96.1, LA“.\\
+Bewertung & Urteil einer Prüferin oder eines Prüfers zu einem Eintrag (korrekt oder Fehlertyp), dazu ergänzte fehlende Einträge und bei Studien die Checkliste.\\
+Konsens & Prüfer mit dem festen Namen \textsf{Konsens}. Klärt Abweichungen zwischen zwei Prüfern und sieht dabei die Urteile beider.\\
+Referenz & Sollzustand je Brief. Entsteht aus ärztlichen Bewertungen, aus einem Pipeline-Lauf oder aus dem Zielphenopacket eines synthetischen Briefs. Wird \emph{eingefroren} und ist dann unveränderlich.\\
+KI-Ensemble & Mehrere lokale Sprachmodelle, die jeden Eintrag nach denselben Regeln wie die Ärzte bewerten, ihr Urteil mit einem wörtlichen Zitat belegen und fehlende Einträge vorschlagen.\\
+Schnellprüfung & Prüfen mit sichtbaren Ensemble-Urteilen (nur Regressions-Datensätze): bestätigen oder korrigieren.\\
+Zweitblick & Bei Studien: Ensemble-Urteile erscheinen erst, nachdem der Brief ohne sie abgeschlossen wurde. Beide Stände werden getrennt gespeichert.\\
+Lauf & Extraktion aller Briefe eines Datensatzes und Vergleich mit der Referenz; entweder neu extrahiert oder mit den gespeicherten Phenopackets des Bestands.\\
+Basis & Ein ausgewählter Lauf, mit dem spätere Läufe verglichen werden.\\
+Pipeline-Stand & Fingerabdruck von Backend, Modell, Prompts, Intercepts, Filterregeln, Katalogversionen und Mapping-Schaltern, der mit jedem Lauf gespeichert wird.\\
+Abweichungsprüfung & Lokale Modelle prüfen nur die Unterschiede zwischen einem Lauf und der Referenz am Brieftext; Ergebnis ist eine korrigierte Kopie des Datensatzes.\\
+Worker, Queue & Hintergrundprozess bzw.\ Warteschlange von Minion, die Vorbereitung, Läufe, Ensemble und synthetische Briefe ausführt (Teil~\ref{part:betrieb}).\\
+\bottomrule
+\end{longtable}
+
+\section{Ablauf auf einen Blick}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=10mm and 9mm,
+  box/.style={draw=otblau,fill=othell,rounded corners=3pt,align=center,font=\sffamily\small,minimum height=12mm,text width=3.1cm},
+  opt/.style={box,draw=otgruen,fill=otgruenhell},
+  alt/.style={box,draw=otorange,fill=otorangehell},
+  arr/.style={-{Stealth[length=2.5mm]},thick,color=otblau}]
+  \node[box] (zieh) {Datensatz ziehen\\\scriptsize geschichtet, gesperrt};
+  \node[box,right=of zieh] (prep) {Vorbereitung\\\scriptsize Neu-Extraktion (Worker)};
+  \node[opt,right=of prep] (ens) {KI-Ensemble\\\scriptsize optional, Worker};
+  \node[box,below=of ens] (pruef) {Briefe prüfen\\\scriptsize Ärzte, ggf.\ doppelt};
+  \node[box,left=of pruef] (kons) {Konsens\\\scriptsize Abweichungen klären};
+  \node[box,left=of kons] (frier) {Referenz einfrieren};
+  \node[box,below=of frier] (basis) {Basis-Lauf\\\scriptsize neu extrahieren};
+  \node[box,right=of basis] (lauf) {Läufe nach Updates\\\scriptsize ok oder Regression};
+  \node[opt,right=of lauf] (studie) {Studienkennzahlen\\\scriptsize Precision, Recall, $\kappa$};
+  \node[alt,below=of basis] (pl) {Pipeline-Lauf\\\scriptsize als Referenz};
+  \node[alt,right=of pl] (syn) {Synthetischer\\Datensatz};
+  \draw[arr] (zieh) -- (prep);
+  \draw[arr] (prep) -- (ens);
+  \draw[arr] (ens) -- (pruef);
+  \draw[arr,dashed] (prep.south east) -- node[font=\sffamily\scriptsize,text=otgrau,below left=-1mm]{ohne Ensemble} (pruef.north west);
+  \draw[arr] (pruef) -- (kons);
+  \draw[arr] (kons) -- (frier);
+  \draw[arr] (frier) -- (basis);
+  \draw[arr] (basis) -- (lauf);
+  \draw[arr,dashed] (pruef) -- (studie);
+  \draw[arr,dashed,color=otorange] (pl) -- (basis);
+  \draw[arr,dashed,color=otorange] (syn.north) -- ++(0,0.4) -| ([xshift=4mm]basis.south);
+\end{tikzpicture}
+\end{center}
+
+Orange: Alternativen zur ärztlichen Referenz für reine Regressionstests (Abschnitt~\ref{sec:quellen}).
+
+\section{Rollen}
+
+\begin{tabularx}{\textwidth}{@{}P{3.6cm}L@{}}
+\toprule
+\textbf{Rolle} & \textbf{Aufgaben}\\
+\midrule
+Koordination & Datensätze anlegen, Pilotrunde organisieren, Ensemble starten, Referenz einfrieren, Sicherungen laden, Kennzahlen auswerten, Chart-Review-Listen hochladen.\\
+Prüferinnen, Prüfer & Briefe bewerten (Kapitel~\ref{kap:pruefer}). Sehen nur ihre eigenen Bewertungen.\\
+Konsens & Abweichungen zwischen zwei Prüfern klären (Abschnitt~\ref{sec:konsens}).\\
+Freigabe synthetischer Prompts & Few-Shot-Beispiele lesen, überarbeiten und freigeben (Abschnitt~\ref{sec:synthfreigabe}). Name wird mit der Freigabe gespeichert.\\
+Betrieb & Backend, Minion-Worker, Konfiguration, Datenbank, Sicherung (Teil~\ref{part:betrieb}).\\
+\bottomrule
+\end{tabularx}
+
+% =====================================================================
+\chapter{Das Validierungsfenster}
+% =====================================================================
+
+\section{Öffnen}
+
+In der Kandidatenliste öffnet das Aktionsmenü der Knopfleiste (Zahnrad) den Eintrag \textsf{Validierung …} (direkt hinter \textsf{Propensity Matching}). Das Fenster ist ein schwebendes Panel wie das Panel \textsf{Hintergrundprozesse}; es passt sich beim Öffnen an die Größe des Browserfensters an und lässt sich mit der Maus vergrößern. Brieftext und Tabellen wachsen mit.
+
+\section{Kopfzeile}
+
+\begin{tabularx}{\textwidth}{@{}P{3.8cm}L@{}}
+\toprule
+\textbf{Element} & \textbf{Funktion}\\
+\midrule
+\feld{Datensatz} & Auswahl des Datensatzes; in Klammern der Zweck.\\
+\btn{Neuer Datensatz …} & Neue Stichprobe ziehen oder synthetischen Datensatz anlegen (Kapitel~\ref{kap:datensaetze} und~\ref{kap:synth}).\\
+\btn{Sicherung laden} & Lädt den Datensatz mit Briefen, Extraktionen, allen Bewertungen, KI-Bewertungen und Läufen als JSON-Datei herunter.\\
+\btn{Chart-Review …} & Öffnet das eigene Fenster für Fall-Listen retrospektiver Studien (Kapitel~\ref{kap:chartreview}).\\
+\feld{Prüfer} & Ihr Name oder Kürzel, mit \taste{Enter} bestätigen. Alle Bewertungen werden unter diesem Namen gespeichert; der Browser merkt sich den Eintrag.\\
+Infozeile & Anzahl der Briefe, Seed, \textsf{gesperrt} oder \textsf{ENTSPERRT}, Stand der Referenz mit Quelle (Ärzte, Pipeline, KI bei alten Datensätzen). Während der Vorbereitung: „wird vorbereitet“ mit dem aktuellen Brief.\\
+\bottomrule
+\end{tabularx}
+
+\section{Die drei Reiter}
+
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[\reiter{Prüfen}] Briefe Eintrag für Eintrag bewerten, Ensemble-Urteile bestätigen, Vorschläge für fehlende Einträge übernehmen. Arbeitsplatz der Prüferinnen und Prüfer.
+  \item[\reiter{Referenz \& Regression}] Stand der Prüfung, Referenz einfrieren und auftauen, Sperre, Löschen, Kopieren, Referenzen vergleichen, KI-Ensemble starten und beenden, Regressionsläufe starten, auswerten, abbrechen, fortsetzen und neu bewerten.
+  \item[\reiter{Studie}] Kennzahlen nach Bewertungshandbuch berechnen und Rohdaten exportieren.
+\end{description}
+
+\section{Hintergrundprozesse}\label{sec:hud}
+
+Vorbereitung, KI-Ensemble, Läufe und synthetische Briefe arbeiten als Minion-Jobs im Hintergrund. Ihr Fortschritt erscheint im Panel \textsf{OntoTrial Hintergrundprozesse}, zum Beispiel „Validierung: Brief 20 von 50“, und zusätzlich im Statusfeld des Reiters \reiter{Referenz \& Regression}. Das Validierungsfenster und sogar der Browser dürfen währenddessen geschlossen werden; die Arbeit geht weiter.
+
+\begin{hinweis}[„wartet auf einen Worker“]
+Erscheint „wartet auf einen Worker für die Warteschlange „validation““, läuft kein Worker für diese Queue. Das ist ein Fall für den Betrieb: \code{perl backend.pl minion worker -q validation -j 4} (Kapitel~\ref{kap:worker}). Der Auftrag bleibt bis dahin gespeichert und startet, sobald ein Worker da ist.
+\end{hinweis}
+% =====================================================================
+\part{Datensätze}
+% =====================================================================
+
+% =====================================================================
+\chapter{Datensätze anlegen, vorbereiten und schützen}\label{kap:datensaetze}
+% =====================================================================
+
+\section{Neue Stichprobe ziehen}
+
+\btn{Neuer Datensatz …} öffnet den Dialog \textsf{Neuen Validierungsdatensatz ziehen}:
+
+\begin{longtable}{@{}P{4.6cm}p{10.0cm}@{}}
+\toprule
+\textbf{Feld} & \textbf{Bedeutung}\\
+\midrule
+\endhead
+\feld{Name} & Eindeutiger Name, zum Beispiel \code{referenz_2026_1}. Wird später zum Bestätigen geschützter Aktionen gebraucht.\\
+\feld{Zweck} & \emph{Regressionstest} oder \emph{Validierungsstudie}. Nur Studien haben Checkliste, Doppelprüfung, eingestreute Fehler und Zweitblick.\\
+\feld{Anzahl Briefe} & Vorschlag 50 (Regression) bzw.\ 150 (Studie); erlaubt 5 bis 2000.\\
+\feld{Seed} & Startwert der Zufallsziehung. Mit gleichem Seed und gleichem Bestand entsteht dieselbe Stichprobe. Leer = zufällig; der gezogene Seed steht danach in der Infozeile.\\
+\feld{Nur Tag} & Optional: nur Briefe von Patienten mit diesem Tag (mehrere kommagetrennt, Groß-/Kleinschreibung egal).\\
+\feld{höchstens ein Brief je Patient} & Standard. Verhindert, dass ein Patient mit vielen Briefen das Ergebnis dominiert.\\
+\feld{Phenopackets neu extrahieren (empfohlen)} & Standard. Die Briefe werden nach der Ziehung mit der aktuellen Pipeline neu extrahiert, mit dem Modell aus der Auswahl \textsf{LLM Model} im Hauptfenster. Ohne Haken wird der gespeicherte Stand aus dem Bestand übernommen; dann kommen nur Briefe mit Phenopacket in Frage.\\
+\feld{danach KI-Ensemble starten} & Bei Regression vorausgewählt, bei Studie nicht. Startet nach der Vorbereitung automatisch das Ensemble (Kapitel~\ref{kap:ensemble}).\\
+\feld{Doppelt prüfen (Anteil)} & Nur Studie, Standard 0{,}3: Anteil der Briefe, die zwei Prüfer unabhängig bewerten.\\
+\feld{Eingestreute Fehler} & Nur Studie, Standard 0{,}08: Anteil der Briefe mit einem absichtlich eingebauten Fehler.\\
+\feld{Zum Bestätigen ANLEGEN} & Schutz vor versehentlichem Anlegen: \code{ANLEGEN} eintippen, dann \btn{Stichprobe ziehen}.\\
+\bottomrule
+\end{longtable}
+
+\paragraph{So wird gezogen.} In Frage kommen Briefe mit mindestens 300 Zeichen Text, die noch in keinem anderen Validierungsdatensatz stecken (ohne Neu-Extraktion zusätzlich nur Briefe mit Phenopacket). Identische Brieftexte zählen einmal. Die Stichprobe wird proportional nach Quelle (\code{doc_source}) und Jahr geschichtet (Verfahren der größten Reste), sodass jede Schicht etwa so stark vertreten ist wie im Bestand. Die Reihenfolge der Briefe im Datensatz ist zufällig, aber durch den Seed reproduzierbar. Die Meldung nach dem Anlegen nennt die Zahl der geeigneten Briefe und der Schichten.
+
+\paragraph{Eingestreute Fehler.} Bei Studien wird in den ausgewählten Briefen genau ein Eintrag manipuliert, bevor die Prüfer ihn sehen: die Augenseite vertauscht, das Datum um ein Jahr verschoben oder ein Eintrag entfernt. Welche Briefe betroffen sind, zeigt die Oberfläche nicht an. Für die Referenz zählt immer der unveränderte Eintrag; die Manipulation misst nur, wie aufmerksam geprüft wird. Bei Neu-Extraktion werden die Fehler erst in der Vorbereitung eingestreut, deterministisch aus Seed und Brief.
+
+\section{Vorbereitung}\label{sec:vorbereitung}
+
+Mit Neu-Extraktion ist der Datensatz zunächst im Zustand \textsf{wird vorbereitet}. Ein Minion-Job der Queue \queue{validation} extrahiert jeden Brief mit der aktuellen Pipeline (bis zu zwei Versuche je Brief). Währenddessen
+
+\begin{itemize}
+  \item zeigt die Infozeile den aktuellen Brief und die Sekunden, die er schon läuft,
+  \item ist Prüfen, Ensemble und Lauf gesperrt („Der Datensatz wird noch vorbereitet“),
+  \item werden Briefe, die sich auch im zweiten Versuch nicht extrahieren lassen, aus dem Datensatz entfernt.
+\end{itemize}
+
+Am Ende meldet das Fenster „Datensatz … ist vorbereitet“ mit der Zahl extrahierter und entfernter Briefe. Modell und Pipeline-Stand der Vorbereitung werden im Datensatz vermerkt. War \feld{danach KI-Ensemble starten} gesetzt, reiht der Job anschließend das Ensemble ein.
+
+\begin{tipp}[Unterbrochene Vorbereitung fortsetzen]
+Wird der Worker während der Vorbereitung neu gestartet, fragt das Fenster: „Die Vorbereitung von … ist unterbrochen.“ \btn{Fortsetzen} macht beim nächsten Brief weiter; bereits extrahierte Briefe bleiben erhalten. Das gilt ebenso für synthetische Datensätze, solange deren Zuordnung noch existiert (Abschnitt~\ref{sec:synthschutz}).
+\end{tipp}
+
+\section{Schutz des Datensatzes}
+
+Ein validierter Datensatz ist wertvoll. Deshalb gilt:
+
+\begin{itemize}
+  \item Brieftext und Extraktion werden als Kopie gespeichert. Neu-Extraktionen oder Löschungen im Bestand verändern den Datensatz nicht.
+  \item Jeder neue Datensatz ist \textbf{gesperrt}. Ein gesperrter Datensatz lässt sich weder löschen noch auftauen.
+  \item Nach dem \textbf{Einfrieren} der Referenz sind Bewertungen unveränderlich.
+  \item Diese Regeln erzwingt die Datenbank selbst über Trigger, also auch gegen direkte SQL-Befehle. Die allgemeinen Tabellen-Routen der API (\code{/BBB/validation_...}) sind für die Validierungstabellen gesperrt (HTTP 403).
+  \item Entsperren, Einfrieren, Auftauen und Löschen verlangen das Eintippen des Datensatznamens.
+\end{itemize}
+
+\begin{tipp}[Sicherung]
+Vor jedem größeren Schritt, insbesondere vor Entsperren, Auftauen oder Löschen, mit \btn{Sicherung laden} eine JSON-Kopie herunterladen (Format \code{ontotrial-validation-1}). Sie enthält Datensatz, Briefe, Extraktionen, Referenz, alle Bewertungen, KI-Bewertungen und Läufe.
+\end{tipp}
+
+\section{Datensatz kopieren}\label{sec:kopieren}
+
+\btn{Datensatz kopieren …} im Reiter \reiter{Referenz \& Regression} legt einen neuen Datensatz mit denselben Briefen und Extraktionen an, übernimmt alle ärztlichen Bewertungen (beide Phasen), KI-Bewertungen und Ensemble-Vorschläge, aber \emph{keine} Referenz und \emph{keine} Läufe. Die Kopie ist gesperrt.
+
+Wozu: Jede Referenzquelle bekommt ihren eigenen Datensatz. Typisch ist ein ärztlich geprüfter Datensatz und eine Kopie, deren Referenz aus einem Pipeline-Lauf eines anderen Modells stammt. Beide lassen sich dann mit \btn{Referenz vergleichen mit …} gegenüberstellen (Abschnitt~\ref{sec:refvergleich}).
+
+\section{Datensatz löschen}
+
+Im Reiter \reiter{Referenz \& Regression}: erst \btn{Sperren / Entsperren …}, dann \btn{Datensatz löschen …}. Beides mit dem Namen bestätigen. Gelöscht werden Läufe, Referenz, Bewertungen, KI-Bewertungen und Vorschläge.
+
+\section{Namen aus Brieftexten entfernen}\label{sec:redact}
+
+Brieftexte in Validierungsdatensätzen sind unveränderlich. Taucht dort trotzdem ein Name auf, der nicht hineingehört, entfernt ihn der Betrieb in \code{psql}:
+
+\begin{befehl}
+SELECT * FROM ontotrial_redact('Nachname');
+\end{befehl}
+
+Die Funktion ersetzt das ganze Wort in Kandidaten, Validierungsbriefen, Ensemble-Bewertungen, Vorschlägen und Bewertungen und meldet die Zahl geänderter Zeilen. Optional sind Ersatztext und Groß-/Kleinschreibung einstellbar. Die schützenden Trigger lassen die Änderung nur innerhalb dieser Funktion zu. Gebeugte Formen (etwa ein Genitiv-s) brauchen einen eigenen Aufruf.
+
+% =====================================================================
+\chapter{Synthetische Datensätze}\label{kap:synth}
+% =====================================================================
+
+\section{Zweck und Prinzip}
+
+Ein synthetischer Datensatz besteht aus Briefen, die ein Sprachmodell aus vorgegebenen Phenopackets schreibt. Die Referenz ist das vorgegebene Phenopacket; niemand muss die Briefe prüfen. Damit lassen sich große Regressionsdatensätze (Standard 400 Briefe) schnell aufbauen, auch mit einem externen Generator, ohne dass echte Brieftexte die Klinik verlassen.
+
+\begin{enumerate}
+  \item Aus dem Bestand werden Zielphenopackets gezogen: Briefe ab einem Datum (Standard 1.1.2025) aus bestimmten Quellen (Standard \code{argos}), höchstens ein Brief je Patient. Ihr Text wird nicht verwendet.
+  \item Jedes Ziel wird verfremdet: Datum um ±1 bis 12 Monate verschoben (nie in die Zukunft), Tage innerhalb des Monats neu gewürfelt (Reihenfolge bleibt), Alter um $-1$, $0$ oder $+1$ Jahr verändert, Messwerte leicht verrauscht (Visus ±1 Stufe, Augendruck ±2\,mmHg, Dioptrien ±0{,}25, Achse ±5\textdegree, \textmu m ±10, Zellzahl ±100). Nichts davon wird gespeichert.
+  \item Der Generator bekommt nur den freigegebenen Prompt und die Liste der verfremdeten Einträge und schreibt dazu einen Brief mit einem wörtlichen Beleg je Eintrag.
+  \item Die Antwort wird geprüft (Abschnitt~\ref{sec:synthpruefung}); verworfene Ziele werden durch Reserve-Ziele ersetzt.
+  \item Nach dem letzten Brief wird die Referenz automatisch eingefroren (Quelle \textsf{Synthetisch} mit Modellname).
+\end{enumerate}
+
+Synthetische Datensätze haben immer den Zweck \emph{Regressionstest}. \btn{Gespeicherte Phenopackets prüfen} ist für sie nicht möglich, weil die Briefe nicht im Bestand stehen; Läufe extrahieren immer neu. Die Pseudonyme lauten \code{SYN-0001}, \code{SYN-0002} usw., die Quelle \code{synthetic}.
+
+\section{Generator wählen}
+
+Das Feld \feld{Modell} im Dialog entscheidet über den Weg:
+
+\begin{tabularx}{\textwidth}{@{}P{3.6cm}L@{}}
+\toprule
+\textbf{Modellname} & \textbf{Weg}\\
+\midrule
+\code{claude-...} & Anthropic-API (extern). Braucht \code{ONTOTRIAL_SYNTH_API_KEY} (Rückfall \code{ANTHROPIC_API_KEY}) und \code{ONTOTRIAL_SYNTH_ALLOW_EXTERNAL=1}.\\
+alle anderen & wie die Extraktion über vLLM bzw.\ Ollama (\code{...-mlx}, \code{ollama}) im Kliniknetz.\\
+\bottomrule
+\end{tabularx}
+
+Ohne Angabe gilt \code{ONTOTRIAL_SYNTH_MODEL}. Ob ein Endpunkt „extern“ ist, entscheidet ein regulärer Ausdruck für Hosts im Kliniknetz (\code{ONTOTRIAL_SYNTH_LOCAL_HOSTS}; Standard: private Adressbereiche, \code{.local}, \code{uniklinik-freiburg.de}, \code{uni-freiburg.de}). Die Kopfzeile des Dialogs zeigt Host, ob er extern ist, ob er freigegeben ist und ob ein Schlüssel gesetzt ist.
+
+\begin{achtung}[Externer Generator nur nach Klärung mit dem Datenschutz]
+Bei einem externen Endpunkt verlassen Prompt und Zielphenopackets (Codes, Seiten, verschobene Daten, verrauschte Werte, Geschlecht, Alter) das Kliniknetz, außerdem die fünf Few-Shot-Beispiele im Prompt. Ohne \code{ONTOTRIAL_SYNTH_ALLOW_EXTERNAL=1} lehnt das Backend den Batch ab (HTTP 403).
+\end{achtung}
+
+\section{Schritt 1 bis 3 im Dialog}\label{sec:synthfreigabe}
+
+\btn{Neuer Datensatz …} $\rightarrow$ \btn{Synthetischer Datensatz (Briefe aus Phenopackets generieren) …} öffnet den Dialog \textsf{Synthetischer Validierungsdatensatz}. Oben im Fenster muss ein Prüfername eingetragen sein.
+
+\subsection*{1. Few-Shot-Paare laden}
+
+\btn{Few-Shot-Paare laden …} (optional mit Seed) wählt fünf echte Briefe ab dem Startdatum aus verschiedenen Subspezialitäten (Hornhaut, Linse, Netzhaut, Glaukom, Sonstiges), je Patient höchstens einen, mit 4 bis 25 Einträgen und 600 bis 6000 Zeichen. Briefe und Einträge werden in den Prompt \code{validation_synth} in \code{llm_prompts} geschrieben. Namen, Geburtsdaten, lange Nummern, Telefonnummern, Postleitzahl mit Ort und Straßen sind nur \emph{grob} vormaskiert. Der gespeicherte Prompt wird überschrieben; nichts verlässt das Kliniknetz.
+
+\subsection*{2. Prompt prüfen und freigeben}
+
+Die beiden Textfelder zeigen den Systemprompt (Regeln) und die Few-Shot-Paare mit der Aufgabe (Platzhalter \code{{{reference_date}}}, \code{{{sex}}}, \code{{{age}}}, \code{{{n_entries}}}, \code{{{entries}}}; die ersten beiden sind Pflicht).
+
+\begin{enumerate}
+  \item Jedes Beispiel von Hand überarbeiten: Reste echter Angaben zur Person, seltene Details, echte Daten.
+  \item \btn{Speichern}.
+  \item \btn{Prompt freigeben …} bestätigt: Der Brief wirkt wie einer aus der Klinik, Brief und Einträge stimmen überein (Seite, Datum, Verneinung, Werte), kein Rest echter Patientendaten.
+\end{enumerate}
+
+Freigegeben wird genau der gespeicherte Text (MD5-Hash). Jede spätere Änderung hebt die Freigabe auf; die Statuszeile zeigt dann in Rot „NICHT freigegeben (seit der letzten Freigabe durch … geändert)“. \btn{Neu laden} verwirft ungespeicherte Änderungen nach Rückfrage.
+
+\subsection*{3. Batch starten}
+
+\feld{Name} (Vorschlag \code{synthetisch_JJJJ_MM}), \feld{Anzahl} (Standard 400), \feld{Seed}, \feld{Modell}, \feld{Briefe ab}, \feld{Quellen}, \code{ANLEGEN} eintippen, \btn{Batch starten}. Der Knopf ist nur aktiv, wenn der angezeigte Prompt gespeichert und freigegeben ist. Der Job läuft in der Queue \queue{validation}; Fortschritt im Panel \textsf{Hintergrundprozesse}.
+
+\section{Prüfung jeder Antwort}\label{sec:synthpruefung}
+
+Ein erzeugter Brief wird nur übernommen, wenn
+
+\begin{itemize}
+  \item ein \code{<brief>}-Block mit mindestens 150 Zeichen vorhanden ist,
+  \item zu jedem Eintrag ein Beleg existiert, der wörtlich im Brief steht,
+  \item bei Messwerten der Wert im Beleg vorkommt (Punkt oder Komma),
+  \item höchstens 15\,\% der Wortfolgen (8er-Schindeln) aus den Few-Shot-Briefen stammen (\code{ONTOTRIAL_SYNTH_MAX_OVERLAP}),
+  \item mit \code{ONTOTRIAL_SYNTH_STRICT=1} zusätzlich Seite, Datum und Verneinung im Beleg stimmen.
+\end{itemize}
+
+Fehlen Belege, bekommt der Generator seine Antwort mit dem Hinweis auf die fehlenden Einträge zurück, statt neu zu würfeln. Nach \code{ONTOTRIAL_SYNTH_ATTEMPTS} (Standard 3) Versuchen wird das Ziel verworfen und durch ein Reserve-Ziel ersetzt (Reserve: 25\,\% + 10). Gründe werden gezählt und im Datensatz vermerkt. Fehler bei Schlüssel, Modellname oder Anfrage (HTTP 4xx außer 429) brechen den Batch ab; er lässt sich nach der Korrektur fortsetzen.
+
+\section{Schutz der Zuordnung}\label{sec:synthschutz}
+
+Nach Abschluss löscht der Job die Zuordnung Ziel $\rightarrow$ synthetischer Brief; nur Anzahlen und Ablehnungsgründe bleiben. Danach ist kein Fortsetzen mehr möglich. Mit \code{ONTOTRIAL_SYNTH_KEEP_KEYS=1} bleibt die Zuordnung erhalten (nur zur Fehlersuche).
+
+\section{Verknüpfbarkeit prüfen}
+
+Für die Datenschutzbewertung zählt ein eigener Job, wie viele Patienten im Bestand zu jedem synthetischen Brief passen würden (alle Einträge mit Code, Seite und Status; Daten, Alter und Messwerte innerhalb der Rauschgrenzen). Er wird über die API gestartet:
+
+\begin{befehl}
+curl -X POST http://localhost:4007/BBB/validation/sets/<id>/linkage
+curl http://localhost:4007/BBB/validation/sets/<id>/linkage
+\end{befehl}
+
+Das Ergebnis ordnet die Briefe in die Klassen 0, 1, 2--4, 5--9 und 10+ passender Patienten und nennt den Anteil eindeutig zuordenbarer Briefe (\code{unique_share}). Der Job läuft in der Queue \queue{validation} mit niedriger Priorität.
+
+\section{Abweichungsprüfung für synthetische Referenzen}
+
+Auch ein Generator macht Fehler: Ein Eintrag steht nicht im Brief, oder der Brief nennt etwas Zusätzliches. Die Abweichungsprüfung (Abschnitt~\ref{sec:abweichung}) lässt lokale Modelle genau die Unterschiede zwischen einem Lauf und der Referenz am Brieftext entscheiden und legt eine korrigierte, eingefrorene Kopie des Datensatzes an.
+
+\section{Konfiguration}
+
+Alle Variablen stehen in Abschnitt~\ref{sec:envsynth}.
+% =====================================================================
+\part{Prüfen}
+% =====================================================================
+
+% =====================================================================
+\chapter{Anleitung für Prüferinnen und Prüfer}\label{kap:pruefer}
+% =====================================================================
+
+\section{Vor dem Start}
+
+\begin{enumerate}
+  \item Oben im Feld \feld{Prüfer} den eigenen Namen oder ein festes Kürzel eintragen und mit \taste{Enter} bestätigen. Immer dasselbe Kürzel verwenden, sonst zählt das System zwei verschiedene Prüfer.
+  \item Den richtigen Datensatz auswählen. Steht in der Infozeile „wird vorbereitet“, ist Prüfen noch nicht möglich.
+  \item Das Bewertungshandbuch kennen; die Kurzfassung steht in Abschnitt~\ref{sec:regeln}.
+  \item Bei Studien: an der Pilotrunde teilnehmen, bevor die Hauptrunde beginnt.
+\end{enumerate}
+
+\begin{hinweis}[Grundsatz]
+Referenz ist ausschließlich der \textbf{Brieftext}. Bewertet wird, ob die Extraktion den Brief richtig wiedergibt, nicht ob der Brief medizinisch stimmt. Akte, Bildgebung und eigenes Wissen bleiben außen vor. Das gilt auch für die Urteile des KI-Ensembles: Sie sind Hinweise, keine Wahrheit.
+\end{hinweis}
+
+\section{Die Arbeitsfläche}
+
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[Links: Briefliste] Nummer, Pseudonym und Ihr Stand: \textsf{offen}, \textsf{5/23} (5 von 23 Einträgen bewertet), \textsf{Checkliste $\checkmark$} oder \textsf{fertig}. Der Zusatz \textsf{2$\times$} markiert Briefe, die doppelt geprüft werden. Darunter der eigene Fortschritt.
+  \item[Mitte: Brieftext] Der vollständige Brief, wie er der Extraktion vorlag. Darüber die Kopfzeile (Nummer, Pseudonym, Datum, Quelle, ggf.\ „doppelt geprüft“) und das Suchfeld \feld{Im Brief suchen …}: Treffer werden markiert, \taste{Enter} springt zum nächsten, daneben steht die Trefferzahl.
+  \item[Rechts oben: Teil A] Nur bei Studien: die Checkliste.
+  \item[Rechts: Teil B] Die extrahierten Einträge mit Domäne, Bezeichnung, Code, Seite, Datum, Wert, Ihrem Urteil, dem Ensemble-Urteil (sobald sichtbar) und für den Konsens den Urteilen der anderen Prüfer.
+  \item[Rechts darunter] \textsf{Im Brief vorhanden, aber nicht extrahiert}: Ensemble-Vorschläge und selbst ergänzte Einträge. Der Trenner zwischen beiden Tabellen lässt sich ziehen; der Browser merkt sich die Position.
+  \item[Unten] \btn{Brief abschließen}, \btn{Nächster offener Brief} und die Farblegende der Belege.
+\end{description}
+
+\paragraph{Belege im Brief.} Ist das Ensemble sichtbar, sind die Belegstellen im Brieftext farbig hinterlegt: \textcolor{otgruen}{grün} korrekt, \textcolor{otorange}{orange} möglicher Fehler, \textcolor{otblau}{blau} vorgeschlagener fehlender Eintrag, gelb der gerade ausgewählte Eintrag. Beim Auswählen eines Eintrags scrollt der Brief zu seinem Beleg.
+
+\paragraph{Code nachschlagen.} Das Auswählen eines Eintrags sucht seinen Code zusätzlich im Ontologie-Browser des Hauptfensters; dort stehen kanonische Bezeichnung und Hierarchie.
+
+\paragraph{Schnelles Weiterarbeiten.} Die nächsten zwei Briefe werden im Hintergrund vorgeladen; gespeichert wird ebenfalls im Hintergrund.
+
+\section{Ein Brief Schritt für Schritt}
+
+\begin{enumerate}
+  \item Brief in der Liste anklicken und den Text vollständig lesen.
+  \item \emph{Nur bei Studien:} Teil A, die Checkliste, ausfüllen, solange die Extraktion noch verborgen ist (Abschnitt~\ref{sec:teila}).
+  \item Teil B: jeden Eintrag bewerten (Abschnitt~\ref{sec:teilb}); bei Regressions-Datensätzen mit Ensemble meist nur bestätigen.
+  \item Fehlende Einträge: Vorschläge übernehmen oder ablehnen, eigene ergänzen (Abschnitt~\ref{sec:fehlend}).
+  \item \emph{Nur bei Studien:} für jede Checklistenzeile den Abgleich setzen.
+  \item \btn{Brief abschließen}. Bei Regression springt das System zum nächsten offenen Brief; bei Studien wird der Zweitblick angeboten (Abschnitt~\ref{sec:zweitblick}).
+\end{enumerate}
+
+Jede Eingabe wird sofort gespeichert. Sie können jederzeit unterbrechen und später weitermachen.
+
+\section{Teil A: Checkliste (nur Studie)}\label{sec:teila}
+
+Die Checkliste misst die Vollständigkeit unverzerrt. Deshalb ist die Extraktion verborgen, bis die Checkliste abgeschlossen ist.
+
+\begin{enumerate}
+  \item \btn{Zeile hinzufügen …} öffnet den Dialog \textsf{Checklistenzeile hinzufügen} mit \feld{Art} (Augen, Diagnose, Eingriff, Medikation, Visus, Tensio, Messwert), \feld{Bezeichnung}, \feld{Augenseite}, \feld{Datum} und \feld{Wert}. Stichworte genügen, Codes sind nicht nötig. \btn{Entfernen} löscht die markierte Zeile.
+  \item Erfasst werden: betroffene Augen, Hauptdiagnosen aus dem Diagnosenblock, alle Eingriffe mit Seite und Datum (auch anamnestische), Augenmedikation, letzter Visus und Augendruck je Auge sowie Endothelzelldichte, Hornhautdicke oder Refraktion, falls genannt.
+  \item \btn{Checkliste abschließen, Extraktion zeigen}. Danach erscheint Teil B.
+  \item Nach der Bewertung von Teil B jede Checklistenzeile markieren und \btn{Gefunden}, \btn{Attributfehler} (gefunden, aber Seite, Datum oder Wert falsch oder fehlend) oder \btn{Fehlt} klicken.
+\end{enumerate}
+
+\section{Teil B: Einträge bewerten}\label{sec:teilb}
+
+Eintrag in der Tabelle markieren, dann einen Knopf klicken oder eine Taste drücken. Nach jedem Urteil springt die Auswahl zum nächsten Eintrag.
+
+\begin{tabularx}{\textwidth}{@{}P{3.4cm}P{1.4cm}L@{}}
+\toprule
+\textbf{Knopf} & \textbf{Taste} & \textbf{Wann}\\
+\midrule
+\btn{Bestätigen} & \taste{Enter} & Ensemble-Urteil übernehmen (nur wenn sichtbar und eindeutig, nicht bei \textsf{uneinig}).\\
+\btn{Korrekt} & \taste{K} & Konzept, Status, Seite, Datum und Wert stimmen.\\
+\btn{Fehler …} & \taste{F} & Irgendetwas stimmt nicht. Öffnet den Dialog \textsf{Eintrag bewerten}; ebenso ein Doppelklick.\\
+\btn{Dublette} & \taste{D} & Zweiter Eintrag zum selben Befund mit gleicher Seite. Zählt nicht als Fehler.\\
+\btn{Unklar} & \taste{U} & Der Brief lässt keine Entscheidung zu. Ein Kommentar ist Pflicht.\\
+\btn{Zurücksetzen} & & Urteil zurücknehmen.\\
+\btn{Übrige korrekt} & & Alle noch nicht bewerteten Einträge als korrekt markieren (mit Rückfrage). Ist das Ensemble sichtbar, heißt der Knopf \btn{Übrige Ensemble-Urteile übernehmen}; Einträge ohne eindeutiges Urteil bleiben offen.\\
+\bottomrule
+\end{tabularx}
+
+Mit $\uparrow$ und $\downarrow$ wechseln Sie den Eintrag. Die Tasten wirken, solange die Eintragstabelle den Fokus hat.
+
+\subsection*{Der Dialog „Eintrag bewerten“}
+
+Jedes Merkmal wird getrennt bewertet. So lässt sich später berichten, ob der Code selbst oder nur ein Attribut falsch ist.
+
+\begin{tabularx}{\textwidth}{@{}P{2.6cm}P{5.0cm}L@{}}
+\toprule
+\textbf{Merkmal} & \textbf{Urteile} & \textbf{Erläuterung}\\
+\midrule
+Konzept & korrekt · zu allgemein · zu spezifisch · falsches Konzept · nicht im Brief · falscher Bezug & „Falscher Bezug“: betrifft nicht den Patienten (Familie, Spender). „Zu allgemein“: richtige Oberklasse, der Brief stützt einen genaueren Code.\\
+Status & korrekt · Verneinung falsch · Geplantes als erfolgt & Bezieht sich auf vorhanden/verneint. Verneinte Einträge sind in der Tabelle mit \textsf{[verneint]} markiert. „Verdacht als gesichert“ gibt es nicht mehr.\\
+Augenseite & korrekt · falsch · fehlt · überflüssig · nicht anwendbar & Daneben \feld{richtig}: RA, LA, beidseits oder keine Seite. Bitte immer angeben, wenn bekannt.\\
+Datum & dieselben Urteile & Daneben \feld{richtig}: Datum so genau wie im Brief (JJJJ, JJJJ-MM oder JJJJ-MM-TT).\\
+Messwert & korrekt · falsch · nicht anwendbar & Nur bei Messwerten; daneben der richtige Wert.\\
+Kommentar & frei & Kurz begründen, besonders bei Grenzfällen.\\
+\bottomrule
+\end{tabularx}
+
+\begin{hinweis}[Warum die richtige Angabe wichtig ist]
+Aus „Seite falsch, richtig: LA“ wird in der Referenz ein Eintrag mit LA. Fehlt die richtige Angabe, kann die Seite in späteren Regressionstests nicht geprüft werden.
+\end{hinweis}
+
+\paragraph{Berechnete Werte.} Das sphärische Äquivalent (LOINC 95327-3, 95328-1) wird aus Sphäre und Zylinder berechnet und steht nicht im Brief. Es erscheint nicht in Teil B, wird nicht bewertet und gehört nicht zur Referenz.
+
+\section{Fehlende Einträge}\label{sec:fehlend}
+
+Die untere Tabelle \textsf{Im Brief vorhanden, aber nicht extrahiert} enthält zwei Arten von Zeilen:
+
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[Vorschläge des Ensembles] mit Code, Seite, Datum, Wert und \feld{Stimmen} (zum Beispiel 2/3: zwei von drei Modellen haben den Vorschlag am Brieftext bestätigt). Der Beleg ist im Brief blau hinterlegt. \btn{Vorschlag übernehmen} macht ihn zu einem fehlenden Eintrag; \btn{Ablehnen} verwirft ihn. Auch ein bereits übernommener Vorschlag lässt sich mit \btn{Ablehnen} zurücknehmen. Beide Entscheidungen werden für die Studie ausgewertet.
+  \item[Eigene Ergänzungen] über \btn{Eigenen ergänzen …}.
+\end{description}
+
+\subsection*{Eigenen fehlenden Eintrag ergänzen}
+
+\begin{enumerate}
+  \item \feld{Art} (Domäne) und \feld{Bezeichnung} wie im Brief eintragen.
+  \item \btn{Code suchen} schlägt über die Mapping-Pipeline einen Code vor; die Bezeichnung aus der Terminologie kann übernommen werden. Alternativ den Code von Hand eintragen, etwa \code{ICD10:H18.5}.
+  \item Augenseite, Datum, Wert, Einheit und \feld{im Brief verneint} ergänzen.
+  \item \btn{Übernehmen}.
+\end{enumerate}
+
+Ohne Code fragt das System nach: Der Eintrag zählt dann in der Studie, aber nicht im Regressionstest. Versehentlich ergänzte Einträge mit \btn{Entfernen} streichen.
+
+\section{Brief abschließen}
+
+\btn{Brief abschließen} ist erst möglich, wenn alle Einträge ein Urteil haben und bei Studien jede Checklistenzeile abgeglichen ist. Ein abgeschlossener Brief lässt sich mit \btn{Wieder öffnen} erneut bearbeiten, solange die Referenz nicht eingefroren ist. \btn{Nächster offener Brief} springt zum nächsten Brief, den Sie noch nicht abgeschlossen haben.
+
+\section{Zweitblick bei Studien}\label{sec:zweitblick}
+
+Bei Studien bleibt das Ensemble während der eigenen Bewertung verborgen. Beim ersten Abschluss eines Briefs speichert das System Ihren Stand als \emph{Bewertung vor dem Zweitblick}. Gibt es Ensemble-Urteile, folgt die Frage:
+
+\begin{quote}\sffamily
+Zweitblick: Das KI-Ensemble hat diesen Brief ebenfalls bewertet.\\
+\btn{Ensemble einblenden}\quad\btn{Weiter zum nächsten Brief}
+\end{quote}
+
+Nach \btn{Ensemble einblenden} sehen Sie Urteile, Belege und Vorschläge und können Ihre Bewertung ändern. Änderungen werden als Endstand gespeichert; die Studie berichtet den Stand vor dem Zweitblick als Hauptergebnis und zusätzlich, was der Zweitblick geändert hat.
+
+\section{Bewertungsregeln (Kurzfassung)}\label{sec:regeln}
+
+\subsection*{Allgemeine Regeln}
+
+\begin{itemize}
+  \item \textbf{Anamnestische Angaben} („Z.\,n.“, „bekannte“, „seit“) gehören zum Brief. Ihr Datum muss der Genauigkeit im Brief entsprechen.
+  \item \textbf{Verneinte Befunde} („kein Anhalt für“, „keine“, „ausgeschlossen“) sind korrekt, wenn sie als verneint extrahiert sind; als vorhanden extrahiert ist das ein Statusfehler.
+  \item \textbf{Verdachtsdiagnosen} („V.\,a.“, „Verdacht auf“, „fraglich“, „DD“) werden als die Diagnose selbst kodiert, weil die Kodierung keinen Verdachtsstatus kennt. Das ist \emph{korrekt}, weder falsches Konzept noch Statusfehler.
+  \item \textbf{Geplante Maßnahmen} („geplant“, „empfohlen“, „Vorstellung zur“) als erfolgt extrahiert: Statusfehler „Geplantes als erfolgt“.
+  \item \textbf{Fremder Bezug}: Familienanamnese, Spenderangaben, andere Personen gehören nicht zum Patienten.
+  \item \textbf{Zitierte Vorbefunde} anderer Kliniken gehören zum Brief.
+  \item \textbf{Aktuelle Befunde ohne eigenes Datum} sind mit Brief- oder Untersuchungsdatum korrekt datiert; auch ganz ohne Datum gilt das Briefdatum implizit (Datum korrekt). „Datum fehlt“ nur, wenn der Brief ein eigenes, abweichendes Datum nennt. Ein anamnestisches Ereignis ohne Datum darf das Briefdatum \emph{nicht} tragen (Datum überflüssig).
+  \item \textbf{Messwertpaare} wie „Tensio 18/21 mmHg“ werden als RA/LA gelesen.
+  \item \textbf{Niedriger Visus} „HBW“, „FZ“, „LS“, „NL“ wird als Dezimalvisus nach Schulze-Bonsel kodiert (0{,}005; 0{,}013; 0{,}002; 0); das ist korrekt.
+  \item \textbf{Medikation}: Dosis und Frequenz werden nicht bewertet. Eine intravitreale Injektion (IVOM) ist als Medikament mit Seite und Datum gespeichert; ein zusätzlicher OPS-Eingriff 5-156.9 ist dann nicht „fehlend“.
+  \item \textbf{Im Zweifel} \btn{Unklar} mit Kommentar statt raten.
+\end{itemize}
+
+\subsection*{Regeln je Domäne}
+
+\begin{tabularx}{\textwidth}{@{}P{2.7cm}LL@{}}
+\toprule
+\textbf{Domäne} & \textbf{Korrekt, wenn} & \textbf{Häufige Fehler}\\
+\midrule
+Diagnose (ICD-10) & Code bezeichnet die genannte Krankheit; spezifischster Code, den der Brief stützt. Z-Codes für Zustände nach Eingriff sind zulässig; Z85--Z87 vergibt die Pipeline nicht. & Oberklasse statt Endcode.\\
+Befund (HPO) & Term trifft den Befund; bedeutungsgleicher Nachbarterm ist korrekt. Benannte Entzündungen dürfen zusätzlich als ICD-10 kodiert sein. & Sehr allgemeiner Term wie „Abnormality of the eye“.\\
+Eingriff (OPS) & Code entspricht dem durchgeführten Eingriff. & Geplanter Eingriff als erfolgt; Briefdatum statt OP-Datum.\\
+Medikation (ATC) & Wirkstoff stimmt; Kombinationspräparate als Kombinationscode oder Einzelwirkstoffe. & Präparat falsch aufgelöst; Seite fehlt bei „RA“, „LA“, „bds.“.\\
+Messwert (LOINC) & Messgröße, Zahl, Einheit, Operator und Auge stimmen; Visus dezimal. & Werte zwischen RA und LA vertauscht; Lochblende als Hauptvisus.\\
+\bottomrule
+\end{tabularx}
+
+\subsection*{Grenzfälle}
+
+\begin{longtable}{@{}P{4.0cm}P{3.6cm}P{3.0cm}P{3.6cm}@{}}
+\toprule
+\textbf{Brieftext} & \textbf{Extraktion} & \textbf{Urteil} & \textbf{Begründung}\\
+\midrule
+\endhead
+„Z.\,n.\ DMEK RA 03/2021“ & OPS 5-125.*, RA, 2021-03 & korrekt & Datum in der Genauigkeit des Briefs\\
+„Z.\,n.\ DMEK RA“ (ohne Datum) & OPS 5-125.*, RA, Briefdatum & Datum überflüssig & anamnestisch, kein Briefdatum\\
+„V.\,a.\ Transplantatabstoßung LA“ & T86.83, LA, vorhanden & korrekt & Verdacht wird als Diagnose kodiert\\
+„Kein Anhalt für Makulaödem“ & HPO Makulaödem, verneint & korrekt & Verneinung richtig\\
+„Visus RA 0,5 cc, LA FZ“ & RA 0,5; LA 0,013 & korrekt & FZ nach Schulze-Bonsel\\
+„Tensio 18/21 mmHg“ & RA 18, LA 21 & korrekt & Konvention RA/LA\\
+„Dexa-Gentamicin AT bds.“ & ATC S01CA01, beidseits & korrekt & Kombinationscode zulässig\\
+„Fuchs-Endotheldystrophie“ & ICD-10 H18 & Konzept zu allgemein & Brief stützt H18.5\\
+„Pseudophakie RA, LA phak“ & Z96.1, beidseits & Seite falsch, richtig RA & nur RA pseudophak\\
+„DMEK RA geplant 11/2026“ & OPS 5-125.*, erfolgt & Status: Geplantes als erfolgt & noch nicht durchgeführt\\
+„Mutter mit Glaukom“ & ICD-10 H40, vorhanden & Konzept: falscher Bezug & Familienanamnese\\
+„Refraktion RA $-$2,0 / $-$1,0 / 90\textdegree“ & sph.\ Äquivalent $-$2,5 & (nicht angezeigt) & berechneter Wert\\
+\bottomrule
+\end{longtable}
+
+\section{Häufige Fragen}
+
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[Ein Eintrag hat einen richtigen Code, aber die falsche Seite. Ist das „Korrekt“ oder „Fehler“?]
+  \btn{Fehler …}, Konzept \emph{korrekt}, Augenseite \emph{falsch}, richtige Seite angeben.
+  \item[Derselbe Befund ist zweimal extrahiert.]
+  Den ersten bewerten, den zweiten als \btn{Dublette}.
+  \item[Das Ensemble sagt „Fehler“, ich sehe keinen.]
+  Ihr Urteil zählt. \btn{Korrekt} drücken. Die Spalte \feld{Ensemble} nennt das gemeldete Problem und die Stimmen; der Beleg ist im Brief hinterlegt.
+  \item[\taste{Enter} tut nichts.]
+  Für diesen Eintrag gibt es kein Ensemble-Urteil oder die Modelle sind uneinig. Selbst bewerten.
+  \item[Ich habe mich verklickt.]
+  Eintrag markieren und neu bewerten oder \btn{Zurücksetzen}. Ergänzte Einträge mit \btn{Entfernen}, übernommene Vorschläge mit \btn{Ablehnen} streichen.
+  \item[Die Knöpfe reagieren nicht mehr.]
+  Wahrscheinlich ist die Referenz eingefroren; dann sind keine Änderungen mehr möglich, die Meldung sagt das. Oder der Datensatz wird gerade vorbereitet.
+\end{description}
+
+% =====================================================================
+\chapter{Arbeiten mit dem KI-Ensemble}\label{kap:ensemble}
+% =====================================================================
+
+\section{Was das Ensemble tut}
+
+Mehrere lokale Sprachmodelle (die Briefe bleiben im Haus) bewerten einen Datensatz vor. Für jeden Brief und jedes Modell:
+
+\begin{enumerate}
+  \item \textbf{Judge-Urteil}: jeder Eintrag nach den Regeln des Bewertungshandbuchs, mit wörtlichem Zitat und kurzer Begründung, dazu fehlende Einträge. Ein vorhandenes fehlerfreies Urteil desselben Modells wird wiederverwendet.
+  \item \textbf{Recall-Durchgang}: der Brief abschnittsweise (Standard 1800 Zeichen), Satz für Satz auf Fehlendes durchsucht.
+  \item \textbf{Pipeline-Läufe}: die Extraktionen der letzten abgeschlossenen Neu-Extraktions-Läufe je Modell dieses Datensatzes als weitere Kandidatenquelle.
+\end{enumerate}
+
+Alle Kandidaten für fehlende Einträge werden über die Mapping-Pipeline kodiert, gruppiert, gegen Vorhandenes abgeglichen (auch über Codesysteme hinweg, etwa ICD-10 und HPO mit gleicher Bezeichnung) und auf höchstens 40 je Brief begrenzt. Dann prüft jedes Modell jeden Kandidaten am Brieftext. Ein Vorschlag erscheint nur, wenn
+
+\begin{itemize}
+  \item sein Zitat Zeichen für Zeichen im Brief steht (Leerraum, Groß-/Kleinschreibung und Anführungszeichen tolerant),
+  \item mindestens zwei Modelle ihn bestätigen (bei nur einem Modell: dieses eine),
+  \item er einen Code hat, kein Normalbefund und keine nicht kodierbare Angabe ist, kein Oberbegriff der HPO-Wurzel ist und Messwerte einen Wert und einen von der Pipeline verwendeten LOINC-Code haben.
+\end{itemize}
+
+Das Urteil je Eintrag ist die Mehrheit der Modelle; bei Gleichstand \textsf{uneinig}. Bekannte Fehlalarme werden neutralisiert: fehlendes Datum, wenn das richtige Datum nur das Briefdatum ist; berechnetes sphärisches Äquivalent; Visus HBW/FZ/LS/NL als Dezimalwert; Verdachtsdiagnosen; verneinte Einträge, die ein Modell als „nicht im Brief“ meldet, obwohl der Brief sie verneint.
+
+\section{Starten und beenden}
+
+\begin{enumerate}
+  \item Im Reiter \reiter{Referenz \& Regression} \btn{Ensemble starten …}. Die Rückfrage nennt die Modelle und die nötige Zahl bestätigender Modelle.
+  \item Fortschritt im Statusfeld und im Panel \textsf{Hintergrundprozesse}, etwa „KI-Ensemble: läuft, 38\,\% – Brief 20 von 50, Recall glm-53, Abschnitt 2/4 (41\,s)“. Ein Brief dauert einige Minuten.
+  \item Danach zeigt das Statusfeld die Zahl der Vorschläge für fehlende Einträge und der Fehlerhinweise.
+\end{enumerate}
+
+\btn{Ensemble beenden} stoppt nach dem Brief, der gerade bearbeitet wird; wartende Jobs werden entfernt, Jobs ohne lebenden Worker sofort als fehlgeschlagen markiert. Bisherige Ergebnisse bleiben. Ein neuer Start ersetzt die Vorschläge, verwendet aber vorhandene Judge-Urteile wieder. Pro Datensatz läuft höchstens ein Ensemble.
+
+\begin{hinweis}[Vorschläge nach neuen Läufen auffrischen]
+Weil Pipeline-Läufe eine Kandidatenquelle sind, lohnt ein erneuter Start, nachdem neue Läufe mit anderen Modellen fertig sind.
+\end{hinweis}
+
+\section{Schnellprüfung (Regressions-Datensätze)}
+
+Bei Regressions-Datensätzen sind Ensemble-Urteile, Belege und Vorschläge sofort sichtbar. Die Spalte \feld{Ensemble} zeigt „korrekt“, „uneinig (1:1)“ oder ein Fehlerzeichen mit dem Problem, zum Beispiel „Seite falsch (richtig: L)“, jeweils mit den Stimmen. Arbeitsweise:
+
+\begin{enumerate}
+  \item Eintrag ansehen, Beleg im Brief prüfen (gelb hinterlegt).
+  \item Stimmt das Ensemble: \taste{Enter}. Sonst \taste{K}, \taste{F}, \taste{D} oder \taste{U}.
+  \item Vorschläge für fehlende Einträge übernehmen oder ablehnen.
+  \item Wer sich sicher ist: \btn{Übrige Ensemble-Urteile übernehmen}.
+\end{enumerate}
+
+\begin{achtung}[Bewusst verzerrt]
+Die Schnellprüfung beeinflusst das Urteil. Sie ist für Referenzen von Regressionstests gedacht, wo es auf Tempo und Stabilität ankommt, nicht für publizierbare Kennzahlen. Dafür gibt es den Studien-Datensatz mit Zweitblick.
+\end{achtung}
+
+\section{Zweitblick (Studien)}
+
+Bei Studien bleibt das Ensemble verborgen, bis Sie einen Brief abgeschlossen haben (Abschnitt~\ref{sec:zweitblick}). Die Studie misst zusätzlich, wie gut das Ensemble im Vergleich zu den Ärzten ist (Abschnitt~\ref{sec:studienkennzahlen}).
+
+\section{Methodische Einordnung}
+
+\begin{itemize}
+  \item Es gibt keine eigenständige KI-Referenz. Referenzen entstehen aus ärztlichen Bewertungen, aus einem Pipeline-Lauf oder aus synthetischen Zielphenopackets.
+  \item Ein Modell, das auch die Pipeline antreibt, übersieht eher die eigenen Fehler. Für das Ensemble mindestens eine andere Modellfamilie einbinden.
+  \item In einer Publikation ist das Ensemble kein Goldstandard, sondern ein weiterer Bewerter, dessen Übereinstimmung mit den Ärzten berichtet wird.
+\end{itemize}
+
+% =====================================================================
+\chapter{Doppelprüfung, Konsens und Referenz}\label{kap:konsens}
+% =====================================================================
+
+\section{Wie das System die Bewertungen eines Briefs zusammenführt}
+
+\begin{enumerate}
+  \item Hat der Prüfer \textsf{Konsens} den Brief abgeschlossen, gilt sein Urteil.
+  \item Sonst: Ist der Brief einfach zu prüfen und von einem Prüfer abgeschlossen, gilt dessen Urteil.
+  \item Ist der Brief doppelt zu prüfen, braucht es zwei abgeschlossene Prüfungen. Stimmen beide in allen Einträgen (Urteil, Konzept, Status, Seite, Datum, Wert samt richtigen Angaben) und in den ergänzten fehlenden Einträgen überein, gilt das gemeinsame Urteil.
+  \item Weichen sie ab, ist der Brief eine \emph{Abweichung} und braucht den Konsens.
+\end{enumerate}
+
+\section{Konsens}\label{sec:konsens}
+
+\begin{enumerate}
+  \item Im Reiter \reiter{Referenz \& Regression} \btn{Stand aktualisieren}: Das Statusfeld nennt unvollständige Briefe, Abweichungen zwischen Prüfern und die Zahl abgeschlossener Briefe je Prüfer.
+  \item Im Feld \feld{Prüfer} den Namen \code{Konsens} eintragen (genau so geschrieben).
+  \item Im Reiter \reiter{Prüfen} erscheint die Spalte \feld{Andere Prüfer} mit den Urteilen aller Prüfer. Der Konsens sieht die Extraktion auch bei Studien sofort.
+  \item Jeden betroffenen Brief gemeinsam vollständig bewerten und abschließen.
+\end{enumerate}
+
+Die ursprünglichen Einzelurteile bleiben gespeichert und gehen in die Übereinstimmungsanalyse ($\kappa$) ein.
+
+\section{Wie aus den Bewertungen die Referenz wird}
+
+\begin{tabularx}{\textwidth}{@{}P{5.2cm}L@{}}
+\toprule
+\textbf{Urteil} & \textbf{Folge für die Referenz}\\
+\midrule
+korrekt & Eintrag wird übernommen.\\
+Seite, Datum oder Wert falsch/fehlend & Eintrag mit der richtigen Angabe; ohne richtige Angabe wird dieses Attribut nicht geprüft.\\
+überflüssige Seite oder Datum & Eintrag ohne diese Angabe; eine spätere Angabe gilt als Fehler.\\
+Verneinung falsch & Status umgedreht übernommen.\\
+Geplantes als erfolgt & Eintrag gehört nicht in die Referenz.\\
+falsches Konzept, nicht im Brief, falscher Bezug & Eintrag gehört nicht in die Referenz.\\
+zu allgemein, zu spezifisch, Dublette, unklar & \emph{toleriert}: zählt später weder als Treffer noch als Fehler.\\
+ergänzter fehlender Eintrag mit Code & Wird in die Referenz aufgenommen (auch übernommene Ensemble-Vorschläge).\\
+eingestreuter Fehler & Der Originaleintrag gilt.\\
+berechneter Wert (sph.\ Äquivalent) & Gehört nie zur Referenz.\\
+\bottomrule
+\end{tabularx}
+
+\section{Quellen der Referenz}\label{sec:quellen}
+
+\begin{tabularx}{\textwidth}{@{}P{3.4cm}P{4.6cm}L@{}}
+\toprule
+\textbf{Quelle} & \textbf{Entsteht durch} & \textbf{Geeignet für}\\
+\midrule
+Ärzte & \btn{Referenz einfrieren …} nach vollständiger Prüfung & Studie und Regression; Goldstandard.\\
+Pipeline-Lauf & \btn{Lauf als Referenz einfrieren …} auf einem fertigen Lauf mit Neu-Extraktion & Regression: misst Veränderung gegenüber einem Pipeline-Stand, nicht Richtigkeit.\\
+Synthetisch & automatisch nach dem Batch (Kapitel~\ref{kap:synth}) & Regression mit großem Umfang; Referenz kennt den „wahren“ Inhalt.\\
+Abweichungsprüfung & korrigierte Kopie nach Abschnitt~\ref{sec:abweichung} & Regression, wenn die Ausgangsreferenz Fehler hat.\\
+\bottomrule
+\end{tabularx}
+
+Alte Datensätze können noch eine KI-Judge-Referenz tragen (\code{judge:...}); neue lassen sich so nicht mehr einfrieren.
+
+\section{Einfrieren und Auftauen}
+
+\btn{Referenz einfrieren …} übernimmt die zusammengeführten Bewertungen als Referenz. Es klappt nur, wenn alle Briefe abgeschlossen und alle Abweichungen geklärt sind; sonst nennt die Meldung die offenen Briefe. Danach sind die Bewertungen unveränderlich.
+
+\btn{Lauf als Referenz einfrieren …} nimmt stattdessen die Extraktionen eines fertigen Laufs mit Neu-Extraktion. Hat der Datensatz schon eine Referenz, geht das nicht; dann den Datensatz kopieren und in der Kopie einen Lauf starten.
+
+\btn{Referenz auftauen …} macht die Referenz wieder änderbar, geht aber nur bei entsperrtem Datensatz. Bereits gelaufene Regressionsläufe beziehen sich dann auf die alte Referenz; nach erneutem Einfrieren einen neuen Basis-Lauf anlegen oder die Läufe neu bewerten (Abschnitt~\ref{sec:laufaktionen}).
+
+\section{Zwei Referenzen vergleichen}\label{sec:refvergleich}
+
+\btn{Referenz vergleichen mit …} stellt die Referenz des aktuellen Datensatzes der Referenz eines anderen gegenüber. Angeboten werden alle Datensätze mit eingefrorener Referenz und gemeinsamen Briefen (gleicher Brieftext), typischerweise eine Kopie. Das Ergebnisfenster zeigt Precision, Recall und F1 der zweiten Referenz gegen die erste, je Domäne, und die Briefe mit den meisten Abweichungen: nur in A, nur in B, hierarchisch verwandt, Attributunterschiede. \btn{Abweichungen als CSV} lädt alles herunter.
+
+Typische Fragen: Wie weit liegt die Pipeline-Referenz eines Modells von der ärztlichen Referenz entfernt? Wie stark unterscheiden sich zwei Modelle?
+% =====================================================================
+\part{Auswertung}
+% =====================================================================
+
+% =====================================================================
+\chapter{Regressionstests}\label{kap:regression}
+% =====================================================================
+
+\section{Zwei Arten von Läufen}
+
+\begin{tabularx}{\textwidth}{@{}P{5.0cm}L@{}}
+\toprule
+\textbf{Knopf} & \textbf{Was passiert}\\
+\midrule
+\btn{Lauf starten (neu extrahieren) …} & Alle Briefe gehen mit dem aktuellen Stand erneut durch die Pipeline; die Ergebnisse werden mit der Referenz verglichen. Modell und Deep Mode kommen aus der Auswahl \textsf{LLM Model} und dem Schalter \textsf{Deep Mode} im Hauptfenster und werden im Pipeline-Stand vermerkt. Der Bestand wird nicht verändert.\\
+\btn{Gespeicherte Phenopackets prüfen} & Vergleicht die im Bestand gespeicherten Phenopackets mit der Referenz, ohne neu zu extrahieren. Schnell; zeigt, wie gut der aktuelle Bestand ist. Briefe, deren Text sich im Bestand geändert hat oder die gelöscht wurden, erscheinen als Fehler. Braucht eine eingefrorene Referenz; nicht bei synthetischen Datensätzen.\\
+\bottomrule
+\end{tabularx}
+
+Beim Start fragt das Fenster nach einer Bezeichnung, etwa „gpt-oss-120b Lauf 1“ oder „Bestand vor Neu-Extraktion“. Läufe werden als Minion-Jobs der Queue \queue{validation} ausgeführt.
+
+\paragraph{Lauf ohne Referenz.} Hat der Datensatz noch keine Referenz, speichert ein Lauf mit Neu-Extraktion nur die Extraktionen. Er kann danach als Pipeline-Referenz eingefroren werden (\btn{Lauf als Referenz einfrieren …}).
+
+\paragraph{Parallele Läufe.} Läufe eines Datensatzes sperren sich nicht gegenseitig. Wie viele gleichzeitig laufen, bestimmt die Zahl der Jobs des Validierungs-Workers (\code{-j}, Abschnitt~\ref{sec:jobs}). Läufe mit Modellen auf getrennter Infrastruktur (etwa vLLM auf GPU-Servern und MLX auf einem Mac Studio) bremsen sich nicht gegenseitig.
+
+\section{Einrichten: Basis und Grundrauschen}
+
+\begin{enumerate}
+  \item \btn{Lauf starten (neu extrahieren) …} mit einer Bezeichnung wie „Basis November 2026“.
+  \item Nach Abschluss den Lauf in der Tabelle markieren und \btn{Als Basis festlegen}.
+  \item Ohne Änderung an der Pipeline einen zweiten Lauf starten. Die Spalte \feld{$\Delta$F1 zur Basis} zeigt das Grundrauschen, denn ein Sprachmodell liefert nicht bei jedem Lauf exakt dasselbe.
+  \item Liegt das Rauschen über 2 Prozentpunkten, in der \code{.env} eine größere Toleranz setzen, etwa \code{ONTOTRIAL_REGRESSION_TOLERANCE=0.03}, und Hypnotoad sowie den Validierungs-Worker neu starten.
+\end{enumerate}
+
+\begin{tipp}[Basis immer neu extrahieren]
+Die gespeicherten Phenopackets können aus älteren Pipeline-Ständen stammen. Spätere Läufe extrahieren neu; die Basis sollte das deshalb auch tun, mit demselben Modell und Modus.
+\end{tipp}
+
+\section{Im Alltag}
+
+Nach jeder Änderung an Prompts, Intercepts, Filterregeln, Katalogen, Modell oder Code einen Lauf mit Neu-Extraktion starten und die Spalte \feld{Ergebnis} lesen:
+
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[\textsf{ok}] Keine Domäne und nicht der Gesamtwert hat sich über die Toleranz hinaus verschlechtert.
+  \item[\textsf{Regression}] In mindestens einer Domäne oder insgesamt ist F1 stärker gefallen als die Toleranz. Der Detailbereich nennt die Domänen und listet je Brief, welche Einträge \emph{verloren} gingen, welche \emph{neu falsch} dazukamen und wie viele \emph{neu richtig} sind.
+\end{description}
+
+\begin{achtung}[Basis mit anderer Referenz]
+Wurde die Referenz nach dem Basis-Lauf aufgetaut und neu eingefroren, warnt der Detailbereich („ACHTUNG Basis-Lauf …“): Der Vergleich mischt zwei Referenzen. Neuen Basis-Lauf anlegen oder die Basis neu bewerten.
+\end{achtung}
+
+\section{Die Tabelle der Läufe}
+
+\begin{tabularx}{\textwidth}{@{}P{3.6cm}L@{}}
+\toprule
+\textbf{Spalte} & \textbf{Inhalt}\\
+\midrule
+Lauf, Gestartet & Nummer und tatsächlicher Start (nicht der Zeitpunkt des Einreihens).\\
+Quelle & neu extrahiert (mit „Deep“ im Deep Mode) oder Bestand.\\
+Status & wartet, läuft (mit Prozent), fertig, abgebrochen.\\
+F1, Precision, Recall & Gesamtwerte gegen die Referenz.\\
+$\Delta$F1 zur Basis, Ergebnis & Veränderung und Urteil \textsf{ok}/\textsf{Regression}; die Basis selbst ist markiert.\\
+Modell & Extraktionsmodell aus dem Pipeline-Stand.\\
+Laufzeit, s/Brief (Median) & Dauer des Laufs und mittlere Extraktionszeit je Brief.\\
+Referenz & Quelle und Zeitpunkt der Referenz, gegen die verglichen wurde.\\
+Pipeline-Stand & Kurzform des Fingerabdrucks (Abschnitt~\ref{sec:pipelinestand}).\\
+Bezeichnung & Ihre Bezeichnung beim Start.\\
+\bottomrule
+\end{tabularx}
+
+Der Detailbereich darunter zeigt für den markierten Lauf die Kennzahlen je Domäne, die Attributgenauigkeit, den Vergleich mit der Basis und die Briefe mit Fehlern. \btn{Bericht als CSV} liefert jeden Unterschied Brief für Brief: fehlt, zusätzlich, verwandt, Attributfehler, Pipeline-Fehler.
+
+\section{Abbrechen, fortsetzen, neu bewerten, löschen}\label{sec:laufaktionen}
+
+\btn{Lauf abbrechen / bewerten …} bietet je nach Status des markierten Laufs:
+
+\begin{tabularx}{\textwidth}{@{}P{3.4cm}P{3.6cm}L@{}}
+\toprule
+\textbf{Status} & \textbf{Angebot} & \textbf{Wirkung}\\
+\midrule
+wartet, läuft & \btn{Lauf abbrechen} & Wartender Job wird aus der Queue entfernt; ein laufender hört nach dem aktuellen Brief auf.\\
+fertig & \btn{Neu bewerten} & Gleicht die gespeicherten Extraktionen mit der aktuellen Vergleichslogik und der aktuellen Referenz neu ab, ohne neu zu extrahieren; aktualisiert auch den Vergleich mit der Basis.\\
+fertig & \btn{Lauf löschen …} & Entfernt Ergebnisse und Extraktionen; die Referenz bleibt. War er die Basis, hat der Datensatz danach keine.\\
+abgebrochen, hängend & \btn{Lauf fortsetzen} & Extrahiert nur die Briefe ohne Ergebnis, mit demselben Modell und Modus; die ursprüngliche Startzeit bleibt. Lehnt ab, solange noch ein Job dieses Laufs aktiv ist.\\
+abgebrochen, hängend & \btn{Lauf löschen …} & wie oben.\\
+\bottomrule
+\end{tabularx}
+
+\begin{hinweis}[Hängender Lauf]
+Steht ein Lauf auf „läuft“, ohne Fortschritt, wurde meist der Worker neu gestartet. Ist der Job noch als aktiv eingetragen, verweigert \btn{Lauf fortsetzen} mit dem Hinweis auf den Befehl, der ihn beendet:\\
+\code{perl backend.pl minion job -b kill -a '["TERM", <job-id>]'}\\
+Danach fortsetzen (Kapitel~\ref{kap:minionadmin}).
+\end{hinweis}
+
+\section{Die Kennzahlen}
+
+Für jeden Brief werden Referenz und Extraktion je Domäne abgeglichen; berechnete Werte bleiben auf beiden Seiten außen vor.
+
+\begin{enumerate}
+  \item \textbf{Treffer (TP)}: gleicher Code. Bei mehreren Kandidaten wird der mit passendem Status, passender Seite, passendem Datum und Wert bevorzugt.
+  \item \textbf{Verwandt}: kein gleicher Code, aber hierarchisch verwandt (HPO über die \code{isas}-Hierarchie, sonst Präfix des Codes ab 3 Zeichen; nicht bei Messwerten). Zählt nur in der toleranten Wertung als Treffer.
+  \item \textbf{Fehlend (FN)}: Referenzeintrag ohne Gegenstück.
+  \item \textbf{Zusätzlich (FP)}: extrahierter Eintrag ohne Gegenstück. Treffer auf tolerierte Referenzeinträge (Dublette, unklar, zu allgemein, zu spezifisch) zählen weder als FP noch als TP.
+\end{enumerate}
+
+\begin{tabularx}{\textwidth}{@{}P{4.0cm}L@{}}
+\toprule
+\textbf{Kennzahl} & \textbf{Definition}\\
+\midrule
+Precision & TP / (TP + FP + verwandt)\\
+Recall & TP / (TP + FN + verwandt)\\
+F1 & 2\,TP / (2\,TP + FP + FN + 2\,verwandt); „tol.“-Varianten werten Verwandte als Treffer\\
+Seite, Datum, Status, Wert & Anteil korrekter Attribute unter den Treffern, bei denen die Referenz das Attribut prüfbar festlegt. Datum gilt als korrekt, wenn eines das andere als Präfix enthält (2021-03 und 2021-03-15); bei einer Referenz ohne Datum („überflüssig“) nur, wenn auch die Extraktion keins hat. Messwerte werden numerisch verglichen, qualitative Werte als Text.\\
+\bottomrule
+\end{tabularx}
+
+\section{Pipeline-Stand}\label{sec:pipelinestand}
+
+Jeder Lauf speichert einen Fingerabdruck: MD5 von \code{backend.pl}, Git-Stand (falls vorhanden), Modell, Deep Mode, Prüfsummen der Tabellen \code{llm_prompts} (ohne die Prompts des synthetischen Generators), \code{ontology_intercepts}, \code{filter_rules} und \code{catalog_versions}, die Mapping-Schalter aus der Umgebung (\code{ONTOTRIAL_RERANK...}, \code{..._OCULAR...}, \code{..._ICD...}, \code{..._LABEL...}, \code{..._BLOCK...}, \code{..._INTERCEPT...}, \code{..._PARENT...}, \code{..._GROUND...}, \code{..._TRANSLATION...}) sowie die Referenz. Zwei Läufe mit gleichem Fingerabdruck liefen mit derselben Pipeline.
+
+\section{Abweichungsprüfung}\label{sec:abweichung}
+
+Gedacht für Referenzen, die selbst Fehler haben können, vor allem synthetische. Für jeden Brief eines fertigen Laufs mit Abweichungen (fehlend, zusätzlich, abweichende Seite, Datum, Status oder Wert) fragen lokale Modelle in einem kurzen Aufruf, was im Brief steht, mit wörtlichem Beleg. Je Abweichung entscheidet die Mehrheit:
+
+\begin{itemize}
+  \item \emph{reference\_wrong}: Die Referenz irrt (Eintrag steht nicht im Brief, zusätzlicher Eintrag steht doch drin, Attribut der Extraktion stimmt).
+  \item \emph{extraction\_wrong}: Die Extraktion irrt.
+  \item \emph{unclear}: keine Mehrheit.
+\end{itemize}
+
+Ist der letzte Teil-Job fertig, entsteht automatisch ein neuer, eingefrorener Datensatz „\textit{Name} (korrigiert nach Lauf \textit{N})“ mit korrigierter Referenz und dem neu bewerteten Lauf. Original-Datensatz und -Lauf bleiben unverändert. Die Prüfung hat (noch) keinen Knopf; sie wird über die API gestartet:
+
+\begin{befehl}
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"models":["gpt-oss-120b","qwen38-27b","glm-53"],"min_votes":2,"shards":4}' \
+  http://localhost:4007/BBB/validation/runs/<lauf>/discrepancy_check
+curl http://localhost:4007/BBB/validation/runs/<lauf>/discrepancy_check
+\end{befehl}
+
+Ohne Angaben gelten die Modelle aus \code{ONTOTRIAL_DISC_MODELS}, Mehrheit 2 (bei mindestens drei Modellen) und 4 Teil-Jobs (\code{shards}, höchstens 16), die parallel in der Queue \queue{validation} laufen. Die Abfrage zeigt geprüfte Briefe, offene Teil-Jobs, Entscheidungen je Art und die korrigierte Kopie.
+
+% =====================================================================
+\chapter{Validierungsstudie}\label{kap:studie}
+% =====================================================================
+
+\section{Empfohlener Ablauf}
+
+\begin{enumerate}
+  \item Version der Pipeline festlegen (Modell, Prompts, Kataloge) und nicht mehr ändern.
+  \item Pilotrunde mit etwa 15 Briefen in einem eigenen Studien-Datensatz; Abweichungen besprechen und als Regeln festhalten.
+  \item Studien-Datensatz ziehen (Standard 150 Briefe, 30\,\% doppelt, 8\,\% eingestreute Fehler, mit Neu-Extraktion).
+  \item Optional KI-Ensemble starten, damit der Zweitblick zur Verfügung steht. Es bleibt bis zum eigenen Abschluss jedes Briefs verborgen.
+  \item Prüfung durch die Ärzte, höchstens etwa 20 Briefe je Sitzung.
+  \item Konsens für alle Abweichungen.
+  \item Referenz einfrieren.
+  \item \btn{Kennzahlen berechnen} im Reiter \reiter{Studie}; \btn{Bewertungen als CSV} für die eigene Statistik.
+\end{enumerate}
+
+\section{Die Kennzahlen im Reiter Studie}\label{sec:studienkennzahlen}
+
+Hauptergebnis sind die Bewertungen \emph{vor} dem Zweitblick.
+
+\begin{longtable}{@{}P{4.2cm}p{10.4cm}@{}}
+\toprule
+\textbf{Kennzahl} & \textbf{Berechnung}\\
+\midrule
+\endhead
+Precision streng & Anteil der Einträge mit Konzept korrekt an allen bewerteten Einträgen (ohne Dubletten, unklare, eingestreute und berechnete).\\
+Precision tolerant & wie oben, „zu allgemein“ zählt als korrekt.\\
+Seite, Datum, Status, Wert & Anteil korrekter Attribute unter den Einträgen mit korrektem Konzept; „nicht anwendbar“ zählt nicht mit.\\
+Konzeptfehler & Anzahlen je Fehlertyp, dazu Dubletten und nicht beurteilbare Einträge.\\
+Recall (Checkliste) & Anteil der Checklistenzeilen mit Abgleich „gefunden“ oder „Attributfehler“; „ohne Attributfehler“ nur „gefunden“. Je Kategorie und gesamt.\\
+Übereinstimmung & Cohens $\kappa$ und prozentuale Übereinstimmung der beiden Erstprüfer auf doppelt geprüften Briefen, für „korrekt ja/nein“, Konzept, Status, Seite und Datum.\\
+Wachsamkeit & Anteil erkannter eingestreuter Fehler je Fehlertyp (Seite vertauscht, Datum verschoben, Eintrag entfernt).\\
+Ensemble-Modell vs.\ Ärzte & je Modell: Sensitivität für ärztlich gefundene Fehler, Spezifität, Vierfeldertafel, $\kappa$ je Merkmal, Übereinstimmung bei fehlenden Einträgen, Erkennung eingestreuter Fehler.\\
+Modelle untereinander & $\kappa$ der ersten beiden Ensemble-Modelle.\\
+Zweitblick & Precision und Attributgenauigkeit nach dem Zweitblick im Vergleich zu vorher; entschiedene Hinweise, übernommen (Fehlerhinweise, fehlende Einträge), abgelehnt, Vorschläge insgesamt.\\
+\bottomrule
+\end{longtable}
+
+Konfidenzintervalle (95\,\%) stammen aus einem Cluster-Bootstrap über Briefe mit 2000 Ziehungen und festem Startwert, weil Einträge eines Briefs nicht unabhängig sind. Briefe, die unvollständig sind oder eine offene Abweichung haben, gehen nicht ein; ihre Zahl wird angegeben. Die Berechnung kann bei großen Datensätzen eine Minute dauern.
+
+\section{Rohdaten für die Statistik}
+
+\btn{Bewertungen als CSV} liefert eine Zeile je Urteil (Semikolon-getrennt, UTF-8) mit den Spalten \code{set}, \code{position}, \code{item_id}, \code{pseudonym}, \code{stratum}, \code{double_review}, \code{reviewer}, \code{phase} (\code{vor_zweitblick} oder \code{final}), \code{row_type} (\code{eintrag}, \code{ergaenzt}, \code{ergaenzt_geloescht}, \code{checkliste}, \code{ki_entscheidung}), Eintrag (Domäne, Code, Bezeichnung, Seite, Datum, verneint, Wert, eingestreuter Fehler), allen Urteilsfeldern mit richtigen Angaben und Kommentar sowie Kategorie und Abgleich der Checkliste. Damit lassen sich alle Kennzahlen in R nachrechnen.
+
+\begin{hinweis}[Berichten]
+Für Arbeiten mit Sprachmodellen empfiehlt sich die Darstellung nach TRIPOD-LLM. Pipeline-Stand, Modellversionen, Ensemble-Modelle und Prompt-Versionen (\code{validation_judge}, \code{validation_recall}, \code{validation_verify}) sind im System gespeichert und gehören ins Supplement. Den Zweitblick als eigene Analyse berichten, nicht als Hauptergebnis.
+\end{hinweis}
+
+% =====================================================================
+\chapter{Chart-Review}\label{kap:chartreview}
+% =====================================================================
+
+\section{Zweck}
+
+Retrospektive Studien brauchen oft eine ärztliche Beurteilung einzelner Fälle anhand der Briefe, zum Beispiel „primäres oder sekundäres Transplantatversagen?“. Der Chart-Review nimmt eine Fall-Liste als CSV (etwa die Arbeitsliste, die das R-Skript einer Studie schreibt), zeigt je Fall alle Briefe des Patienten mit markiertem Zeitfenster und gibt die Urteile je Prüfer als CSV zurück.
+
+Nichts wird neu extrahiert: Gezeigt werden die gespeicherten Briefe und, für den gewählten Brief, die gespeicherten Phenopacket-Einträge, also genau der Stand, mit dem die Studienauswertung gerechnet hat.
+
+\section{Liste hochladen}
+
+Im Validierungsfenster \btn{Chart-Review …}, dann \btn{Liste hochladen …}:
+
+\begin{tabularx}{\textwidth}{@{}P{4.4cm}L@{}}
+\toprule
+\textbf{Feld} & \textbf{Bedeutung}\\
+\midrule
+\feld{Name} & Eindeutiger Name der Liste.\\
+\btn{CSV wählen …} & Datei mit Kopfzeile; Komma, Semikolon oder Tab werden erkannt, UTF-8 oder Windows-1252. Höchstens 5000 Fälle.\\
+\feld{Spalte Patienten-ID} & Pflicht. Wird mit dem Pseudonym (PIZ) der Briefe abgeglichen; Excel-Artefakte wie „10103690.0“ und führende Nullen werden normalisiert.\\
+\feld{Spalte Auge} & Optional; RA/R/OD/rechts, LA/L/OS/links, BA/bds./OU.\\
+\feld{Zeitfenster: Beginn / Ende} & Optional je eine Datumsspalte (JJJJ-MM-TT oder TT.MM.JJJJ) mit Tagen davor (Vorschlag 365) und danach (Vorschlag 30). Fenster = [Beginn $-$ davor, Ende $+$ danach]; fehlt eine Spalte, gilt die andere.\\
+\feld{Stichprobe} & alle Fälle, $n$ zufällige Fälle oder $n$ Fälle je Wert einer Gruppenspalte (etwa Versagen/Kontrolle); reproduzierbar über den Seed.\\
+\feld{Urteilscodes} & Je Zeile „P = primäres Transplantatversagen“; „K = … / F = …“ in einer Zeile geht auch. Ohne Codes gibt es nur Kommentare.\\
+\bottomrule
+\end{tabularx}
+
+Die Meldung danach nennt die Zahl der Fälle, wie viele davon Briefe im Bestand haben, Fälle ohne Patienten-ID und die erkannten Codes.
+
+\section{Fälle beurteilen}
+
+\begin{enumerate}
+  \item Oben \feld{Prüfer} eintragen (eigenes Feld, unabhängig vom Validierungsfenster) und die Liste wählen.
+  \item Links die Fälle mit PIZ, Auge, Ihrem Urteil und Stand. Ein Klick öffnet den Fall.
+  \item Oben die CSV-Spalten des Falls und das Zeitfenster; daneben die Briefe des Patienten mit Datum, Quelle, Länge, „im Zeitfenster“ und Zahl der Phenopacket-Einträge. Der erste Brief im Fenster wird gezeigt.
+  \item Brieftext mit Suche (\feld{Im Brief suchen …}); darunter die gespeicherten Phenopacket-Einträge des Briefs. Ein Klick auf einen Eintrag sucht seine Bezeichnung im Brief.
+  \item \feld{Urteil} aus den Codes wählen, \feld{Kommentar} schreiben. \btn{Speichern} sichert zwischendurch, \btn{Fall abschließen, nächster} markiert den Fall als fertig. \btn{Wieder öffnen} hebt das auf.
+  \item Der Bereich \textsf{Urteile der Prüfer und Legende} zeigt die Urteile aller Prüfer zu diesem Fall.
+\end{enumerate}
+
+\section{Ergebnis}
+
+\btn{Ergebnis herunterladen} liefert die hochgeladene CSV (mit demselben Trennzeichen, UTF-8 mit BOM für Excel) mit vorangestellter Spalte \code{zeile_original} (Zeilennummer in der Originaldatei) und je Prüfer den Spalten \code{urteil_<name>}, \code{kommentar_<name>}, \code{fertig_<name>}. \code{urteil_konsens} enthält den Code, wenn alle Prüfer mit abgeschlossenem Fall übereinstimmen, sonst „uneinig“.
+
+\btn{Liste löschen …} entfernt Liste, Fälle und Urteile nach Eingabe des Namens.
+
+\begin{achtung}[Identifizierende Daten]
+Die Listen enthalten PIZ und oft weitere identifizierende Angaben. Sie bleiben im Haus und gehören nicht in E-Mails oder auf private Rechner. Nach Abschluss der Studie Ergebnis sichern und die Liste löschen.
+\end{achtung}
+% =====================================================================
+\chapter{Werkzeuge im Aktionsmenü}\label{kap:werkzeuge}
+% =====================================================================
+
+Im selben Aktionsmenü der Kandidatenliste wie \textsf{Validierung …} stehen drei Werkzeuge für Kohorten. Alle drei arbeiten mit \emph{Tags}: Kandidaten bekommen in der Kandidatenliste einen Tag (etwa \code{Kohorte_DMEK}), und das Werkzeug nimmt alle Kandidaten mit diesem Tag.
+
+\begin{tabularx}{\textwidth}{@{}P{4.4cm}L@{}}
+\toprule
+\textbf{Werkzeug} & \textbf{Zweck}\\
+\midrule
+\textsf{Kandidaten neu extrahieren} & Alle Briefe einer Kohorte mit dem aktuellen Pipeline-Stand neu extrahieren (Minion, Queue \queue{default}).\\
+\textsf{Propensity Matching} & Zu Fällen einer Kohorte ähnliche Kontrollen finden, anhand der Phenopackets.\\
+\textsf{Anonymisierter Export} & Phenopackets einer Kohorte anonymisiert als GA4GH-JSON ausgeben (nur Studienleitung).\\
+\bottomrule
+\end{tabularx}
+
+Laufende Aufträge erscheinen im Panel \textsf{Hintergrundprozesse}.
+
+\begin{achtung}[Wie Tags gefunden werden]
+Die Werkzeuge vergleichen Tags nicht exakt. \textsf{Propensity Matching} und \textsf{Anonymisierter Export} suchen den Tag als Teilzeichenkette, ohne Groß-/Kleinschreibung: \code{Kohorte_AMD} trifft auch \code{Kohorte_AMD_alt}. \textsf{Kandidaten neu extrahieren} sucht ihn am Anfang, am Ende oder vor einem Komma der Tag-Liste; auch das kann längere Tags mit gleichem Anfang oder Ende treffen. Tags deshalb so wählen, dass keiner Teil eines anderen ist, und die angezeigte Anzahl prüfen.
+\end{achtung}
+
+\section{Kandidaten nach Tag neu extrahieren}\label{sec:recompute}
+
+\paragraph{Wozu.} Nach einer Änderung an Prompts, Intercepts, Katalogen oder Modell soll eine Studienkohorte mit dem neuen Stand ausgewertet werden. Der Regressionstest (Kapitel~\ref{kap:regression}) hat vorher gezeigt, dass die Änderung unbedenklich ist.
+
+\paragraph{So geht es.}
+\begin{enumerate}
+  \item Aktionsmenü $\rightarrow$ \textsf{Kandidaten neu extrahieren}.
+  \item \feld{Tag der Kandidaten} wählen oder eintippen. Die Vorschläge stammen aus den Tags der gerade geladenen Kandidaten.
+  \item \feld{Betroffene Kandidaten} zeigt nach kurzer Pause die Anzahl der Kandidaten mit diesem Tag und einem Brieftext.
+  \item \feld{Modell} und \feld{Deep Mode} sind mit der Auswahl des Hauptfensters vorbelegt und lassen sich hier ändern.
+  \item \btn{$n$ Kandidaten neu extrahieren}. Der Knopf ist erst aktiv, wenn die Anzahl für genau diesen Tag ermittelt ist und größer als null.
+\end{enumerate}
+
+Das Fenster meldet „$n$ Kandidat(en) eingereiht“. Die Extraktion läuft danach im Worker der Queue \queue{default}, ein Job je Brief.
+
+\begin{achtung}[Was dabei überschrieben wird]
+Die bisherigen Phenopackets dieser Kandidaten werden ersetzt. Studienergebnisse, die auf dem alten Stand beruhen, lassen sich danach nicht mehr reproduzieren; vorher den Langformat-Export sichern. Validierungsdatensätze sind nicht betroffen, sie halten eigene Kopien. Trial-Matches anschließend neu berechnen.
+\end{achtung}
+
+\paragraph{Für den Betrieb.}
+\begin{itemize}
+  \item Die Jobs bekommen Priorität 0, also dieselbe wie Live-Briefe aus argos. Eine große Kohorte kann den Import von Live-Briefen deshalb deutlich verzögern. Abhilfe in Abschnitt~\ref{sec:lagen}.
+  \item Jedes gespeicherte Phenopacket löst wie beim Import die Rückmeldung an das Quellsystem aus, sofern \code{ONTOTRIAL_NOTIFY_URL_<QUELLE>} gesetzt ist. Eine Kohorte von 2000 Briefen erzeugt also 2000 Rückmeldungen, etwa an argos.
+  \item Die Statusabfrage für Quellsysteme (\code{/BBB/document_codes}) zeigt diese Briefe während der Neu-Extraktion nicht als „pending“, weil die Aktion die Job-Nummer am Kandidaten nicht setzt.
+  \item Es gibt keine Prüfung auf bereits wartende Jobs. Zweimal einreihen bedeutet jeden Brief zweimal extrahieren. Vor einem zweiten Versuch mit \code{minion job -S inactive -q default} nachsehen.
+  \item Die Modellliste im Fenster ist im Frontend fest eingetragen (\code{ToolsController.j}). Das Modell aus dem Hauptfenster wird ergänzt, falls es fehlt. Neue Modelle in dieser Liste nachtragen.
+\end{itemize}
+
+\section{Propensity Matching}\label{sec:psm}
+
+\paragraph{Wozu.} Zu jedem Fall einer Kohorte (etwa DMEK-Patienten) werden die ähnlichsten Patienten aus einem Kontrollpool gesucht. Ähnlichkeit bedeutet hier: ähnliche Diagnosen, Befunde, Eingriffe, Medikation, Messwerte, Alter und Geschlecht im Phenopacket. Es ist ein Distanz-Matching auf den Phenopackets, kein Matching auf einem logistisch geschätzten Propensity Score.
+
+\subsection*{Eingaben}
+
+\begin{longtable}{@{}P{4.4cm}p{10.2cm}@{}}
+\toprule
+\textbf{Feld} & \textbf{Bedeutung}\\
+\midrule
+\endhead
+\feld{Fälle (Tag)} & Pflicht.\\
+\feld{Kontrollpool (Tag)} & Leer = alle Kandidaten. Der Pool ist auf 5000 Patienten begrenzt.\\
+\feld{Verhältnis 1:} & 1 bis 5 Kontrollen je Fall.\\
+\feld{Caliper} & Größte erlaubte Distanz (0 bis 1, Vorschlag 0{,}35). Leer = keine Grenze.\\
+\feld{Geschlecht exakt} & Fall und Kontrolle müssen dasselbe Geschlecht haben, wenn bei beiden angegeben.\\
+\feld{Augen spiegeln} & Siehe Hinweis unten: derzeit ohne Wirkung.\\
+\feld{Kontrollen mehrfach verwenden} & Eine Kontrolle darf mehreren Fällen zugeordnet werden (Ziehen mit Zurücklegen).\\
+\feld{Gewichte der Merkmalsblöcke} & Demografie 0{,}15, Diagnosen 0{,}25, Phänotypen 0{,}20, Prozeduren 0{,}15, Medikation 0{,}10, Messwerte 0{,}15. Die Summe muss nicht 1 sein; 0 schaltet einen Block ab.\\
+\bottomrule
+\end{longtable}
+
+\subsection*{So wird gerechnet}
+
+\begin{enumerate}
+  \item Je Patient zählt nur der \textbf{jüngste Brief} mit Phenopacket. Patienten, die in den Fällen stehen, werden aus dem Kontrollpool entfernt.
+  \item Aus jedem Phenopacket werden Merkmale gebildet: Diagnosen, Befunde, Eingriffe und Medikation ohne verneinte Einträge, je Code mit der Seite \emph{einseitig}, \emph{beidseitig} oder \emph{unbekannt}. Rechts und links gelten als gleichwertig. Dazu kommt je Messgröße und Auge der jüngste Wert; der Visus wird in logMAR umgerechnet.
+  \item Je Block wird eine Distanz zwischen 0 und 1 berechnet:
+  \begin{itemize}
+    \item \textbf{Codes} (Diagnosen, Prozeduren, Medikation, Phänotypen): symmetrischer Best-Match-Average. Jeder Code sucht beim anderen Patienten seinen ähnlichsten Partner, in beide Richtungen gemittelt. Ähnlichkeit bei ICD-10, OPS und ATC über die tiefste gemeinsame Hierarchieebene (zum Beispiel ICD-10: gleicher Buchstabe 0{,}10, gleiche Kategorie 0{,}60, gleicher Viersteller 0{,}85; verschiedene Codes höchstens 0{,}95). Bei HPO über die Überlappung der Vorfahren (Jaccard), ohne die Wurzelbegriffe. Abweichende Seite mindert die Ähnlichkeit (unbekannt $\times$0{,}9, einseitig gegen beidseitig $\times$0{,}8).
+    \item \textbf{Messwerte}: nur Messgrößen, die beide Patienten haben. Die Differenz wird je Größe skaliert (etwa Augendruck 10\,mmHg, Hornhautdicke 50\,\textmu m, Visus 0{,}5 logMAR, Endothelzelldichte 500) und auf 1 begrenzt. Die Augen werden als ungeordnetes Paar verglichen: rechts mit rechts oder rechts mit links, je nachdem, was mehr gemeinsame Größen und die kleinere Distanz ergibt. Die Zylinderachse geht nicht ein.
+    \item \textbf{Demografie}: Altersdifferenz geteilt durch 15 Jahre (höchstens 1) und Geschlecht (gleich 0, verschieden 1, eines fehlt 0{,}5).
+  \end{itemize}
+  \item Die Gesamtdistanz ist der gewichtete Mittelwert der Blöcke. Blöcke, für die bei einem Paar keine Daten vorliegen, fallen heraus; die übrigen Gewichte werden neu normiert.
+  \item Alle Paare unterhalb des Calipers werden nach Distanz sortiert und der Reihe nach vergeben (gieriges Nächster-Nachbar-Matching über alle Fälle), bis jeder Fall seine Kontrollen hat oder keine passenden mehr übrig sind.
+\end{enumerate}
+
+\begin{hinweis}[Rechenaufwand]
+Der Aufwand wächst mit Fälle $\times$ Kontrollen. Die Anfrage läuft synchron im Webserver (Zeitgrenze 50 Minuten) und nicht als Minion-Job. Bei großen Pools den Kontrollpool per Tag eingrenzen. Wird das Fenster geschlossen, ist das Ergebnis verloren.
+\end{hinweis}
+
+\subsection*{Ergebnis}
+
+Die Zusammenfassung nennt Fälle, Größe des Kontrollpools, vollständig gematchte Fälle, Fälle ohne Partner und die mittlere Distanz. Die Tabelle zeigt je Paar Fall, Kontrolle und Distanz.
+
+\begin{itemize}
+  \item \textbf{Doppelklick} auf eine Zeile öffnet die Kontrolle in der Kandidatenliste. Ein Doppelklick in der ersten Spalte öffnet den Fall.
+  \item \btn{Kontrollen taggen} hängt den eingegebenen Tag an alle gematchten Kontrollen an; vorhandene Tags bleiben erhalten. Danach lassen sich die Kontrollen wie jede Kohorte weiterverwenden, etwa im Langformat-Export oder in einem R-Skript.
+  \item \btn{CSV exportieren} speichert \code{psm_<tag>_<JJJJ-MM>.csv} mit den Spalten \code{treated_pseudonym}, \code{treated_id}, \code{control_pseudonym}, \code{control_id}, \code{distance} und \code{mirrored} (Semikolon, UTF-8 mit BOM).
+\end{itemize}
+
+\begin{achtung}[„Augen spiegeln“ und Spalte „Gespiegelt“]
+Das Backend wertet die Option \feld{Augen spiegeln} derzeit nicht aus und liefert auch nicht zurück, ob gespiegelt wurde. Die Spalte \feld{Gespiegelt} zeigt deshalb immer „nein“, und in der CSV steht in \code{mirrored} immer „nein“. Tatsächlich werden die Augen \emph{immer} seitenunabhängig verglichen (siehe oben). Für die Methodenbeschreibung gilt diese Rechnung, nicht die Einstellung im Fenster.
+\end{achtung}
+
+\paragraph{Einzelne Paare nachvollziehen.} Die Route \code{POST /BBB/phenopacket_distance} berechnet die Distanz zweier Kandidaten mit Teildistanzen je Block, dem Anteil der verfügbaren Gewichte (\code{coverage}) und mit \code{"explain": true} den besten Partner jedes Codes:
+
+\begin{befehl}
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"a": 1234, "b": 5678, "exact": ["sex"], "explain": true}' \
+  http://localhost:4007/BBB/phenopacket_distance
+\end{befehl}
+
+\paragraph{Berichten.} Gewichte, Caliper, Verhältnis, Ziehen mit oder ohne Zurücklegen, Pipeline-Stand der Phenopackets und die Balance der Kovariaten nach dem Matching (selbst berechnet, etwa in R) gehören in die Methoden. Das Werkzeug berechnet keine Balance-Statistik.
+
+\section{Anonymisierter Export}\label{sec:anonexport}
+
+\paragraph{Wozu.} Phenopackets einer Kohorte so aus dem Haus geben, dass sie nach dem Datenschutzkonzept (DSFA OntoTrial V1.0, Anlage V1.4) als anonym gelten, etwa für Kooperationen oder Register. \textbf{Nur durch die Studienleitung.}
+
+\paragraph{So geht es.}
+\begin{enumerate}
+  \item Aktionsmenü $\rightarrow$ \textsf{Anonymisierter Export}.
+  \item \feld{Kandidaten mit Tag} eintragen. Leer bedeutet \emph{alle} Kandidaten mit Phenopacket; dafür gibt es eine Rückfrage.
+  \item \feld{k-Anonymität} eintragen, mindestens 5. Kleinere Werte werden auf 5 angehoben.
+  \item \btn{Export erzeugen}. Das kann bei großen Kohorten Minuten dauern (Zeitgrenze 30 Minuten).
+  \item Zusammenfassung und Vorschau (ein zufälliges Phenopacket) prüfen.
+  \item \btn{JSON herunterladen} speichert \code{ontotrial_anonym_<tag>_<JJJJ-MM>.json}.
+\end{enumerate}
+
+\subsection*{Was mit den Daten geschieht}
+
+\begin{tabularx}{\textwidth}{@{}P{3.6cm}L@{}}
+\toprule
+\textbf{Filter} & \textbf{Wirkung}\\
+\midrule
+Kein Freitext & Neu aufgebaut wird nur aus einer Positivliste. Übernommen werden nur gültige Codes mit kanonischem Label aus der Terminologie; Codes ohne Label entfallen. Verbatim-Texte, freie Bezeichnungen, Modifier von Messungen und freie Einheiten entfallen. Messwerte nur mit Zahl, zulässiger Einheit und Vergleichsoperator; qualitativ nur „Positive / Detected“ und „Examined“.\\
+Zufalls-IDs & Jeder Patient bekommt je Exportlauf eine neue Zufalls-ID (\code{subject-...}). Die Briefe eines Patienten bleiben darüber verbunden. Die Zuordnung zum Pseudonym wird nirgends gespeichert oder protokolliert. Die Reihenfolge der Phenopackets wird gemischt.\\
+Daten & Auf den Monat gekürzt und je Patient um einen festen Versatz von $\pm$1, 2 oder 3 Monaten verschoben (nie 0). Abstände innerhalb eines Patienten bleiben erhalten. Nicht auswertbare Daten (etwa „PAST-UK-UK“) entfallen.\\
+Alter & In vollen Jahren; ab 90 zusammengefasst („90 oder älter“).\\
+k-Anonymität & Jeder ausgegebene Code muss bei mindestens $k$ Patienten vorkommen. Seltene Codes werden entlang der Hierarchie verallgemeinert, höchstens bis zum ICD-10-Dreisteller, OPS-Viersteller oder zur ATC-Ebene 3. Seltene LOINC-Codes und seltene verneinte Befunde werden nicht verallgemeinert, sondern verworfen.\\
+\bottomrule
+\end{tabularx}
+
+Die Zusammenfassung nennt Patienten, Phenopackets (eines je Brief), $k$ und wie viele Codes unterdrückt, verallgemeinert oder mangels Label verworfen wurden sowie die verworfenen Werte. Umfasst die Auswahl weniger als $k$ Patienten, lehnt das Backend den Export ab.
+
+\begin{achtung}[Vor der Weitergabe]
+\begin{itemize}
+  \item Die Vorschau stichprobenartig auf Reste prüfen, die nicht hineingehören.
+  \item k-Anonymität gilt je Code, nicht für die Kombination aller Codes eines Patienten. Bei kleinen Kohorten mit vielen Merkmalen kann eine Kombination trotzdem selten sein. Im Zweifel $k$ erhöhen oder die Kohorte vergrößern.
+  \item Die Datei liegt nach dem Herunterladen im Download-Ordner des Browsers. Nach der Weitergabe dort löschen.
+  \item Der Export wird nur mit Zählwerten protokolliert (\code{[ANON EXPORT]}), also ohne Inhalte. Die Weitergabe selbst dokumentiert die Studienleitung.
+\end{itemize}
+\end{achtung}
+% =====================================================================
+\part{Betrieb}\label{part:betrieb}
+% =====================================================================
+
+% =====================================================================
+\chapter{Architektur und Prozesse}\label{kap:architektur}
+% =====================================================================
+
+\section{Bestandteile}
+
+\begin{tabularx}{\textwidth}{@{}P{5.0cm}L@{}}
+\toprule
+\textbf{Datei, Dienst} & \textbf{Inhalt}\\
+\midrule
+\code{backend.pl} & Mojolicious-Anwendung: REST-API, WebSocket, Extraktion, Mapping, Vergleich, Kennzahlen und alle Minion-Tasks. Webserver \emph{und} Worker laufen aus dieser Datei.\\
+\code{migrations/ontotrial.sql} & Datenbankschema als Mojo::Pg-Migration; wird beim Start automatisch eingespielt.\\
+\code{.env} & Konfiguration und Schlüssel neben \code{backend.pl} (nie ins Repository, Rechte 600).\\
+\code{public/Frontend/} & Cappuccino-Oberfläche, darin \code{ValidationController.j} (Validierungsfenster und Chart-Review).\\
+\code{update_catalogs.pl} & Pflege der Terminologien (HPO, ICD-10-GM, OPS, ATC, LOINC).\\
+PostgreSQL & Hauptdatenbank (Standard \code{hpo}); Minion-Tabellen in derselben oder einer eigenen Datenbank.\\
+LLM-Server & vLLM (OpenAI-kompatibel) und/oder Ollama; Routing nach Modellname.\\
+Patchbay & Vektorsuche je Terminologie (Standard \code{http://localhost:3036}).\\
+\bottomrule
+\end{tabularx}
+
+\section{Prozesse}
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw=otblau,fill=othell,rounded corners=3pt,align=center,font=\sffamily\small,minimum height=12mm,text width=3.4cm},
+  wk/.style={box,draw=otgruen,fill=otgruenhell,text width=3.6cm},
+  ext/.style={box,draw=otgrau,fill=black!4,text width=2.8cm},
+  arr/.style={{Stealth[length=2mm]}-{Stealth[length=2mm]},thick,color=otgrau}]
+  \node[ext] (ui)  at (0,0)     {Browser\\\scriptsize Frontend};
+  \node[box] (web) at (4.3,0)   {\textbf{Hypnotoad}\\\scriptsize Port 4007, 3 Prozesse\\REST, WebSocket};
+  \node[box] (pg)  at (4.3,-2.6){\textbf{PostgreSQL}\\\scriptsize Hauptdatenbank\\und Minion-Tabellen};
+  \node[wk]  (w1)  at (9.6,0.2) {\textbf{Worker default}\\\scriptsize Import, Extraktion, Rückmeldung};
+  \node[wk]  (w2)  at (9.6,-1.6){\textbf{Worker validation}\\\scriptsize Vorbereitung, Läufe,\\Ensemble, Synthetik};
+  \node[wk]  (w3)  at (9.6,-3.4){\textbf{Worker backfill}\\\scriptsize nur bei Bedarf};
+  \node[ext] (llm) at (2.4,-5.0){LLM-Server\\\scriptsize vLLM, Ollama};
+  \node[ext] (pb)  at (6.2,-5.0){Patchbay\\\scriptsize Vektorsuche};
+  \draw[arr] (ui) -- (web);
+  \draw[arr] (web) -- (pg);
+  \coordinate (bus) at (7.2,-2.6);
+  \draw[thick,color=otgrau] (w1.west) -| (bus);
+  \draw[thick,color=otgrau] (w2.west) -| (bus);
+  \draw[thick,color=otgrau] (w3.west) -| (bus);
+  \draw[arr] (bus) -- (pg.east);
+  \draw[arr,dashed] (pg.south) -- (llm.north);
+  \draw[arr,dashed] (pg.south) -- (pb.north);
+\end{tikzpicture}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{Hypnotoad} beantwortet die API und hält die WebSocket-Verbindungen. Konfiguration in \code{backend.pl}: \code{listen => ['http://*:4007']}, 3 Worker-Prozesse, Heartbeat- und Inaktivitäts-Timeout 120\,s. Lange Arbeit reiht er als Minion-Job ein, statt sie selbst zu tun.
+  \item \textbf{Minion-Worker} sind eigene Prozesse (\code{perl backend.pl minion worker}). Sie holen Jobs aus der Datenbank und führen jeden Job in einem eigenen Kindprozess aus. Ohne Worker bleibt jeder Job liegen.
+  \item \textbf{PostgreSQL} ist zugleich Warteschlange (Minion) und Nachrichtenbus: Fortschritt und Tabellenänderungen gehen per \code{LISTEN/NOTIFY} (\code{fireside_updates}) an alle Browser.
+  \item LLM-Server und Patchbay werden von Webserver und Workern direkt angesprochen (gestrichelt: logisch, nicht über die Datenbank).
+\end{itemize}
+
+\begin{hinweis}[Patchbay-Drosselung gilt je Prozess]
+Aufrufe an Patchbay laufen über eine Warteschlange mit höchstens einem gleichzeitigen Aufruf, aber je Prozess. Weil jeder Minion-Job ein eigener Prozess ist, erzeugt ein Worker mit \code{-j 4} bis zu vier gleichzeitige Patchbay-Aufrufe, und alle Worker zusammen entsprechend mehr. Bei Last auf Patchbay die \code{-j}-Werte senken.
+\end{hinweis}
+
+\section{Wer liest was beim Start}
+
+\code{backend.pl} lädt die \code{.env} aus seinem eigenen Verzeichnis in einem \code{BEGIN}-Block. Dabei gilt: \textbf{bereits gesetzte Umgebungsvariablen haben Vorrang}. Das ist für Docker gedacht, hat aber eine Folge für Hypnotoad (Abschnitt~\ref{sec:neustart}). Webserver und Worker lesen Code und \code{.env} nur beim Start; Prompts, Intercepts und Filterregeln kommen dagegen zur Laufzeit aus der Datenbank (Prompts mit 30\,s Cache).
+
+% =====================================================================
+\chapter{Minion-Grundlagen}\label{kap:minion}
+% =====================================================================
+
+Minion ist die Job-Queue von Mojolicious. Wer OntoTrial betreibt, braucht fünf Begriffe.
+
+\begin{longtable}{@{}P{3.0cm}p{11.6cm}@{}}
+\toprule
+\textbf{Begriff} & \textbf{Bedeutung}\\
+\midrule
+\endhead
+Task & Eine benannte Funktion in \code{backend.pl}, etwa \code{validation_run_task}. Liste: \code{perl backend.pl minion job -T}.\\
+Job & Ein Auftrag, einen Task mit bestimmten Argumenten auszuführen. Hat eine Nummer (ID), eine Queue, eine Priorität, einen Zustand, Notizen (Fortschritt) und ein Ergebnis.\\
+Queue & Name einer Warteschlange. OntoTrial nutzt \code{default}, \code{validation} und \code{backfill}. Ein Job wird nur von einem Worker geholt, der seine Queue bedient.\\
+Worker & Prozess, der Jobs aus einer oder mehreren Queues holt. \code{-j} legt fest, wie viele Jobs er gleichzeitig ausführt; jeder läuft in einem eigenen Kindprozess.\\
+Priorität & Ganze Zahl; höhere zuerst, bei Gleichstand der ältere Job. Wirkt innerhalb der Queues, die ein Worker bedient.\\
+\bottomrule
+\end{longtable}
+
+\section{Lebenszyklus eines Jobs}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=8mm and 14mm,
+  st/.style={draw=otblau,fill=othell,rounded corners=8pt,font=\sffamily\small\bfseries,minimum width=2.4cm,minimum height=9mm},
+  arr/.style={-{Stealth[length=2.5mm]},thick,color=otblau},
+  lab/.style={font=\sffamily\scriptsize,text=otgrau,align=center}]
+  \node[st] (in) {inactive};
+  \node[st,right=of in] (ac) {active};
+  \node[st,right=of ac,yshift=7mm,draw=otgruen,fill=otgruenhell] (fi) {finished};
+  \node[st,right=of ac,yshift=-7mm,draw=otrot,fill=otrothell] (fa) {failed};
+  \draw[arr] (in) -- node[lab,above]{Worker holt} (ac);
+  \draw[arr] (ac) -- node[lab,above,sloped]{finish} (fi);
+  \draw[arr] (ac) -- node[lab,below,sloped]{fail, Abbruch} (fa);
+  \draw[arr,dashed] (fa.south) -- ++(0,-6mm) -| node[lab,below,pos=0.25]{retry (-R) oder automatische Wiederholung} (in.south);
+\end{tikzpicture}
+\end{center}
+
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[inactive] wartet. In der Oberfläche: „wartet auf einen Worker“.
+  \item[active] läuft in einem Worker. Fortschritt steht in den Notizen des Jobs.
+  \item[finished] fertig. Das Ergebnis bleibt sichtbar, bis Minion abgeschlossene Jobs aufräumt (Standard nach 2 Tagen).
+  \item[failed] fehlgeschlagen, mit Fehlermeldung. Ein Job wird nur so oft versucht, wie \code{attempts} erlaubt; in OntoTrial meist einmal, die Rückmeldung an Quellsysteme fünfmal.
+\end{description}
+
+\paragraph{Wenn ein Worker verschwindet.} Stirbt ein Worker (Absturz, \code{kill -9}, Neustart des Rechners), bleiben seine Jobs zunächst \code{active}. Minion räumt sie bei der nächsten Reparatur auf und setzt sie auf \code{failed} („Worker went away“). Die Reparatur läuft periodisch in den Workern; bis dahin können Stunden vergehen. Die Validierung prüft für ihre eigenen Jobs selbst, ob der Worker noch lebt, und bietet dann Fortsetzen an.
+
+\paragraph{Hängende Wartende.} Wartet ein Job länger als \code{stuck_after}, gilt er als hängend und wird bei der Reparatur auf \code{failed} gesetzt. OntoTrial setzt diesen Wert auf 30 Tage (Standard wären 2 Tage), damit ein großer Rückstand beim Import nicht verloren geht.
+
+\section{Wo Minion seine Daten hält}
+
+Minion speichert Jobs, Worker und Sperren in eigenen Tabellen (\code{minion_jobs}, \code{minion_workers}, \code{minion_locks}). Wo, steuert die \code{.env}:
+
+\begin{tabularx}{\textwidth}{@{}P{4.4cm}L@{}}
+\toprule
+\textbf{Variable} & \textbf{Wirkung}\\
+\midrule
+\code{ONTOTRIAL_PG} & Hauptdatenbank, Standard \code{postgresql://postgres:postgres@localhost/hpo}.\\
+\code{ONTOTRIAL_MINION_PG} & vollständige Verbindung für Minion (hat Vorrang).\\
+\code{ONTOTRIAL_MINION_DB} & nur der Datenbankname für Minion; Host, Benutzer, Passwort aus \code{ONTOTRIAL_PG}.\\
+\bottomrule
+\end{tabularx}
+
+Ohne Angaben teilen sich Hauptdatenbank und Minion dieselbe Datenbank. Beim Start protokolliert das Backend beide Verbindungen ohne Passwort (\code{[CONFIG] Hauptdatenbank: ... | Minion: ...}). Eine eigene Minion-Datenbank hält die Hauptdatenbank klein und erleichtert Sicherungen; SQL auf \code{minion_jobs} muss dann dort laufen.
+
+% =====================================================================
+\chapter{Queues und Tasks}\label{kap:queues}
+% =====================================================================
+
+\section{Übersicht}
+
+\begin{longtable}{@{}P{2.0cm}P{4.8cm}P{4.2cm}P{3.2cm}@{}}
+\toprule
+\textbf{Queue} & \textbf{Task} & \textbf{Ausgelöst durch} & \textbf{Priorität, Versuche}\\
+\midrule
+\endhead
+\queue{default} & \code{import_and_extract_letter_task} & \code{/BBB/import_and_extract_letter} (Push aus argos, DWH, OP); \textsf{Kandidaten neu extrahieren} (\code{/BBB/candidates/recompute_by_tag}) & argos 0, andere Quellen $-$5, frei wählbar $-$1000…1000; Neu-Extraktion per Tag 0; 1 Versuch\\
+\queue{default} & \code{notify_document_ready_task} & Speichern eines Phenopackets, wenn \code{ONTOTRIAL_NOTIFY_URL_<QUELLE>} gesetzt ist & 0; 5 Versuche mit wachsendem Abstand\\
+\queue{validation} & \code{validation_prepare_task} & Neuer Datensatz mit Neu-Extraktion; \btn{Fortsetzen} & $-$5; 1\\
+\queue{validation} & \code{validation_synth_task} & Synthetischer Datensatz; \btn{Fortsetzen} & $-$5; 1\\
+\queue{validation} & \code{validation_synth_linkage_task} & \code{POST .../linkage} & $-$10; 1\\
+\queue{validation} & \code{validation_run_task} & \btn{Lauf starten …}, \btn{Gespeicherte Phenopackets prüfen} & $-$5; 1\\
+\queue{validation} & \code{validation_run_resume_task} & \btn{Lauf fortsetzen} & $-$5; 1\\
+\queue{validation} & \code{validation_ensemble_task} & \btn{Ensemble starten …}, automatisch nach der Vorbereitung & $-$5; 1\\
+\queue{validation} & \code{validation_discrepancy_task} & \code{POST .../discrepancy_check} (mehrere Teil-Jobs) & $-$5; 1\\
+\queue{backfill} & \code{cataract_backfill_task} & \code{POST /BBB/admin/cataract_backfill} (einmalige Wartung) & 0; 1\\
+\bottomrule
+\end{longtable}
+
+Nicht als Job laufen: Propensity Matching und anonymisierter Export (synchron im Webserver, bis 50 bzw.\ 30 Minuten), das Laden der Few-Shot-Paare, Kennzahlen der Studie, Referenzvergleich und \btn{Neu bewerten}; sie sind gewöhnliche Web-Anfragen.
+
+\section{Die Queue default}
+
+Sie trägt den Alltag: Jeder Brief, der per Push ankommt, wird hier extrahiert. Besonderheiten:
+
+\begin{itemize}
+  \item \textbf{Live vor Altbestand.} Briefe aus \code{argos} bekommen Priorität 0, andere Quellen (DWH-Nachladen) $-$5. Ein Push kann eine eigene \code{priority} mitgeben; wartet der Job desselben Briefs schon, wird seine Priorität angepasst.
+  \item \textbf{Veraltete Jobs.} Ersetzt ein neuerer Import den Brieftext, bevor oder während ein Job läuft, verwirft der Job sein Ergebnis und endet mit \code{superseded}.
+  \item \textbf{Watchdog.} Hängt eine Extraktion (etwa durch Regex-Backtracking), beendet ein Alarm nach \code{ONTOTRIAL_JOB_TIMEOUT} Sekunden (Standard 1800) den Kindprozess, schreibt Kontext und Perl-Stack nach \code{ONTOTRIAL_WATCHDOG_LOG} (Standard \code{/tmp/ontotrial_watchdog.log}) und gibt den Slot frei. Der Job steht dann auf \code{failed}.
+  \item \textbf{Rückmeldung.} Ist für eine Quelle \code{ONTOTRIAL_NOTIFY_URL_<QUELLE>} gesetzt (etwa \code{ONTOTRIAL_NOTIFY_URL_ARGOS}), meldet ein eigener Job jedes gespeicherte Phenopacket per POST zurück (\code{source}, \code{doc_id}, \code{candidate_id}, \code{pseudonym}, \code{reference_date}). Fehlschläge wiederholt Minion bis zu fünfmal.
+\end{itemize}
+
+\section{Die Queue validation}
+
+Hier läuft alles aus dem Validierungsfenster. Die Jobs sind lang (Minuten bis Stunden) und belasten dieselben LLM-Server wie die Extraktion. Darum haben sie eine eigene Queue und einen eigenen Worker: Validierung verzögert den Import nicht, und der Import verzögert die Validierung nicht.
+
+\section{Die Queue backfill}
+
+Nur für einmalige Wartungsaufträge. Derzeit: Katarakt-OP-Parameter in Phenopackets nachtragen, die vor dem 22.10.2026 extrahiert wurden (ohne Sprachmodell, fortsetzbar, mit \code{dry_run=1} nur zählen). Den Worker nur starten, solange ein Auftrag wartet.
+
+\begin{befehl}
+curl -X POST 'http://localhost:4007/BBB/admin/cataract_backfill?dry_run=1'
+perl backend.pl minion worker -q backfill
+\end{befehl}
+
+Ist \code{ONTOTRIAL_EXPORT_TOKEN} gesetzt, braucht der Aufruf den Header \code{X-Export-Token}.
+
+\section{Wie viele Jobs gleichzeitig?}\label{sec:jobs}
+
+\begin{tabularx}{\textwidth}{@{}P{2.4cm}P{2.2cm}L@{}}
+\toprule
+\textbf{Queue} & \textbf{Vorschlag} & \textbf{Überlegung}\\
+\midrule
+\queue{default} & \code{-j 4} & Durchsatz beim Import gegen Last auf LLM-Server und Patchbay. Bei großem Rückstand vorsichtig erhöhen und Antwortzeiten beobachten.\\
+\queue{validation} & \code{-j 4} & Bestimmt, wie viele Läufe, Ensembles, Vorbereitungen oder Teil-Jobs der Abweichungsprüfung gleichzeitig laufen. Senken, wenn der LLM-Server der Engpass ist oder der Import spürbar langsamer wird.\\
+\queue{backfill} & \code{-j 1} bis 4 & Kein LLM; Datenbanklast.\\
+\bottomrule
+\end{tabularx}
+
+Minion hält zusätzlich einen Reserveplatz für Jobs mit Priorität ab 1 frei (\code{--spare}, Standard 1). Ein Import mit \code{priority} $\geq 1$ startet deshalb auch, wenn alle regulären Plätze belegt sind.
+% =====================================================================
+\chapter{Worker betreiben}\label{kap:worker}
+% =====================================================================
+
+\section{Starten}
+
+Alle Worker aus dem Verzeichnis starten, in dem \code{backend.pl} und \code{.env} liegen, damit sie dieselbe Konfiguration lesen wie der Webserver. Jede Queue braucht einen Worker; ein Job in einer Queue ohne Worker bleibt auf „wartet auf einen Worker“.
+
+\begin{befehl}
+cd /Users/Shared/bin/OntoTrial2              # Verzeichnis mit backend.pl und .env
+
+perl backend.pl minion worker                        # default: Import, Extraktion, Rückmeldung
+perl backend.pl minion worker -q validation -j 4     # Validierung, Läufe, Ensemble, Synthetik
+perl backend.pl minion worker -q backfill            # nur solange ein Backfill wartet
+\end{befehl}
+
+Ohne \code{-q} bedient ein Worker nur \code{default}, ohne \code{-j} führt er 4 Jobs gleichzeitig aus. Ein Worker kann mehrere Queues bedienen (\code{-q default -q validation}); getrennte Worker halten die Validierung aber vom Alltag fern.
+
+Für einen schnellen Start in einem Terminal:
+
+\begin{befehl}
+mkdir -p log
+nohup perl backend.pl minion worker                    > log/worker-default.log    2>&1 &
+nohup perl backend.pl minion worker -q validation -j 4 > log/worker-validation.log 2>&1 &
+\end{befehl}
+
+\section{Dauerbetrieb mit systemd}
+
+Eine Unit je Queue, etwa \code{/etc/systemd/system/ontotrial-worker-validation.service}:
+
+\begin{befehl}
+[Unit]
+Description=OntoTrial Minion worker (validation)
+After=network.target postgresql.service
+
+[Service]
+WorkingDirectory=/Users/Shared/bin/OntoTrial2
+ExecStart=/usr/bin/perl backend.pl minion worker -q validation -j 4
+Restart=on-failure
+User=ontotrial
+# TERM: Worker nimmt keine neuen Jobs an und wartet auf die laufenden.
+# Danach beendet systemd hart. Lange Läufe lassen sich fortsetzen.
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
+\end{befehl}
+
+Die Unit für \code{default} entsteht genauso ohne \code{-q}; dort empfiehlt sich \code{TimeoutStopSec=35min}, damit eine laufende Extraktion (Watchdog 30 min) zu Ende kommen kann.
+
+\begin{befehl}
+sudo systemctl daemon-reload
+sudo systemctl enable --now ontotrial-worker-default ontotrial-worker-validation
+systemctl status ontotrial-worker-validation
+journalctl -u ontotrial-worker-validation -f          # Protokoll live
+\end{befehl}
+
+\section{Dauerbetrieb auf macOS mit launchd}\label{sec:launchd}
+
+Auf macOS gibt es kein systemd; dieselbe Aufgabe übernimmt ein LaunchDaemon je Queue. Zuerst den Perl-Pfad feststellen, mit dem die Worker heute laufen (\code{which perl}); bei Homebrew oder perlbrew ist das nicht \code{/usr/bin/perl}, und nur dort sind Mojolicious und Minion installiert.
+
+Datei \code{/Library/LaunchDaemons/de.ukf.ontotrial.worker-validation.plist}:
+
+\begin{befehl}
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>             <string>de.ukf.ontotrial.worker-validation</string>
+  <key>WorkingDirectory</key>  <string>/Users/Shared/bin/OntoTrial2</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/perl</string>   <!-- Ausgabe von: which perl -->
+    <string>backend.pl</string>
+    <string>minion</string>
+    <string>worker</string>
+    <string>-q</string>
+    <string>validation</string>
+    <string>-j</string>
+    <string>4</string>
+  </array>
+  <key>UserName</key>          <string>macosx</string>
+  <key>RunAtLoad</key>         <true/>
+  <key>KeepAlive</key>         <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ExitTimeOut</key>       <integer>120</integer>
+  <key>StandardOutPath</key>   <string>/Users/Shared/bin/OntoTrial2/log/worker-validation.log</string>
+  <key>StandardErrorPath</key> <string>/Users/Shared/bin/OntoTrial2/log/worker-validation.log</string>
+</dict>
+</plist>
+\end{befehl}
+
+Die Datei für \code{default} entsteht genauso: anderes \code{Label} und Logfile, in \code{ProgramArguments} ohne \code{-q validation -j 4}, \code{ExitTimeOut} 2100 (35 min, Watchdog). \code{KeepAlive} mit \code{SuccessfulExit = false} startet einen abgestürzten Worker neu, einen geordnet beendeten aber nicht. \code{ExitTimeOut} ist die Wartezeit nach \code{TERM}, bevor launchd hart beendet.
+
+\begin{befehl}
+mkdir -p /Users/Shared/bin/OntoTrial2/log
+sudo chown root:wheel /Library/LaunchDaemons/de.ukf.ontotrial.worker-*.plist
+sudo chmod 644 /Library/LaunchDaemons/de.ukf.ontotrial.worker-*.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/de.ukf.ontotrial.worker-validation.plist
+
+sudo launchctl print system/de.ukf.ontotrial.worker-validation | grep -E 'state|pid'
+sudo launchctl kickstart -k system/de.ukf.ontotrial.worker-validation   # neu starten
+sudo launchctl kill TERM system/de.ukf.ontotrial.worker-validation      # geordnet beenden
+sudo launchctl bootout system/de.ukf.ontotrial.worker-validation        # abmelden
+tail -f /Users/Shared/bin/OntoTrial2/log/worker-validation.log
+\end{befehl}
+
+Vorher von Hand gestartete Worker (\code{nohup}) beenden, sonst laufen zwei Worker je Queue. \code{perl backend.pl minion job -w} zeigt alle Worker mit Host und PID.
+
+\section{Signale an den Worker}\label{sec:signale}
+
+\begin{tabularx}{\textwidth}{@{}P{2.6cm}L@{}}
+\toprule
+\textbf{Signal} & \textbf{Wirkung}\\
+\midrule
+\code{INT}, \code{TERM} & Geordnet beenden: keine neuen Jobs, laufende zu Ende führen.\\
+\code{QUIT} & Sofort beenden, laufende Jobs werden abgebrochen.\\
+\code{TTIN} / \code{TTOU} & Zahl gleichzeitiger Jobs um eins erhöhen bzw.\ senken, ohne Neustart.\\
+\bottomrule
+\end{tabularx}
+
+\begin{befehl}
+kill -TTOU <pid-des-workers>     # LLM-Server überlastet: einen Job weniger
+\end{befehl}
+
+Die PID steht in \code{perl backend.pl minion job -w} (Spalte mit Host und PID).
+
+\section{Wann was neu starten}\label{sec:neustart}
+
+\begin{tabularx}{\textwidth}{@{}P{6.0cm}L@{}}
+\toprule
+\textbf{Änderung} & \textbf{Neu starten}\\
+\midrule
+nur Frontend (\code{ValidationController.j} u.\,a.) & nichts; im Browser neu laden (\taste{Cmd}+\taste{Shift}+\taste{R})\\
+Prompts, Intercepts, Filterregeln in der Datenbank & nichts (Prompts nach spätestens 30\,s)\\
+\code{backend.pl}, nur Routen oder Anzeige & Hypnotoad (Hot Deploy genügt)\\
+\code{backend.pl}, alles was Jobs ausführen & Hypnotoad \emph{und} alle Worker\\
+\code{.env} & Hypnotoad vollständig (Stopp und Start) \emph{und} alle Worker\\
+\code{migrations/ontotrial.sql} & Hypnotoad; die Migration läuft beim Start\\
+Terminologien (\code{update_catalogs.pl}) & Hypnotoad und Worker, danach Patchbay-Indizes neu aufbauen\\
+\bottomrule
+\end{tabularx}
+
+\begin{achtung}[.env und Hot Deploy]
+Ein Hot Deploy mit \code{hypnotoad backend.pl} übernimmt die Umgebung des alten Prozesses, und bereits gesetzte Variablen haben Vorrang vor der \code{.env}. Geänderte Werte wirken deshalb erst nach einem vollständigen Neustart:
+\end{achtung}
+
+\begin{befehl}
+cd /Users/Shared/bin/OntoTrial2
+hypnotoad -s backend.pl          # stoppen
+hypnotoad backend.pl             # starten (bei laufendem Server: Hot Deploy)
+\end{befehl}
+
+\section{Worker neu starten, ohne Arbeit zu verlieren}
+
+\begin{enumerate}
+  \item Nachsehen, was läuft: \code{perl backend.pl minion job -S active}.
+  \item Kurze Jobs (Import) abwarten; \code{TERM} wartet ohnehin auf sie.
+  \item Lange Validierungsjobs dürfen abbrechen, wenn danach aufgeräumt wird:
+  \begin{itemize}
+    \item Vorbereitung und synthetischer Batch: im Fenster \btn{Fortsetzen} (wird automatisch angeboten).
+    \item Lauf: \btn{Lauf abbrechen / bewerten …} $\rightarrow$ \btn{Lauf fortsetzen}.
+    \item Ensemble: neu starten; vorhandene Judge-Urteile werden wiederverwendet.
+    \item Abweichungsprüfung: erneut starten; bereits geprüfte Briefe werden übersprungen.
+  \end{itemize}
+  \item Worker neu starten und mit \code{minion job -w} prüfen, dass er die richtige Queue bedient.
+\end{enumerate}
+
+% =====================================================================
+\chapter{Minion administrieren}\label{kap:minionadmin}
+% =====================================================================
+
+Alle Befehle im Verzeichnis von \code{backend.pl}. Sie sprechen dieselbe Datenbank an wie Webserver und Worker. Die vollständige Liste der Optionen zeigt \code{perl backend.pl minion job -h}; die folgenden sind die gebräuchlichen und mit der installierten Minion-Version geprüft.
+
+\section{Überblick verschaffen}
+
+\begin{befehl}
+perl backend.pl minion job -s                         # Statistik: aktiv, wartend, fehlgeschlagen, Worker
+perl backend.pl minion job -w                         # laufende Worker mit Queues und Jobs
+perl backend.pl minion job -w <worker-id>             # Details eines Workers
+perl backend.pl minion job -T                         # registrierte Tasks
+perl backend.pl minion job -l 20                      # letzte 20 Jobs
+perl backend.pl minion job -q validation -l 10        # letzte Jobs einer Queue
+perl backend.pl minion job -S failed -l 20            # letzte Fehlschläge
+perl backend.pl minion job -S inactive -q default     # Rückstand beim Import
+perl backend.pl minion job -t validation_run_task -l 5
+perl backend.pl minion job -q validation -S active -S inactive   # mehrere Zustände
+perl backend.pl minion job 670428                     # ein Job: Argumente, Notizen, Ergebnis, Fehler
+perl backend.pl minion job -H                         # Verlauf: Jobs je Stunde, fertig/fehlgeschlagen
+perl backend.pl minion job -L                         # aktive benannte Sperren
+\end{befehl}
+
+Jeder Aufruf lädt \code{backend.pl} und schreibt deshalb zuerst die \code{[CONFIG]}-Zeilen; sie zeigen nebenbei, welche Hauptdatenbank und welche Minion-Datenbank der Befehl anspricht. Die Befehle müssen dieselbe \code{.env} sehen wie die Worker, also im Verzeichnis von \code{backend.pl} laufen (oder mit \code{--home <pfad>}).
+
+Die Detailansicht eines Jobs zeigt in \code{notes} den Fortschritt (etwa \code{current}, \code{total}, \code{step}, \code{progress}) und bei \code{failed} die Fehlermeldung, bei Extraktionen zum Beispiel \code{Extraktionsfehler: ...}.
+
+\section{Eingreifen}
+
+\begin{longtable}{@{}P{6.4cm}p{8.2cm}@{}}
+\toprule
+\textbf{Befehl} & \textbf{Wirkung und Hinweise}\\
+\midrule
+\endhead
+\code{minion job -R <id>} & Fehlgeschlagenen Job erneut einreihen. Gut für Import und Rückmeldung. Für Validierungsläufe besser \btn{Lauf fortsetzen}: ein erneuter \code{validation_run_task} beginnt von vorn.\\
+\code{minion job -f <id>} & Job im Vordergrund im aktuellen Terminal ausführen, mit allen Meldungen. Das beste Werkzeug, um eine fehlschlagende Extraktion zu untersuchen.\\
+\code{minion job --remove <id>} & Job löschen (nicht während er läuft).\\
+\code{minion job --retry-failed} & Alle fehlgeschlagenen Jobs erneut einreihen. Vorsicht: betrifft alle Queues.\\
+\code{minion job --remove-failed} & Alle fehlgeschlagenen Jobs löschen. Vorsicht: Fehlermeldungen gehen verloren.\\
+\code{minion job -b kill -a '["TERM", <id>]'} & Signal an den Kindprozess eines laufenden Jobs; beendet einen hängenden Lauf, damit er fortgesetzt werden kann.\\
+\code{minion job -b jobs -a '[2]' <worker-id>} & Zahl gleichzeitiger Jobs eines laufenden Workers ändern (ohne Worker-ID: alle Worker).\\
+\code{minion job -U <name>} & Hängengebliebene benannte Sperre freigeben (siehe \code{-L}).\\
+\code{minion job -e <task> -a '[...]' -q <queue>} & Job von Hand einreihen; nur für Wartung, die Oberfläche macht das sonst selbst.\\
+\bottomrule
+\end{longtable}
+
+\begin{gefahr}[Nicht direkt in minion\_jobs löschen]
+Laufende Jobs nie per SQL löschen oder auf \code{finished} setzen; der Worker schreibt weiter, und die Validierung erkennt den Zustand nicht mehr. Stattdessen abbrechen (Oberfläche), \code{-b kill} oder \code{--remove}.
+\end{gefahr}
+
+\section{Nützliches SQL}
+
+In der Minion-Datenbank (Abschnitt~\ref{kap:minion}); \code{args}, \code{notes} und \code{result} sind JSONB.
+
+\begin{befehl}
+-- Zustand je Queue
+SELECT queue, state, count(*) FROM minion_jobs GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- Was als Nächstes dran ist
+SELECT id, task, priority, created FROM minion_jobs
+ WHERE state = 'inactive' AND queue = 'default'
+ ORDER BY priority DESC, id LIMIT 20;
+
+-- Wartende Extraktion eines Kandidaten vorziehen
+UPDATE minion_jobs SET priority = 50
+ WHERE state = 'inactive' AND task = 'import_and_extract_letter_task'
+   AND args->0->>'candidate_id' = '12345';
+
+-- Altbestand insgesamt zurückstellen
+UPDATE minion_jobs SET priority = -20
+ WHERE state = 'inactive' AND queue = 'default' AND priority < 0;
+
+-- Häufigste Fehler der letzten Woche
+SELECT task, left(result::text, 120) AS fehler, count(*)
+  FROM minion_jobs WHERE state = 'failed' AND finished > now() - interval '7 days'
+ GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20;
+\end{befehl}
+
+Prioritäten wartender Jobs zu ändern ist unbedenklich; laufende Jobs bleiben unberührt. Für einzelne Briefe geht es auch ohne SQL: denselben Brief mit \code{priority} erneut pushen.
+
+\section{Zustand der Validierung prüfen}
+
+In der Hauptdatenbank:
+
+\begin{befehl}
+-- Läufe
+SELECT id, set_id, mode, status, progress, started_at, finished_at
+  FROM validation_runs ORDER BY id DESC LIMIT 10;
+
+-- Datensätze in Vorbereitung
+SELECT id, name, status, params->'extraction' FROM validation_sets WHERE status = 'preparing';
+
+-- Ensemble-Ergebnisse je Datensatz
+SELECT i.set_id, s.kind, count(*) FROM validation_ai_suggestions s
+  JOIN validation_items i ON i.id = s.item_id GROUP BY 1, 2;
+\end{befehl}
+
+\section{Ensemble nach Prompt-Änderung neu bewerten lassen}
+
+Das Ensemble verwendet vorhandene Judge-Urteile ohne Fehler wieder. Nach einer Änderung an \code{validation_judge} müssen die alten Urteile des Datensatzes gelöscht werden, sonst ändert sich nichts:
+
+\begin{befehl}
+DELETE FROM validation_ai_reviews
+ WHERE item_id IN (SELECT id FROM validation_items WHERE set_id = <id>);
+\end{befehl}
+
+Danach \btn{Ensemble starten …}. Bei eingefrorener Referenz ist das unkritisch: KI-Bewertungen gehören nicht zur Referenz.
+
+\section{Typische Lagen}\label{sec:lagen}
+
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[Großer Rückstand beim Import]
+  \code{minion job -s} und das SQL „Zustand je Queue“. Prüfen, dass der default-Worker läuft (\code{-w}). Live-Briefe aus argos haben Vorrang; den Altbestand ggf.\ zurückstellen. \code{-j} des default-Workers nur erhöhen, wenn LLM-Server und Patchbay Reserven haben.
+  \item[Neu-Extraktion einer großen Kohorte verdrängt Live-Briefe]
+  \textsf{Kandidaten neu extrahieren} reiht mit Priorität 0 ein, gleichauf mit argos. Die wartenden Jobs der Kohorte über ihren Tag zurückstellen (Minion-Tabellen in der Hauptdatenbank vorausgesetzt):
+\begin{befehl}
+UPDATE minion_jobs SET priority = -10
+ WHERE state = 'inactive' AND task = 'import_and_extract_letter_task' AND priority = 0
+   AND (args->0->>'candidate_id')::int IN
+       (SELECT id FROM candidates WHERE tags ILIKE '%Kohorte_DMEK%');
+\end{befehl}
+  Vorher mit \code{SELECT count(*)} und derselben Bedingung prüfen, dass die Zahl zur eingereihten Kohorte passt. Ein Live-Brief eines Patienten dieser Kohorte, der gerade wartet, wird dabei mit zurückgestellt.
+  \item[Validierung bremst den Alltag]
+  \code{-j} des Validierungs-Workers senken (\code{kill -TTOU}) oder Läufe mit einem Modell auf anderer Infrastruktur fahren.
+  \item[Ein Job hängt seit Stunden]
+  \code{minion job <id>}: ändern sich die Notizen noch? Extraktionen beendet der Watchdog nach 30\,min. Validierungsjobs: \code{-b kill -a '["TERM", <id>]'}, dann in der Oberfläche fortsetzen.
+  \item[Viele gleiche Fehlschläge]
+  Häufigste Fehler per SQL; einen Job mit \code{-f} im Vordergrund nachstellen; Ursache beheben, dann \code{-R} oder \code{--retry-failed}.
+\end{description}
+
+% =====================================================================
+\chapter{Konfiguration}\label{kap:konfig}
+% =====================================================================
+
+Alle Einstellungen stehen in der \code{.env} neben \code{backend.pl}. Nach Änderungen Hypnotoad vollständig und alle Worker neu starten (Abschnitt~\ref{sec:neustart}). Standardwerte in Klammern.
+
+\section{Datenbank und Dienste}
+
+\begin{longtable}{@{}P{6.4cm}p{8.2cm}@{}}
+\toprule
+\textbf{Variable} & \textbf{Bedeutung}\\
+\midrule
+\endhead
+\code{ONTOTRIAL_PG} & Hauptdatenbank (\code{postgresql://postgres:postgres@localhost/hpo})\\
+\code{ONTOTRIAL_MINION_PG}, \code{ONTOTRIAL_MINION_DB} & Minion-Datenbank (Abschnitt~\ref{kap:minion})\\
+\code{PATCHBAY_URL} & Vektorsuche (\code{http://localhost:3036})\\
+\code{ONTOTRIAL_PROMPT_ID_HPO}, \code{..._HPO_MODIFIER}, \code{..._ICD10}, \code{..._OPS}, \code{..._ATC}, \code{..._LOINC} & Patchbay-Prompt-IDs (51, 52, 64, 65, 66, 69)\\
+\bottomrule
+\end{longtable}
+
+\section{Sprachmodelle}
+
+\begin{longtable}{@{}P{6.4cm}p{8.2cm}@{}}
+\toprule
+\textbf{Variable} & \textbf{Bedeutung}\\
+\midrule
+\endhead
+\code{LLM_PROVIDER} & \code{vllm} oder \code{ollama} (\code{vllm})\\
+\code{VLLM_ENDPOINT}, \code{VLLM_API_KEY}, \code{VLLM_MODEL} & OpenAI-kompatibler Server und Standardmodell (\code{gpt-oss-120b})\\
+\code{OLLAMA_ENDPOINT}, \code{OLLAMA_MODEL} & Ollama; Modellnamen mit \code{-mlx} oder \code{ollama} gehen immer hierhin\\
+\code{ONTOTRIAL_LLM_EXTRA_<MODELL>} & zusätzliche Request-Parameter als JSON, etwa \code{{"reasoning_effort":"low"}}; mit \code{"stream": true} wird gestreamt. Modellname in Großbuchstaben, Sonderzeichen als \code{_}\\
+\code{ONTOTRIAL_LLM_DUMP_DIR}, \code{..._DUMP_MODELS} & jede Anfrage als JSON-Datei ablegen (Diagnose)\\
+\bottomrule
+\end{longtable}
+
+\section{Mapping-Qualität}
+
+\begin{longtable}{@{}P{6.4cm}p{8.2cm}@{}}
+\toprule
+\textbf{Variable} & \textbf{Bedeutung}\\
+\midrule
+\endhead
+\code{ONTOTRIAL_RERANK} & LLM-Reranking der Kandidaten (1)\\
+\code{ONTOTRIAL_RERANK_ACCEPT_SIM} & Ähnlichkeit, ab der ohne Reranking übernommen wird (0,985)\\
+\code{ONTOTRIAL_RERANK_TOP_K} & Kandidaten für das Reranking (5)\\
+\code{ONTOTRIAL_OCULAR_PRIOR}, \code{..._MIN_SIM} & okulärer Prior (1; 0,98)\\
+\code{ONTOTRIAL_ICD_OCULAR_PRIOR} & okulärer Prior auch für ICD-10 (1)\\
+\code{ONTOTRIAL_TRANSLATION_CACHE} & Übersetzungscache (1)\\
+\code{ONTOTRIAL_LABEL_GATE_MIN_COVERAGE} & Wortabdeckung des Labels (0,67)\\
+\code{ONTOTRIAL_ICD_REQUIRE_RESOLVED} & ICD-Code muss in \code{icd10_terms} stehen (1)\\
+\code{ONTOTRIAL_BLOCK_HISTORY_ZCODES} & Z85--Z87 nie vergeben (1)\\
+\code{ONTOTRIAL_INTERCEPT_VALIDATE} & Intercepts mit unbekanntem Code ignorieren (1)\\
+\code{ONTOTRIAL_PARENT_CANDIDATE} & Elternknoten als Rerank-Kandidat (1)\\
+\code{ONTOTRIAL_GROUND_GENERIC} & Organ an Begriffe ohne Organbezug anhängen (1)\\
+\bottomrule
+\end{longtable}
+
+Diese Schalter gehören zum Pipeline-Stand der Läufe.
+
+\section{Import, Export, Rückmeldung, Jobs}
+
+\begin{longtable}{@{}P{6.4cm}p{8.2cm}@{}}
+\toprule
+\textbf{Variable} & \textbf{Bedeutung}\\
+\midrule
+\endhead
+\code{ONTOTRIAL_IMPORT_DATE_TOLERANCE_DAYS} & Tage um das Briefdatum, in denen ein anderer Brief desselben Patienten als derselbe Tag gilt (0)\\
+\code{ONTOTRIAL_SEPARATE_SOURCES} & Quellen mit eigenständigen Dokumenten ohne Tagesabgleich (\code{op})\\
+\code{ONTOTRIAL_NOTIFY_URL_<QUELLE>} & Rückmeldung nach dem Speichern eines Phenopackets, etwa \code{ONTOTRIAL_NOTIFY_URL_ARGOS}\\
+\code{ONTOTRIAL_EXPORT_TOKEN} & Token für Langformat-Export und Backfill-Route\\
+\code{ONTOTRIAL_CODES_TOKEN} & Token für \code{/BBB/document_codes}\\
+\code{ONTOTRIAL_JOB_TIMEOUT} & Watchdog für Extraktionsjobs in Sekunden (1800)\\
+\code{ONTOTRIAL_WATCHDOG_LOG} & Protokoll des Watchdogs (\code{/tmp/ontotrial_watchdog.log})\\
+\bottomrule
+\end{longtable}
+
+\section{Validierung und KI-Ensemble}
+
+\begin{longtable}{@{}P{6.4cm}p{8.2cm}@{}}
+\toprule
+\textbf{Variable} & \textbf{Bedeutung}\\
+\midrule
+\endhead
+\code{ONTOTRIAL_REGRESSION_TOLERANCE} & zulässiger F1-Abfall bis zur Meldung „Regression“ (0,02)\\
+\code{ONTOTRIAL_JUDGE_LOCAL_MODELS} & lokale Modelle, kommagetrennt, z.\,B.\ \code{gpt-oss-120b,glm-53,qwen38-27b} (Pipeline-Modell). Mindestens zwei, möglichst verschiedene Modellfamilien\\
+\code{ONTOTRIAL_ENSEMBLE_MODELS} & Teilmenge für das Ensemble; genügt auch allein (alle lokalen Modelle)\\
+\code{ONTOTRIAL_JUDGE_URL_<MODELL>} & eigener Endpunkt je Modell, etwa \code{ONTOTRIAL_JUDGE_URL_GLM_53} (Pipeline-Endpunkt)\\
+\code{ONTOTRIAL_JUDGE_KEY_<MODELL>} & eigener Schlüssel je Modell (Pipeline-Schlüssel)\\
+\code{ONTOTRIAL_JUDGE_REASONING_EFFORT} & Denkaufwand des Judge-Urteils (medium; bei abgeschnittener Antwort einmal low)\\
+\code{ONTOTRIAL_ENSEMBLE_REASONING_EFFORT} & Denkaufwand von Recall und Prüfung (low)\\
+\code{ONTOTRIAL_ENSEMBLE_CHUNK_CHARS} & Abschnittslänge des Recall-Durchgangs (1800)\\
+\code{ONTOTRIAL_JUDGE_LOCAL_MAX_TOKENS} & Ausgabe-Limit (32000)\\
+\code{ONTOTRIAL_JUDGE_LOCAL_TEMPERATURE} & Temperatur (Modell-Standard)\\
+\code{ONTOTRIAL_JUDGE_LOCAL_THINKING} & \code{0} schaltet den Denkmodus über \code{chat_template_kwargs} ab (1)\\
+\code{ONTOTRIAL_JUDGE_USE_PROXY} & \code{1}: Proxy aus der Umgebung verwenden (0)\\
+\code{ONTOTRIAL_DISC_MODELS} & Modelle der Abweichungsprüfung (\code{gpt-oss-120b,qwen38-27b,glm-53})\\
+\code{ONTOTRIAL_DISC_REASONING_EFFORT} & Denkaufwand (low)\\
+\code{ONTOTRIAL_DISC_MAX_PER_CALL} & Abweichungen je Aufruf (40)\\
+\bottomrule
+\end{longtable}
+
+Prompts in \code{llm_prompts}: \code{validation_judge}, \code{validation_recall}, \code{validation_verify}. Fehlen sie, gelten eingebaute Texte (Warnung im Log).
+
+\section{Synthetische Datensätze}\label{sec:envsynth}
+
+\begin{longtable}{@{}P{6.4cm}p{8.2cm}@{}}
+\toprule
+\textbf{Variable} & \textbf{Bedeutung}\\
+\midrule
+\endhead
+\code{ONTOTRIAL_SYNTH_MODEL} & Voreinstellung für das Feld \feld{Modell}\\
+\code{ONTOTRIAL_SYNTH_URL} & Endpunkt für \code{claude-...} (\code{https://api.anthropic.com/v1/messages})\\
+\code{ONTOTRIAL_SYNTH_API_KEY} & Schlüssel (Rückfall \code{ANTHROPIC_API_KEY})\\
+\code{ONTOTRIAL_SYNTH_ALLOW_EXTERNAL} & muss \code{1} sein, wenn der Endpunkt außerhalb des Kliniknetzes liegt\\
+\code{ONTOTRIAL_SYNTH_LOCAL_HOSTS} & regulärer Ausdruck für Hosts im Kliniknetz\\
+\code{ONTOTRIAL_SYNTH_FROM_DATE}, \code{..._SOURCES} & Ziele ab Datum (2025-01-01) aus Quellen (\code{argos})\\
+\code{ONTOTRIAL_SYNTH_ATTEMPTS} & Versuche je Ziel (3)\\
+\code{ONTOTRIAL_SYNTH_MAX_OVERLAP} & zulässiger Textanteil aus den Beispielen (0,15)\\
+\code{ONTOTRIAL_SYNTH_MAX_TOKENS}, \code{..._TEMPERATURE}, \code{..._NUM_CTX} & Generator-Parameter (8000; Standard; 32768 für Ollama)\\
+\code{ONTOTRIAL_SYNTH_NOISE_VALUES} & Messwerte verrauschen (1)\\
+\code{ONTOTRIAL_SYNTH_STRICT} & Belege auf Seite, Datum, Verneinung prüfen (0)\\
+\code{ONTOTRIAL_SYNTH_PROMPT_CACHE} & Prompt-Caching bei Anthropic (1)\\
+\code{ONTOTRIAL_SYNTH_KEEP_KEYS} & Zuordnung Ziel $\rightarrow$ Brief behalten (0)\\
+\code{ONTOTRIAL_SYNTH_DUMP_DIR} & Anfrage und Antwort jedes Aufrufs ablegen (Diagnose)\\
+\bottomrule
+\end{longtable}
+
+% =====================================================================
+\chapter{Datenbank, Schema und Sicherung}\label{kap:db}
+% =====================================================================
+
+\section{Schema und Migration}
+
+Das Schema steht in \code{migrations/ontotrial.sql} und wird beim Start von Hypnotoad eingespielt; die Version steht in \code{mojo_migrations} unter dem Namen \code{ontotrial}. Jede Version läuft genau einmal. Läufe mit Laufzeitmessung brauchen mindestens Version 13, der Chart-Review die Versionen 14 und 15. Fehlt eine Version, meldet die Oberfläche etwa „Datenbankschema veraltet (Schema-Version 13 fehlt)“.
+
+\begin{befehl}
+psql hpo -c "SELECT * FROM mojo_migrations ORDER BY name"
+\end{befehl}
+
+Neue Schemaänderungen als neuen Abschnitt (\code{-- 16 up}, \code{-- 16 down}) anhängen; eine ausgerollte Version nie ändern.
+
+\section{Tabellen der Validierung}
+
+\begin{tabularx}{\textwidth}{@{}P{5.2cm}L@{}}
+\toprule
+\textbf{Tabelle} & \textbf{Inhalt}\\
+\midrule
+\code{validation_sets} & Datensätze: Zweck, Sperre, Status, Parameter (JSON), Referenzquelle, Basis-Lauf\\
+\code{validation_items} & Briefe mit Text, Schnappschuss, Einträgen, eingestreuten Fehlern, Referenz\\
+\code{validation_reviews} & Bewertungen je Prüfer und Eintrag, Phase \code{pre} oder \code{final}\\
+\code{validation_runs}, \code{validation_run_items} & Läufe mit Pipeline-Stand, Kennzahlen, Vergleich; Extraktion, Ergebnis und Sekunden je Brief\\
+\code{validation_ai_reviews} & Judge-Urteile je Modell und Brief\\
+\code{validation_ai_suggestions} & Ensemble-Vorschläge (\code{missing}) und Fehlerhinweise (\code{flag})\\
+\code{validation_discrepancy_checks} & Ergebnisse der Abweichungsprüfung (wird beim ersten Gebrauch angelegt)\\
+\code{chartreview_sets}, \code{_cases}, \code{_reviews} & Chart-Review\\
+\bottomrule
+\end{tabularx}
+
+Trigger schützen gesperrte Datensätze und eingefrorene Bewertungen. Die Funktion \code{ontotrial_redact} ist der einzige vorgesehene Weg, Brieftexte nachträglich zu ändern (Abschnitt~\ref{sec:redact}).
+
+\section{Sicherung}
+
+\begin{itemize}
+  \item Regelmäßig \code{pg_dump} der Hauptdatenbank; bei eigener Minion-Datenbank diese nicht zwingend mitsichern (Jobs sind kurzlebig), aber vor Updates schon.
+  \item Vor riskanten Schritten an einem Datensatz zusätzlich \btn{Sicherung laden} (JSON). Die Datei enthält Briefe und ist personenbezogen.
+  \item \code{.env} getrennt und geschützt sichern.
+\end{itemize}
+
+\begin{befehl}
+pg_dump -Fc hpo > hpo_$(date +%Y%m%d).dump
+pg_dump -Fc -t 'validation_*' -t 'chartreview_*' hpo > validierung_$(date +%Y%m%d).dump
+\end{befehl}
+
+\section{Datenschutz im Betrieb}
+
+\begin{itemize}
+  \item Die API hat keine eigene Anmeldung und sendet \code{Access-Control-Allow-Origin: *}. Nur in einem geschützten Netzsegment hinter einem authentifizierenden Reverse Proxy betreiben.
+  \item Validierungsdatensätze, Chart-Review-Listen, Sicherungen und Langformat-Exporte sind personenbezogen.
+  \item Ensemble und Abweichungsprüfung nutzen nur lokale Modelle. Nach außen gehen Daten nur beim synthetischen Generator mit externem Endpunkt und nur nach \code{ONTOTRIAL_SYNTH_ALLOW_EXTERNAL=1}.
+\end{itemize}
+
+% =====================================================================
+\chapter{Überwachung und Fehlerbehebung}\label{kap:fehler}
+% =====================================================================
+
+\section{Protokoll}
+
+Die Meldungen tragen Kennzeichen, nach denen sich filtern lässt:
+
+\begin{tabularx}{\textwidth}{@{}P{4.2cm}L@{}}
+\toprule
+\textbf{Kennzeichen} & \textbf{Herkunft}\\
+\midrule
+\code{[CONFIG]}, \code{[SCHEMA]} & Start: Datenbanken, Patchbay, Prompt-IDs, Migration\\
+\code{[IMPORT ...]}, \code{[MINION TASK]} & Push und Extraktionsjobs\\
+\code{[DOCUMENT READY]} & Rückmeldung an Quellsysteme\\
+\code{[VALIDATION]} & Datensätze, Vorbereitung, Läufe, Referenz\\
+\code{[ENSEMBLE]}, \code{[JUDGE]} & KI-Ensemble\\
+\code{[SYNTH]}, \code{[DISC]} & Synthetische Briefe, Abweichungsprüfung\\
+\code{[CHARTREVIEW]} & Chart-Review\\
+\code{[LLM]} & Zusatzparameter, Dumps\\
+\bottomrule
+\end{tabularx}
+
+\begin{befehl}
+journalctl -u ontotrial-worker-validation --since "1 hour ago" | grep -E 'ENSEMBLE|VALIDATION'
+tail -f log/worker-default.log
+tail -50 /tmp/ontotrial_watchdog.log
+\end{befehl}
+
+\section{Fehlerbilder}
+
+\begin{longtable}{@{}P{5.0cm}p{9.6cm}@{}}
+\toprule
+\textbf{Beobachtung} & \textbf{Ursache und Abhilfe}\\
+\midrule
+\endhead
+„wartet auf einen Worker (…„validation“…)“ & Kein Worker für diese Queue. \code{minion job -w} prüfen, Worker starten.\\
+Vorbereitung „unterbrochen“ & Worker neu gestartet. \btn{Fortsetzen} im Dialog.\\
+Lauf steht auf „läuft“ ohne Fortschritt & Worker beendet. \btn{Lauf fortsetzen}; meldet es einen aktiven Job, diesen mit \code{-b kill} beenden.\\
+„Für diesen Lauf ist noch Job … aktiv“ & Siehe oben; der Befehl steht in der Meldung.\\
+Job sofort „failed“, unbekannter Task oder alter Fehler & Worker läuft mit altem Code. Worker neu starten, Auftrag neu anstoßen.\\
+„Datenbankschema veraltet (Schema-Version 13 fehlt)“ & \code{migrations/ontotrial.sql} aktualisieren, Hypnotoad neu starten.\\
+„Der Datensatz wird noch vorbereitet“ & Normal; Prüfen, Ensemble und Läufe warten auf das Ende der Vorbereitung.\\
+„Kein lokales Modell für das Ensemble konfiguriert“ & \code{ONTOTRIAL_JUDGE_LOCAL_MODELS} setzen, vollständig neu starten.\\
+„Für diesen Datensatz läuft bereits ein KI-Ensemble“ & Fortschritt im Panel abwarten oder \btn{Ensemble beenden}.\\
+Ensemble ohne Vorschläge & Nur ein Modell erreichbar und \code{min_votes} 2; Modelle und Endpunkte prüfen (\code{[ENSEMBLE]}-Warnungen im Protokoll).\\
+„Antwort abgeschnitten“ & Ausgabe-Limit erreicht. \code{ONTOTRIAL_JUDGE_REASONING_EFFORT=low} oder größeres Limit.\\
+Modell antwortet nicht oder HTTP 4xx & Endpunkt und Modellname prüfen; Modellnamen auf dem Server: siehe Befehl unten. Bei Bedarf \code{ONTOTRIAL_LLM_DUMP_DIR} setzen und die Anfrage mit \code{curl} nachspielen.\\
+Synthetik: „außerhalb des Kliniknetzes“ (403) & Endpunkt ist extern. Nur nach Klärung mit dem Datenschutz \code{ONTOTRIAL_SYNTH_ALLOW_EXTERNAL=1}.\\
+Synthetik: „Prompt … nicht freigegeben“ & Prompt nach der Freigabe geändert; erneut prüfen und freigeben.\\
+Synthetik: viele verworfene Ziele & Gründe im Datensatz (\code{params->'synthetic'->'reject_reasons'}); meist fehlende wörtliche Belege. Prompt schärfen oder anderes Modell.\\
+„Fortsetzen nicht möglich“ bei Synthetik & Zuordnung nach Abschluss gelöscht; neuen Datensatz anlegen.\\
+Gespeicherte Phenopackets: viele Fehler „Brieftext im Bestand wurde geändert“ & Bestand seit der Ziehung neu importiert; Lauf mit Neu-Extraktion verwenden.\\
+Neues Modell fehlt in der Liste & \code{.env} geändert, aber kein vollständiger Neustart von Hypnotoad.\\
+Einfrieren abgelehnt & Offene oder abweichende Briefe; die Meldung nennt sie.\\
+Löschen oder Auftauen abgelehnt & Datensatz gesperrt; zuerst entsperren.\\
+Propensity Matching oder Export bricht ab, Fenster zeigt Zeitüberschreitung & Kohorte oder Kontrollpool zu groß für die synchrone Anfrage; per Tag eingrenzen. Bei Hypnotoad zusätzlich dessen Zeitgrenzen beachten.\\
+Export: „k-Anonymität … nicht erreichbar“ (422) & Weniger Patienten als $k$; Kohorte vergrößern.\\
+Matching: Spalte „Gespiegelt“ immer „nein“ & Bekannt; Option wird im Backend nicht ausgewertet (Abschnitt~\ref{sec:psm}).\\
+Neu-Extraktion: Anzahl „unbekannt“ & Zählroute nicht erreichbar oder Datenbankfehler; Protokoll prüfen.\\
+Import staut sich & Abschnitt „Typische Lagen“ in Kapitel~\ref{kap:minionadmin}.\\
+Extraktion bricht nach 30\,min ab & Watchdog; Kontext in \code{/tmp/ontotrial_watchdog.log}. Brief mit \code{minion job -f <id>} nachstellen.\\
+\bottomrule
+\end{longtable}
+
+\begin{befehl}
+# Modellnamen auf dem Inferenzserver
+( set -a; source .env; set +a; curl -sS -H "Authorization: Bearer $VLLM_API_KEY" \
+  https://inference-api.aipier.kn.uniklinik-freiburg.de/v1/models | python3 -m json.tool | grep '"id"' )
+\end{befehl}
+% =====================================================================
+\appendix
+\chapter{Kurzreferenz für Prüferinnen und Prüfer}\label{anh:kurz}
+% =====================================================================
+
+\begin{tcolorbox}[enhanced,colback=white,colframe=otblau,arc=2pt,boxrule=0.8pt,title=\sffamily\bfseries Ablauf je Brief,colbacktitle=otblau]
+\begin{enumerate}
+  \item Brief lesen. \emph{Studie:} Checkliste ausfüllen, \btn{Checkliste abschließen, Extraktion zeigen}.
+  \item Jeden Eintrag: \taste{Enter} Ensemble bestätigen, \taste{K} korrekt, \taste{F} Fehler (mit richtiger Angabe), \taste{D} Dublette, \taste{U} unklar (mit Kommentar).
+  \item Fehlendes: Vorschläge \btn{Vorschlag übernehmen} oder \btn{Ablehnen}; Eigenes mit \btn{Eigenen ergänzen …}, möglichst mit Code.
+  \item \emph{Studie:} jede Checklistenzeile \btn{Gefunden}, \btn{Attributfehler} oder \btn{Fehlt}.
+  \item \btn{Brief abschließen}. \emph{Studie:} danach ggf.\ Zweitblick.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[enhanced,colback=white,colframe=otblau,arc=2pt,boxrule=0.8pt,title=\sffamily\bfseries Fehlertypen,colbacktitle=otblau]
+\begin{tabularx}{\linewidth}{@{}P{2.4cm}L@{}}
+Konzept & korrekt · zu allgemein · zu spezifisch · falsches Konzept · nicht im Brief · falscher Bezug\\
+Status & korrekt · Verneinung falsch · Geplantes als erfolgt\\
+Seite, Datum & korrekt · falsch · fehlt · überflüssig · nicht anwendbar \textit{(+ richtige Angabe)}\\
+Messwert & korrekt · falsch · nicht anwendbar \textit{(+ richtiger Wert)}\\
+\end{tabularx}
+\end{tcolorbox}
+
+\begin{tcolorbox}[enhanced,colback=white,colframe=otblau,arc=2pt,boxrule=0.8pt,title=\sffamily\bfseries Die sechs wichtigsten Regeln,colbacktitle=otblau]
+\begin{enumerate}
+  \item Nur der Brieftext zählt, auch gegenüber dem Ensemble.
+  \item „V.\,a.\ X“ als X kodiert ist korrekt; Geplantes als erfolgt ist ein Statusfehler.
+  \item Anamnestisches ohne Datum trägt kein Briefdatum; aktuelle Befunde ohne Datum sind korrekt.
+  \item „18/21“ heißt RA 18, LA 21.
+  \item HBW, FZ, LS, NL als Dezimalvisus sind korrekt.
+  \item Im Zweifel \btn{Unklar} mit Kommentar, nicht raten.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[enhanced,colback=white,colframe=otblau,arc=2pt,boxrule=0.8pt,title=\sffamily\bfseries Farben im Brief,colbacktitle=otblau]
+\textcolor{otgruen}{grün} korrekt · \textcolor{otorange}{orange} möglicher Fehler · \textcolor{otblau}{blau} vorgeschlagener fehlender Eintrag · gelb ausgewählter Eintrag
+\end{tcolorbox}
+
+% =====================================================================
+\chapter{API der Validierung und des Chart-Reviews}\label{anh:api}
+% =====================================================================
+
+Alle Routen unter \code{/BBB/}; Antworten JSON, wenn nicht anders angegeben. Geschützte Aktionen verlangen \code{confirm} mit dem Datensatznamen bzw.\ \code{ANLEGEN}. Die API hat keine eigene Anmeldung.
+
+\section{Datensätze}
+
+\begin{longtable}{@{}P{1.2cm}P{6.2cm}p{7.0cm}@{}}
+\toprule
+\textbf{Art} & \textbf{Route} & \textbf{Zweck}\\
+\midrule
+\endhead
+GET & \code{validation/sets} & Liste, bei Vorbereitung mit Fortschritt (\code{prep})\\
+POST & \code{validation/sets} & Stichprobe ziehen: \code{name}, \code{purpose}, \code{n}, \code{seed}, \code{tag}, \code{one_per_patient}, \code{reextract}, \code{model}, \code{ensemble}, \code{double_fraction}, \code{inject_fraction}, \code{min_length}, \code{confirm: "ANLEGEN"}\\
+POST & \code{validation/sets/:id/prepare} & unterbrochene Vorbereitung oder Synthetik fortsetzen\\
+POST & \code{validation/sets/:id/copy} & kopieren (\code{name}, \code{reviews})\\
+POST & \code{validation/sets/:id/lock} & sperren/entsperren (\code{locked}, \code{confirm})\\
+DELETE & \code{validation/sets/:id} & löschen (\code{confirm}; nur entsperrt)\\
+GET & \code{validation/sets/:id/export} & Sicherung als JSON\\
+GET & \code{validation/sets/:id/status} & unvollständige Briefe, Abweichungen, Prüfer\\
+POST & \code{validation/sets/:id/freeze} & Referenz einfrieren (\code{confirm}, \code{by}; Pipeline: \code{source: "run"}, \code{run_id})\\
+POST & \code{validation/sets/:id/unfreeze} & auftauen (\code{confirm}; nur entsperrt)\\
+GET & \code{validation/sets/:id/comparable} & Datensätze mit gemeinsamen Briefen und Referenz\\
+GET & \code{validation/sets/:id/compare_reference?other=} & Referenzvergleich; \code{&format=csv} als Datei\\
+POST & \code{validation/sets/:id/baseline} & Basis-Lauf festlegen (\code{run_id})\\
+\bottomrule
+\end{longtable}
+
+\section{Prüfen}
+
+\begin{longtable}{@{}P{1.2cm}P{6.2cm}p{7.0cm}@{}}
+\toprule
+\endhead
+GET & \code{validation/sets/:id/items?reviewer=} & Briefliste mit eigenem Stand\\
+GET & \code{validation/items/:id?reviewer=} & Brief, Einträge, eigene Urteile, Ensemble (\code{assist}), für Konsens \code{others}\\
+POST & \code{validation/items/:id/review} & Urteile speichern: \code{reviewer}, \code{reviews: [{entry_key, judgment}]}\\
+\bottomrule
+\end{longtable}
+
+\section{Läufe}
+
+\begin{longtable}{@{}P{1.2cm}P{6.2cm}p{7.0cm}@{}}
+\toprule
+\endhead
+POST & \code{validation/sets/:id/runs} & starten: \code{mode} (\code{reextract}/\code{stored}), \code{label}, \code{model}, \code{deep_mode}\\
+GET & \code{validation/sets/:id/runs} & Läufe mit Laufzeit und Median je Brief\\
+GET & \code{validation/runs/:id} & Lauf mit Ergebnissen je Brief\\
+GET & \code{validation/runs/:id/report.csv} & Bericht\\
+POST & \code{validation/runs/:id/cancel} & abbrechen\\
+POST & \code{validation/runs/:id/resume} & fortsetzen\\
+POST & \code{validation/runs/:id/rescore} & neu bewerten\\
+DELETE & \code{validation/runs/:id} & löschen\\
+POST, GET & \code{validation/runs/:id/discrepancy_check} & Abweichungsprüfung starten (\code{models}, \code{min_votes}, \code{shards}) bzw.\ Stand\\
+\bottomrule
+\end{longtable}
+
+\section{Ensemble, Studie, Synthetik}
+
+\begin{longtable}{@{}P{1.2cm}P{6.2cm}p{7.0cm}@{}}
+\toprule
+\endhead
+GET, POST & \code{validation/sets/:id/ensemble} & Stand bzw.\ starten (\code{min_votes})\\
+POST & \code{validation/sets/:id/ensemble/stop} & beenden\\
+GET & \code{validation/sets/:id/study} & Studienkennzahlen\\
+GET & \code{validation/sets/:id/judgments.csv} & alle Bewertungen\\
+GET & \code{validation/synthetic/config?model=} & Generator, Host, extern, freigegeben, Schlüssel\\
+GET, POST & \code{validation/synthetic/prompt} & Prompt lesen bzw.\ speichern\\
+POST & \code{validation/synthetic/prompt/approve} & freigeben (\code{by}, \code{hash})\\
+POST & \code{validation/synthetic/fewshot} & Few-Shot-Paare laden (\code{seed}, \code{by})\\
+POST & \code{validation/sets/synthetic} & Batch anlegen: \code{name}, \code{n}, \code{seed}, \code{model}, \code{from_date}, \code{sources}, \code{prompt_hash}, \code{confirm}\\
+POST, GET & \code{validation/sets/:id/linkage} & Verknüpfbarkeit prüfen bzw.\ Ergebnis\\
+\bottomrule
+\end{longtable}
+
+\section{Werkzeuge im Aktionsmenü}
+
+\begin{longtable}{@{}P{1.2cm}P{6.2cm}p{7.0cm}@{}}
+\toprule
+\endhead
+GET & \code{candidates/count_by_tag?tag=} & Kandidaten mit Tag und Brieftext zählen\\
+POST & \code{candidates/recompute_by_tag} & neu extrahieren: \code{tag}, \code{model}, \code{deep_mode}; Antwort \code{queued}\\
+POST & \code{propensity_match} & \code{treated_tag} oder \code{treated_ids}, \code{control_tag} oder \code{control_ids}, \code{ratio}, \code{caliper}, \code{replace}, \code{exact: ["sex"]}, \code{weights}, \code{max_pool} (5000)\\
+POST & \code{phenopacket_distance} & Distanz zweier Kandidaten oder Phenopackets: \code{a}, \code{b}, \code{weights}, \code{exact}, \code{explain}\\
+POST & \code{candidates/batch_tag} & Tag setzen: \code{tag}, \code{pseudonyms}, \code{append}\\
+POST & \code{export/anonymized_phenopackets} & \code{tag} oder \code{candidate_ids}, \code{k} ($\geq 5$)\\
+\bottomrule
+\end{longtable}
+
+\section{Chart-Review}
+
+\begin{longtable}{@{}P{1.2cm}P{6.2cm}p{7.0cm}@{}}
+\toprule
+\endhead
+GET & \code{chartreview/sets?reviewer=} & Listen mit eigenem Stand\\
+POST & \code{chartreview/sets} & hochladen: \code{name}, \code{csv}, \code{id_col}, \code{eye_col}, \code{from_col}, \code{to_col}, \code{before_days}, \code{after_days}, \code{codes}, \code{sample_n}, \code{sample_by}, \code{sample_seed}\\
+DELETE & \code{chartreview/sets/:id?confirm=} & löschen\\
+GET & \code{chartreview/sets/:id/cases?reviewer=} & Fälle\\
+GET & \code{chartreview/cases/:id} & Fall mit Briefen, Einträgen, Zeitfenster, Urteilen\\
+POST & \code{chartreview/cases/:id/review} & Urteil: \code{reviewer}, \code{code}, \code{comment}, \code{done}\\
+GET & \code{chartreview/sets/:id/result.csv} & Ergebnis\\
+\bottomrule
+\end{longtable}
+
+% =====================================================================
+\chapter{Minion-Spickzettel}\label{anh:minion}
+% =====================================================================
+
+\begin{tcolorbox}[enhanced,colback=white,colframe=otblau,arc=2pt,boxrule=0.8pt,title=\sffamily\bfseries Queues,colbacktitle=otblau]
+\begin{tabularx}{\linewidth}{@{}P{2.3cm}LP{5.4cm}@{}}
+\queue{default} & Import, Extraktion, Rückmeldung & \code{minion worker}\\
+\queue{validation} & Vorbereitung, Läufe, Ensemble, Synthetik, Abweichungsprüfung & \code{minion worker -q validation -j 4}\\
+\queue{backfill} & einmalige Wartung & \code{minion worker -q backfill}\\
+\end{tabularx}
+\end{tcolorbox}
+
+\begin{befehl}
+# Lage
+perl backend.pl minion job -s                    # Statistik
+perl backend.pl minion job -w                    # Worker
+perl backend.pl minion job -S failed -l 20       # Fehlschläge
+perl backend.pl minion job -S inactive -q default  # Rückstand
+perl backend.pl minion job <id>                  # Details
+perl backend.pl minion job -H                    # Verlauf
+
+# Eingreifen
+perl backend.pl minion job -R <id>               # erneut einreihen
+perl backend.pl minion job -f <id>               # im Vordergrund nachstellen
+perl backend.pl minion job --remove <id>         # löschen
+perl backend.pl minion job -b kill -a '["TERM", <id>]'   # laufenden Job beenden
+
+# Worker (macOS: launchd, Abschnitt Dauerbetrieb)
+sudo launchctl kickstart -k system/de.ukf.ontotrial.worker-validation
+kill -TERM <pid>     # geordnet beenden
+kill -TTIN <pid>     # einen Job mehr
+kill -TTOU <pid>     # einen Job weniger
+\end{befehl}
+
+\begin{tcolorbox}[enhanced,colback=white,colframe=otorange,arc=2pt,boxrule=0.8pt,title=\sffamily\bfseries Nach einem Worker-Neustart,colbacktitle=otorange]
+Vorbereitung und Synthetik: \btn{Fortsetzen} · Lauf: \btn{Lauf fortsetzen} · Ensemble: neu starten · Abweichungsprüfung: neu starten · Import: \code{-R <id>} oder neu pushen.
+\end{tcolorbox}
+
+\end{document}
