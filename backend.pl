@@ -6053,10 +6053,32 @@ helper generate_phenopacket_impl => sub {
             $reference_date = $row->{reference_date} // $row->{date} if $row;
         };
     }
+    # PATCH 2026-11-20: Nur ein echtes Metadatum taugt als OP-Datum, nie das Ersatzdatum "heute"
+    my $ref_from_meta = (defined $reference_date && length $reference_date) ? 1 : 0;
     $reference_date //= POSIX::strftime("%Y-%m-%d", localtime);
     # PATCH 2026-10-23: TT.MM.JJ normalisieren und als JJ.MM.TT vertauschte Briefdaten korrigieren
     $reference_date = normalize_reference_day($reference_date) // $reference_date;
     $reference_date = fix_swapped_reference_day($reference_date, $text_content);
+
+    # PATCH 2026-11-20: OP-Bericht? Dann OP-Datum = Metadatum, Seite aus dem Berichtskopf
+    my ($op_day, $op_side);
+    {
+        my $doc_source;
+        if ($candidate_id) {
+            eval {
+                my $row = $self->pg->db->select('candidates', ['doc_source'], { id => $candidate_id })->hash;
+                $doc_source = $row->{doc_source} if $row;
+            };
+        }
+        if ($ref_from_meta && is_op_report($text_content, $doc_source)) {
+            $op_day  = normalize_reference_day($reference_date);
+            $op_side = op_report_side($text_content);
+            my $txt_day = op_report_text_day($text_content);
+            $self->app->log->info("[OP REPORT] Kandidat " . ($candidate_id // '-') . ": OP-Datum " . ($op_day // '-')
+                . " (Metadaten), Seite " . ($op_side // 'unklar')
+                . (($txt_day && $op_day && $txt_day ne $op_day) ? " – ACHTUNG: Kopf nennt $txt_day" : ''));
+        }
+    }
 
     print STDERR "\n=======================================================\n";
     print STDERR ">>> [PHENOPACKET PIPELINE START] Candidate ID: " . ($candidate_id // 'none') . " | RefDate: $reference_date | Deep Mode: " . ($deep_mode ? "ON" : "OFF") . "\n";
@@ -6999,6 +7021,16 @@ helper generate_phenopacket_impl => sub {
                 }
             }
 
+            # PATCH 2026-11-20: OP-Bericht – Prozeduren ohne Datum erhalten das OP-Datum aus den
+            # Metadaten, Prozeduren dieses Tages ohne Seite die Seite des Berichts (vor der
+            # Deduplikation, damit "5-144 (R)" und "5-144 (ohne Seite)" zusammenfallen).
+            if ($op_day) {
+                my ($nd, $ns) = _op_fill_procedures(\@raw_procedures, $op_day, $op_side,
+                    sub { $_[0]{performedTime} }, sub { $_[0]{performedTime} = $_[1] });
+                $self->app->log->info("[OP REPORT] $nd Prozedur(en) mit OP-Datum $op_day, $ns mit Seite " . ($op_side // '-'))
+                    if $nd || $ns;
+            }
+
             my %seen_procs;
             my @final_procedures;
 
@@ -7280,6 +7312,103 @@ my $import_date_tolerance = $ENV{ONTOTRIAL_IMPORT_DATE_TOLERANCE_DAYS} // 0;
 # werden nur über source + doc_id und identischen Text erkannt.
 our %SEPARATE_DOC_SOURCES = map { $_ => 1 } grep { length }
     split /\s*,\s*/, lc($ENV{ONTOTRIAL_SEPARATE_SOURCES} // 'op');
+
+# =========================================================================
+# PATCH 2026-11-20: OP-BERICHTE – OP-Datum aus den Metadaten, Seite aus dem Kopf
+# OP-Berichte nennen das OP-Datum nicht an den Prozeduren; es steht in den
+# Metadaten (candidates.reference_date). Prozeduren ohne eigenes Datum erhalten
+# dieses Datum; Prozeduren dieses OP-Tags ohne Seite die eindeutige Seite des
+# Berichts ("RA" allein unter der Diagnose, "(R)" am Ende der OPS-Zeile,
+# "OP-Seite: rechts"). Widersprüchliche Seiten oder "beidseits" -> keine Seite.
+# OP-Bericht = doc_source in %SEPARATE_DOC_SOURCES oder Kopfzeile
+# am Zeilenanfang "Operationsbericht vom TT.MM." in den ersten 600 Zeichen.
+# Bestehende Pakete: op_report_backfill_task (ohne Sprachmodell).
+# =========================================================================
+our $OP_REPORT_HEAD_RE = qr/^[ \t]*(?:OP[- ]?Bericht|Operationsbericht)[ \t]+vom[ \t]+[0-3]?\d\./mi;
+
+sub is_op_report {
+    my ($text, $source) = @_;
+    return 1 if defined $source && $SEPARATE_DOC_SOURCES{ lc $source };
+    return (defined $text && substr($text, 0, 600) =~ $OP_REPORT_HEAD_RE) ? 1 : 0;
+}
+
+sub op_report_side {
+    my $t = _cat_normalize(shift // '');
+    my %s;
+    my $map = sub {
+        my $x = lc(shift // '');
+        return 'R' if $x =~ /^(?:r|ra|od|rechts?|rechte[ns]?)$/;
+        return 'L' if $x =~ /^(?:l|la|os|links?|linke[ns]?)$/;
+        return 'B' if $x =~ /^(?:b|ba|ou|bds\.?|beidseits|beide)$/;
+        return undef;
+    };
+    # "5-144.5a: … (R)"
+    while ($t =~ /^[ \t]*\d-\d{2,3}(?:\.[0-9a-z]+)?[ \t]*:[^\n]*\([ \t]*([RLB])[ \t]*\)[ \t]*$/gmi) {
+        my $s = $map->($1); $s{$s}++ if $s;
+    }
+    # "RA" allein in einer Zeile
+    while ($t =~ /^[ \t]*(RA|LA|BA|OD|OS|OU)[ \t]*$/gm) {
+        my $s = $map->($1); $s{$s}++ if $s;
+    }
+    # "OP-Seite: rechts", "Operiertes Auge: LA"
+    while ($t =~ /^[ \t]*(?:OP[- ]?Seite|Seite|operierte[ns]?\s+Auge|OP[- ]?Auge)[ \t]*:[ \t]*(rechts|links|beidseits|RA|LA|BA|R|L|B)\b/gmi) {
+        my $s = $map->($1); $s{$s}++ if $s;
+    }
+    return undef if $s{B};
+    my @k = grep { $s{$_} } qw(R L);
+    return @k == 1 ? $k[0] : undef;
+}
+
+sub _op_side_obj {
+    my $s = shift // return undef;
+    return $s eq 'L' ? { id => 'HP:0012835', label => 'Left' }
+         : $s eq 'R' ? { id => 'HP:0012834', label => 'Right' } : undef;
+}
+
+# Datum im Kopf ("Operationsbericht vom 3.3.2026"), nur zum Abgleich mit den Metadaten
+sub op_report_text_day {
+    my $t = shift // return undef;
+    return undef unless substr($t, 0, 600) =~ /\b(?:OP[- ]?Bericht|Operationsbericht)\s+vom\s+([0-3]?\d)\.\s?([01]?\d)\.\s?(\d{4})\b/i;
+    return undef unless $1 >= 1 && $1 <= 31 && $2 >= 1 && $2 <= 12;
+    return sprintf('%04d-%02d-%02d', $3, $2, $1);
+}
+
+# Ergänzt Datum/Seite in einer Liste von Prozedur-Hashes.
+# $get_t/$set_t lesen bzw. setzen das Datum (procedures[]: performedTime,
+# medicalActions[].procedure: performed.timestamp). Liefert (n_datum, n_seite).
+sub _op_fill_procedures {
+    my ($procs, $op_day, $op_side, $get_t, $set_t) = @_;
+    my ($nd, $ns) = (0, 0);
+    my $side_obj = _op_side_obj($op_side);
+    for my $p (grep { ref $_ eq 'HASH' && ref $_->{code} eq 'HASH' } @$procs) {
+        next if to_bool($p->{excluded});
+        my $t = $get_t->($p);
+        unless (defined $t && length $t) { $set_t->($p, $op_day); $t = $op_day; $nd++; }
+        # Seite nur für Eingriffe dieses OP-Tags, nicht für Voroperationen ("PAST-UK-UK", andere Daten)
+        next unless $side_obj && substr($t, 0, 10) eq $op_day;
+        my $site = ref $p->{bodySite} eq 'HASH' ? ($p->{bodySite}{id} // '') : '';
+        next if length $site;
+        $p->{bodySite} = { %$side_obj };
+        $ns++;
+    }
+    return ($nd, $ns);
+}
+
+# Nachtrag in ein bestehendes Paket; liefert (n_datum, n_seite)
+sub op_report_backfill_packet {
+    my ($pp, $text, $op_day) = @_;
+    return (0, 0) unless ref $pp eq 'HASH' && $op_day && $op_day =~ /^\d{4}-\d{2}-\d{2}$/;
+    my $side = op_report_side($text);
+    my ($nd, $ns) = _op_fill_procedures(ref $pp->{procedures} eq 'ARRAY' ? $pp->{procedures} : [], $op_day, $side,
+        sub { $_[0]{performedTime} }, sub { $_[0]{performedTime} = $_[1] });
+    # medicalActions[].procedure spiegelt procedures[]; gleiche Regel, damit beide übereinstimmen
+    my @ma = map { $_->{procedure} } grep { ref $_ eq 'HASH' && ref $_->{procedure} eq 'HASH' }
+             @{ ref $pp->{medicalActions} eq 'ARRAY' ? $pp->{medicalActions} : [] };
+    _op_fill_procedures(\@ma, $op_day, $side,
+        sub { ref $_[0]{performed} eq 'HASH' ? $_[0]{performed}{timestamp} : undef },
+        sub { $_[0]{performed} = { timestamp => $_[1] } });
+    return ($nd, $ns);
+}
 
 sub normalize_reference_day {
     my ($d) = @_;
@@ -10175,6 +10304,8 @@ post '/BBB/candidates/recompute_by_tag' => sub {
     my $tag            = $payload->{tag};
     my $selected_model = $payload->{model};
     my $deep_mode      = $payload->{deep_mode} // 0;
+    # PATCH 2026-11-20: optionale Minion-Priorität (höher = früher; Live-Briefe argos 0, Altbestand -5)
+    my $priority       = ($payload->{priority} // '') =~ /^-?\d+$/ ? $payload->{priority} + 0 : 0;
 
     unless ($tag && length($tag)) {
         return $c->render(json => { success => 0, error => "Parameter 'tag' ist erforderlich." }, status => 400);
@@ -10210,12 +10341,12 @@ post '/BBB/candidates/recompute_by_tag' => sub {
             reference_date => $cand->{reference_date},
             model          => $selected_model,
             deep_mode      => $deep_mode
-        }]);
+        }] => { priority => $priority });
         $queued_count++;
     }
 
-    $c->app->log->info("[RECOMPUTE BY TAG] $queued_count Kandidaten mit Tag '$tag' zur Neu-Extraktion in Minion eingereiht.");
-    $c->render(json => { success => 1, tag => $tag, queued => $queued_count });
+    $c->app->log->info("[RECOMPUTE BY TAG] $queued_count Kandidaten mit Tag '$tag' zur Neu-Extraktion in Minion eingereiht (Priorität $priority).");
+    $c->render(json => { success => 1, tag => $tag, queued => $queued_count, priority => $priority });
 };
 
 # =========================================================
@@ -11216,6 +11347,20 @@ post '/BBB/admin/cataract_backfill' => sub {
     }
     my $dry = $c->param('dry_run') ? 1 : 0;
     my $id  = $c->minion->enqueue(cataract_backfill_task => [{ dry_run => $dry }], { queue => 'backfill' });
+    $c->render(json => { job_id => $id, dry_run => $dry,
+                         hinweis => "Status: perl backend.pl minion job $id" });
+};
+
+# PATCH 2026-11-20: OP-Datum (Metadaten) und Seite in bestehende OP-Berichte nachtragen
+#   curl -X POST 'http://…:3015/BBB/admin/op_report_backfill?dry_run=1'
+post '/BBB/admin/op_report_backfill' => sub {
+    my $c = shift;
+    if (my $tok = $ENV{ONTOTRIAL_EXPORT_TOKEN}) {
+        my $given = $c->req->headers->header('X-Export-Token') // $c->param('token') // '';
+        return $c->render(json => { error => 'Token fehlt oder ist falsch.' }, status => 403) unless $given eq $tok;
+    }
+    my $dry = $c->param('dry_run') ? 1 : 0;
+    my $id  = $c->minion->enqueue(op_report_backfill_task => [{ dry_run => $dry }], { queue => 'backfill' });
     $c->render(json => { job_id => $id, dry_run => $dry,
                          hinweis => "Status: perl backend.pl minion job $id" });
 };
@@ -12345,6 +12490,128 @@ get '/BBB/validation/sets/:id/export' => sub {
                          set => $set, items => $items, reviews => $rev, ai_reviews => $ai, runs => $runs });
 };
 
+# Rohdaten eines Datensatzes als ZIP für die Auswertung mit anderen Programmen.
+# NICHT anonymisiert: enthält Brieftexte und Pseudonyme, bleibt im Haus.
+#   README.txt                   Aufbau und Spalten
+#   index.csv                    ein Brief je Zeile
+#   briefe/NNNN_<Pseudonym>.txt  Brieftext, wie er der Extraktion vorlag
+#   phenopackets/NNNN_….json     gespeichertes Phenopacket (GA4GH v2) des Datensatzes
+#   referenz/NNNN_….json         eingefrorene Referenz (nur wenn eingefroren)
+#   eintraege.csv                alle Einträge im Langformat (Extraktion, Referenz, Läufe)
+#   laeufe.csv, laeufe/<Lauf>/…  Phenopackets aller abgeschlossenen Läufe (nur mit ?runs=1)
+get '/BBB/validation/sets/:id/rawdata.zip' => sub {
+    my $c   = shift;
+    my $db  = $c->pg->db;
+    my $set = _val_load_set($db, $c->param('id')) or return $c->render(json => { error => 'Datensatz nicht gefunden.' }, status => 404);
+    my $with_runs = $c->param('runs') ? 1 : 0;
+    my $items = _val_load_items($db, $set->{id});
+    require IO::Compress::Zip;
+    require JSON::PP;
+    my $pj   = JSON::PP->new->utf8->canonical->pretty->allow_blessed->convert_blessed;
+    my $cell = sub { my $v = shift // ''; $v = $v ? 1 : 0 if JSON::PP::is_bool($v); $v =~ /[";\r\n]/ ? '"' . ($v =~ s/"/""/gr) . '"' : $v };
+    my $csv  = sub { join(';', map { $cell->($_) } @_) };
+    (my $fn = $set->{name}) =~ s/[^A-Za-z0-9_\-]+/_/g;
+    my $root = "rohdaten_$fn";
+    my $stem = sub { my $i = shift; (my $ps = $i->{pseudonym} // '') =~ s/[^A-Za-z0-9_\-]+/_/g; sprintf('%04d', $i->{position}) . (length $ps ? "_$ps" : '') };
+    my $now  = time;
+
+    my ($buf, $zip) = ('');
+    my $add = sub {
+        my ($name, $bytes) = @_;
+        my %o = (Name => "$root/$name", Time => $now, Method => IO::Compress::Zip::ZIP_CM_DEFLATE(), Minimal => 1);
+        if ($zip) { $zip->newStream(%o) or die $IO::Compress::Zip::ZipError }
+        else      { $zip = IO::Compress::Zip->new(\$buf, %o) or die $IO::Compress::Zip::ZipError }
+        $zip->print($bytes);
+    };
+    my $bom = "\x{FEFF}";
+    my @ecols = qw(key domain code label side date excluded value unit comparator value_text);
+    my @eout  = ($csv->(qw(quelle position item_id pseudonym), @ecols));
+    my $push_entries = sub {
+        my ($src, $i, $list) = @_;
+        for my $e (@{ $list // [] }) {
+            next if _val_is_derived($e);
+            push @eout, $csv->($src, $i->{position}, $i->{id}, $i->{pseudonym}, map { $_ eq 'excluded' ? ($e->{$_} ? 1 : 0) : $e->{$_} } @ecols);
+        }
+    };
+
+    my @idx = ($csv->(qw(position item_id pseudonym candidate_id doc_source reference_date stratum double_review injected
+                         brief phenopacket referenz n_eintraege n_referenz)));
+    for my $i (@$items) {
+        my $st  = $stem->($i);
+        my $pp  = _val_json($i->{snapshot});
+        my $ref = _val_json($i->{reference});
+        my $has_pp  = ref $pp eq 'HASH' && %$pp ? 1 : 0;
+        my $has_ref = ref $ref eq 'HASH' && $set->{frozen_at} ? 1 : 0;
+        $add->("briefe/$st.txt", encode('UTF-8', $i->{narrative} // ''));
+        $add->("phenopackets/$st.json", $pj->encode($pp)) if $has_pp;
+        $add->("referenz/$st.json", $pj->encode($ref)) if $has_ref;
+        my $entries = _val_json($i->{entries}) // [];
+        $push_entries->('extraktion', $i, $entries);
+        $push_entries->('referenz', $i, $ref->{entries}) if $has_ref;
+        my $inj = _val_json($i->{injected}) // [];
+        push @idx, $csv->($i->{position}, $i->{id}, $i->{pseudonym}, $i->{candidate_id}, $i->{doc_source}, $i->{reference_date},
+                          $i->{stratum}, $i->{double_review} ? 1 : 0, scalar(@$inj),
+                          "briefe/$st.txt", $has_pp ? "phenopackets/$st.json" : '', $has_ref ? "referenz/$st.json" : '',
+                          scalar(grep { !_val_is_derived($_) } @$entries),
+                          $has_ref ? scalar(grep { !_val_is_derived($_) } @{ $ref->{entries} // [] }) : '');
+    }
+
+    my $n_runs = 0;
+    if ($with_runs) {
+        my %by_id = map { $_->{id} => $_ } @$items;
+        my $runs  = $db->query(q{SELECT id, mode, label, status, fingerprint, started_at, finished_at FROM validation_runs
+                                 WHERE set_id = ? AND status = 'finished' ORDER BY id}, $set->{id})->expand->hashes->to_array;
+        my @rout = ($csv->(qw(lauf_id ordner modus label modell deep_mode gestartet beendet briefe_mit_phenopacket)));
+        for my $r (@$runs) {
+            my $fp = ref $r->{fingerprint} eq 'HASH' ? $r->{fingerprint} : (_val_json($r->{fingerprint}) // {});
+            (my $lab = join('_', grep { length } $r->{label} // '', $fp->{model} // '')) =~ s/[^A-Za-z0-9_\-]+/_/g;
+            my $dir = "laeufe/$r->{id}" . (length $lab ? "_$lab" : '');
+            my $n = 0;
+            my $rows = $db->query(q{SELECT item_id, phenopacket FROM validation_run_items WHERE run_id = ? AND phenopacket IS NOT NULL},
+                                  $r->{id})->expand->hashes;
+            for my $ri (@$rows) {
+                my $i  = $by_id{ $ri->{item_id} } or next;
+                my $pp = _val_json($ri->{phenopacket});
+                next unless ref $pp eq 'HASH';
+                $add->("$dir/" . $stem->($i) . '.json', $pj->encode($pp));
+                $push_entries->("lauf_$r->{id}", $i, _val_entries($pp));
+                $n++;
+            }
+            push @rout, $csv->($r->{id}, $dir, $r->{mode}, $r->{label}, $fp->{model}, $fp->{deep_mode} ? 1 : 0, $r->{started_at}, $r->{finished_at}, $n);
+            $n_runs++;
+        }
+        $add->('laeufe.csv', encode('UTF-8', $bom . join("\n", @rout) . "\n"));
+    }
+
+    $add->('index.csv',     encode('UTF-8', $bom . join("\n", @idx) . "\n"));
+    $add->('eintraege.csv', encode('UTF-8', $bom . join("\n", @eout) . "\n"));
+    my $readme = join("\n",
+        "OntoTrial – Rohdaten des Validierungsdatensatzes \"$set->{name}\" (ID $set->{id}, Zweck $set->{purpose})",
+        'Exportiert am ' . POSIX::strftime('%Y-%m-%d %H:%M:%S', localtime($now)) . ($with_runs ? ", mit $n_runs abgeschlossenen Läufen" : ', ohne Läufe'),
+        '',
+        'ACHTUNG: nicht anonymisiert. Brieftexte und Pseudonyme sind personenbezogen; die Daten bleiben im Haus.',
+        '',
+        'index.csv          ein Brief je Zeile (Semikolon, UTF-8 mit BOM); Spalten brief/phenopacket/referenz nennen die Dateien',
+        'briefe/            Brieftext je Brief, wie er der Extraktion vorlag (UTF-8)',
+        'phenopackets/      gespeichertes Phenopacket (GA4GH Phenopacket v2, JSON) des Datensatzes',
+        'referenz/          eingefrorene Referenz je Brief (nur wenn die Referenz eingefroren ist)',
+        'eintraege.csv      alle Einträge im Langformat; quelle = extraktion | referenz | lauf_<ID>',
+        '                   Spalten: ' . join(', ', @ecols),
+        ($with_runs ? ('laeufe.csv         abgeschlossene Läufe mit Modell und Ordner',
+                       'laeufe/<ID>_…/     Phenopackets je Lauf und Brief') : ()),
+        '',
+        'Dateinamen: vierstellige Position im Datensatz, Unterstrich, Pseudonym.',
+        'Abgeleitete Einträge (z. B. berechnetes sphärisches Äquivalent) fehlen in eintraege.csv wie in der Bewertung, stehen aber in den Phenopackets.',
+        '');
+    $add->('README.txt', encode('UTF-8', $readme));
+    $zip->close;
+
+    $c->app->log->info(sprintf('[VALIDATION] Rohdaten-Export "%s": %d Briefe, %d Läufe, %.1f MB.', $set->{name}, scalar @$items, $n_runs, length($buf) / 1048576));
+    $c->res->headers->content_type('application/zip');
+    $c->res->headers->content_disposition("attachment; filename=\"$root" . ($with_runs ? '_mit_laeufen' : '') . '.zip"');
+    $c->render(data => $buf);
+};
+
 # ---------------------------------------------------------
 # Prüfen: Briefliste, Brief mit Einträgen, Bewertungen speichern
 # ---------------------------------------------------------
@@ -12841,6 +13108,63 @@ app->minion->add_task(cataract_backfill_task => sub {
             . ($skipped_race ? ", $skipped_race wegen gleichzeitiger Änderung übersprungen" : '');
     $app->log->info("[CATARACT BACKFILL] Fertig: $msg");
     $job->finish({ checked => $k, updated => $upd, measurements => $added, dry_run => $dry, skipped_race => $skipped_race });
+});
+
+# PATCH 2026-11-20: OP-Datum aus den Metadaten und Seite des Berichts in bestehende
+# OP-Berichte nachtragen (Pakete, die vor diesem Patch extrahiert wurden). Kein
+# Sprachmodell; idempotent und fortsetzbar (Prozeduren mit Datum/Seite bleiben
+# unverändert). dry_run => 1 zählt nur. "abweichend" = Kopf nennt ein anderes Datum.
+app->minion->add_task(op_report_backfill_task => sub {
+    my ($job, $p) = @_;
+    my $app  = $job->app;
+    my $db   = $app->pg->db;
+    my $dry  = $p->{dry_run} ? 1 : 0;
+    my $task = 'op_report_backfill';
+    my $srcs = [ sort keys %SEPARATE_DOC_SOURCES ];
+    my $head = '(^|\n)[ \t]*(op[- ]?bericht|operationsbericht)[ \t]+vom[ \t]+[0-3]?[0-9]\.';
+    my $where = q{phenopacket_json IS NOT NULL AND reference_date IS NOT NULL
+                  AND (lower(COALESCE(doc_source, '')) = ANY(?) OR left(narrative_report, 600) ~* ?)};
+    my $n = $db->query("SELECT count(*) FROM candidates WHERE $where", $srcs, $head)->array->[0];
+    my %st = map { $_ => 0 } qw(checked updated dates sides no_side mismatch skipped_race);
+    my $last = 0;
+    $app->log->info("[OP BACKFILL] Start: $n OP-Berichte" . ($dry ? ' (Probelauf)' : ''));
+    while (1) {
+        my $rows = $db->query(qq{
+            SELECT id, doc_source, narrative_report, to_char(reference_date::date, 'YYYY-MM-DD') AS rd,
+                   phenopacket_json::text AS pp, md5(phenopacket_json::text) AS h
+              FROM candidates
+             WHERE id > ? AND $where
+             ORDER BY id LIMIT 500}, $last, $srcs, $head)->hashes->to_array;
+        last unless @$rows;
+        for my $r (@$rows) {
+            $last = $r->{id}; $st{checked}++;
+            next unless is_op_report($r->{narrative_report}, $r->{doc_source});
+            my $day = fix_swapped_reference_day($r->{rd}, $r->{narrative_report});
+            my $txt = op_report_text_day($r->{narrative_report});
+            $st{mismatch}++ if $txt && $txt ne $day;
+            $st{no_side}++ unless op_report_side($r->{narrative_report});
+            my $pp = eval { from_json($r->{pp}) } or next;
+            my ($nd, $ns) = eval { op_report_backfill_packet($pp, $r->{narrative_report}, $day) };
+            if ($@) { $app->log->warn("[OP BACKFILL] Kandidat $r->{id}: $@"); next; }
+            next unless $nd || $ns;
+            unless ($dry) {
+                my $ok = $db->query('UPDATE candidates SET phenopacket_json = ? WHERE id = ? AND md5(phenopacket_json::text) = ?',
+                                    to_json($pp), $r->{id}, $r->{h})->rows;
+                unless ($ok) { $st{skipped_race}++; next; }
+            }
+            $st{updated}++; $st{dates} += $nd; $st{sides} += $ns;
+        }
+        my $pct = int(100 * $st{checked} / ($n || 1));
+        $job->note(progress => $pct, total => $n, %st);
+        $app->notify_task_progress($task, 'backfill', $pct, "OP-Berichte: $st{checked}/$n geprüft, $st{updated} ergänzt");
+    }
+    my $msg = "$st{checked} OP-Berichte geprüft, $st{updated} " . ($dry ? 'würden ergänzt' : 'ergänzt')
+            . " ($st{dates} Datumsangaben, $st{sides} Seiten); ohne erkennbare Seite: $st{no_side};"
+            . " Kopfdatum weicht von Metadaten ab: $st{mismatch}"
+            . ($st{skipped_race} ? "; $st{skipped_race} wegen gleichzeitiger Änderung übersprungen" : '');
+    $app->log->info("[OP BACKFILL] Fertig: $msg");
+    $app->notify_task_progress($task, 'finished', 100, "OP-Nachtrag fertig");
+    $job->finish({ %st, total => $n, dry_run => $dry });
 });
 
 app->minion->add_task(validation_prepare_task => sub {

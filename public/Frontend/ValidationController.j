@@ -27,6 +27,12 @@ var SharedValidationController = nil;
 var OVConsensusName = "Konsens";
 var OVReviewerStorageKey = "ontotrial_validation_reviewer";
 var OVJudgeStorageKey = "ontotrial_validation_judge";
+// Senkrechte Trenner (Brief | Tabellen): Mindestbreiten. Die Briefspalte braucht Platz für das
+// Suchfeld, die rechte Spalte für ihre Knopfzeilen. Ist das Fenster zu schmal, gewinnt der Brief.
+var OVLetterMinWidth = 220.0,
+    OVTablesMinWidth = 580.0,
+    CRLetterMinWidth = 280.0,
+    CRJudgeMinWidth  = 450.0;
 
 var OVDomains      = ["disease", "phenotype", "procedure", "treatment", "measurement"];
 var OVDomainTitles = { disease: "Diagnose", phenotype: "Befund", procedure: "Eingriff", treatment: "Medikation", measurement: "Messwert" };
@@ -486,6 +492,7 @@ function _synDirty()
     id              _itemsLoadingId;
     CPButton        _restButton;
     CPSplitView     _entriesSplit;
+    CPSplitView     _letterSplit;
     CPTextField     _letterSearch;
     CPTextField     _letterSearchInfo;
     id              _searchHits;
@@ -680,18 +687,19 @@ function _synDirty()
     [_setPopUp setAction:@selector(setChanged:)];
     [cv addSubview:_setPopUp];
     [cv addSubview:OTButton(CGRectMake(415, 12, 150, 26), "Neuer Datensatz …", self, @selector(showNewSetPanel:))];
-    [cv addSubview:OTButton(CGRectMake(575, 12, 150, 26), "Sicherung laden", self, @selector(exportSet:))];
+    [cv addSubview:OTButton(CGRectMake(575, 12, 130, 26), "Sicherung (JSON)", self, @selector(exportSet:))];
+    [cv addSubview:OTButton(CGRectMake(710, 12, 130, 26), "Rohdaten (ZIP) …", self, @selector(exportRawData:))];
 
-    [cv addSubview:OTButton(CGRectMake(735, 12, 120, 26), "Chart-Review …", self, @selector(showChartReview:))];
-    [cv addSubview:OTLabel(CGRectMake(865, 17, 50, 18), "Prüfer:", YES)];
+    [cv addSubview:OTButton(CGRectMake(845, 12, 120, 26), "Chart-Review …", self, @selector(showChartReview:))];
+    [cv addSubview:OTLabel(CGRectMake(975, 17, 50, 18), "Prüfer:", YES)];
     var stored = "";
     try { stored = window.localStorage.getItem(OVReviewerStorageKey) || ""; } catch (e) { stored = ""; }
-    _reviewerField = OTField(CGRectMake(915, 12, 130, 26), stored, "Name");
+    _reviewerField = OTField(CGRectMake(1025, 12, 130, 26), stored, "Name");
     [_reviewerField setTarget:self];
     [_reviewerField setAction:@selector(reviewerChanged:)];
     [cv addSubview:_reviewerField];
 
-    _setInfoLabel = OVM(OTLabel(CGRectMake(1055, 10, 235, 32), "", NO), CPViewWidthSizable);
+    _setInfoLabel = OVM(OTLabel(CGRectMake(1165, 10, 125, 32), "", NO), CPViewWidthSizable);
     [_setInfoLabel setTextColor:[CPColor grayColor]];
     [cv addSubview:_setInfoLabel];
 
@@ -895,6 +903,26 @@ function _synDirty()
     if (!_currentSet)
         return;
     window.open("/BBB/validation/sets/" + _currentSet.id + "/export", "_blank");
+}
+
+// Rohdaten für andere Programme: Brieftexte, Phenopackets, Referenz, Einträge als CSV und auf
+// Wunsch die Phenopackets aller abgeschlossenen Läufe, als ZIP. Nicht anonymisiert.
+- (void)exportRawData:(id)sender
+{
+    if (!_currentSet)
+    {
+        OVAlert("Bitte zuerst einen Datensatz wählen.");
+        return;
+    }
+    var setId = _currentSet.id;
+    [OVDialog choose:"Rohdaten von „" + _currentSet.name + "“ als ZIP herunterladen?"
+                info:"Enthält je Brief den Brieftext (.txt) und das Phenopacket (.json), die eingefrorene Referenz, eine Indexdatei und alle Einträge im Langformat (CSV, Semikolon, UTF-8). " +
+                     "Auf Wunsch zusätzlich die Phenopackets aller abgeschlossenen Läufe.\n\nNicht anonymisiert: Brieftexte und Pseudonyme sind personenbezogen und bleiben im Haus."
+             buttons:["Ohne Läufe", "Mit allen Läufen", "Abbrechen"] then:function(index)
+    {
+        if (index === 0 || index === 1)
+            window.open("/BBB/validation/sets/" + setId + "/rawdata.zip" + (index === 1 ? "?runs=1" : ""), "_blank");
+    }];
 }
 
 - (void)showNewSetPanel:(id)sender
@@ -1395,17 +1423,24 @@ function _synDirty()
     _progressLabel = OVM(OTLabel(CGRectMake(5, 650, 230, 40), "", NO), CPViewMinYMargin);
     [v addSubview:_progressLabel];
 
-    _letterHeader = OVM(OTLabel(CGRectMake(245, 5, 230, 18), "", YES), CPViewWidthSizable);
-    [v addSubview:_letterHeader];
+    // Brief links, Checkliste und Tabellen rechts: senkrechter Trenner zum Ziehen.
+    // Die Breite der Briefspalte wird im Browser gespeichert.
+    var vsplit = OVM([[CPSplitView alloc] initWithFrame:CGRectMake(245, 0, 1020, 710)], CPViewWidthSizable | CPViewHeightSizable);
+    [vsplit setVertical:YES];
+    var lp = [[CPView alloc] initWithFrame:CGRectMake(0, 0, 430, 710)];
+    var rp = [[CPView alloc] initWithFrame:CGRectMake(0, 0, 580, 710)];
+
+    _letterHeader = OVM(OTLabel(CGRectMake(0, 5, 230, 18), "", YES), CPViewWidthSizable);
+    [lp addSubview:_letterHeader];
     _letterSearch = OVM([CPTextField textFieldWithStringValue:"" placeholder:"Im Brief suchen …" width:150], CPViewMinXMargin);
-    [_letterSearch setFrame:CGRectMake(480, 1, 150, 24)];
+    [_letterSearch setFrame:CGRectMake(235, 1, 150, 24)];
     [_letterSearch setTarget:self];
     [_letterSearch setAction:@selector(searchInLetter:)];
     [_letterSearch setDelegate:self];
-    [v addSubview:_letterSearch];
-    _letterSearchInfo = OVM(OTLabel(CGRectMake(634, 5, 41, 18), "", NO), CPViewMinXMargin);
-    [v addSubview:_letterSearchInfo];
-    var lt = OVTextArea(CGRectMake(245, 26, 430, 674), NO);
+    [lp addSubview:_letterSearch];
+    _letterSearchInfo = OVM(OTLabel(CGRectMake(389, 5, 41, 18), "", NO), CPViewMinXMargin);
+    [lp addSubview:_letterSearchInfo];
+    var lt = OVTextArea(CGRectMake(0, 26, 430, 674), NO);
     _letterView = lt.text;
     // Briefansicht: CPTextView mit farbig hinterlegten Belegen
     [_letterView setRichText:YES];
@@ -1415,32 +1450,32 @@ function _synDirty()
     [_letterView setMaxSize:CGSizeMake(100000, 100000)];
     [[_letterView textContainer] setWidthTracksTextView:YES];
     [_letterView setFont:[CPFont systemFontOfSize:13.0]];
-    [v addSubview:OVM(lt.scroll, CPViewWidthSizable | CPViewHeightSizable)];
+    [lp addSubview:OVM(lt.scroll, CPViewWidthSizable | CPViewHeightSizable)];
 
-    // rechte Spalte
-    var x = 685, w = 580;
+    // rechte Spalte: wächst mit, wenn der Trenner nach links gezogen wird
+    var x = 0, w = 580, ws = CPViewWidthSizable;
 
-    _checklistBox = OVM([[CPView alloc] initWithFrame:CGRectMake(x, 5, w, 180)], CPViewMinXMargin);
-    [_checklistBox addSubview:OTLabel(CGRectMake(0, 0, w, 18), "Teil A – Checkliste (vor der Extraktion ausfüllen)", YES)];
+    _checklistBox = OVM([[CPView alloc] initWithFrame:CGRectMake(x, 5, w, 180)], ws);
+    [_checklistBox addSubview:OVM(OTLabel(CGRectMake(0, 0, w, 18), "Teil A – Checkliste (vor der Extraktion ausfüllen)", YES), ws)];
     var ct = OVTable(CGRectMake(0, 20, w, 120), [["cat", "Kategorie", 90], ["text", "Angabe", 200], ["side", "Seite", 50],
                                                  ["date", "Datum", 80], ["value", "Wert", 60], ["match", "Abgleich", 95]], self);
     _checklistTable = ct.table;
-    [_checklistBox addSubview:ct.scroll];
+    [_checklistBox addSubview:OVM(ct.scroll, ws)];
     [_checklistBox addSubview:OTButton(CGRectMake(0, 148, 120, 24), "Zeile hinzufügen …", self, @selector(addChecklistLine:))];
     [_checklistBox addSubview:OTButton(CGRectMake(125, 148, 70, 24), "Entfernen", self, @selector(removeChecklistLine:))];
     [_checklistBox addSubview:OTButton(CGRectMake(240, 148, 80, 24), "Gefunden", self, @selector(matchFound:))];
     [_checklistBox addSubview:OTButton(CGRectMake(325, 148, 110, 24), "Attributfehler", self, @selector(matchAttr:))];
     [_checklistBox addSubview:OTButton(CGRectMake(440, 148, 70, 24), "Fehlt", self, @selector(matchMissing:))];
-    [v addSubview:_checklistBox];
+    [rp addSubview:_checklistBox];
 
     _blindLabel = OVM(OTLabel(CGRectMake(x, 200, w, 40),
-        "Die Extraktion bleibt verborgen, bis die Checkliste abgeschlossen ist. So wird die Vollständigkeit unverzerrt gemessen.", NO), CPViewMinXMargin);
-    [v addSubview:_blindLabel];
-    _showExtractionButton = OVM(OTButton(CGRectMake(x, 245, 280, 26), "Checkliste abschließen, Extraktion zeigen", self, @selector(finishChecklist:)), CPViewMinXMargin);
-    [v addSubview:_showExtractionButton];
+        "Die Extraktion bleibt verborgen, bis die Checkliste abgeschlossen ist. So wird die Vollständigkeit unverzerrt gemessen.", NO), ws);
+    [rp addSubview:_blindLabel];
+    _showExtractionButton = OTButton(CGRectMake(x, 245, 280, 26), "Checkliste abschließen, Extraktion zeigen", self, @selector(finishChecklist:));
+    [rp addSubview:_showExtractionButton];
 
-    _entriesBox = OVM([[CPView alloc] initWithFrame:CGRectMake(x, 190, w, 470)], CPViewMinXMargin | CPViewHeightSizable);
-    [_entriesBox addSubview:OTLabel(CGRectMake(0, 0, w, 18), "Teil B – Extrahierte Einträge", YES)];
+    _entriesBox = OVM([[CPView alloc] initWithFrame:CGRectMake(x, 190, w, 470)], ws | CPViewHeightSizable);
+    [_entriesBox addSubview:OVM(OTLabel(CGRectMake(0, 0, w, 18), "Teil B – Extrahierte Einträge", YES), ws)];
     // Einträge oben, fehlende Einträge unten; der Trenner dazwischen lässt sich ziehen
     var split = OVM([[CPSplitView alloc] initWithFrame:CGRectMake(0, 20, w, 450)], CPViewWidthSizable | CPViewHeightSizable);
     [split setVertical:NO];
@@ -1486,12 +1521,21 @@ function _synDirty()
     var savedPos = nil;
     try { savedPos = parseFloat(window.localStorage.getItem("ontotrial.validation.split")); } catch (e) {}
     window.setTimeout(function() { [split setPosition:(savedPos > 120 ? savedPos : 280) ofDividerAtIndex:0]; }, 0);
-    [v addSubview:_entriesBox];
+    [rp addSubview:_entriesBox];
 
-    _doneButton = OVM(OTButton(CGRectMake(x, 672, 180, 28), "Brief abschließen", self, @selector(toggleDone:)), CPViewMinXMargin | CPViewMinYMargin);
-    [v addSubview:_doneButton];
-    [v addSubview:OVM(OTButton(CGRectMake(x + 190, 672, 150, 28), "Nächster offener Brief", self, @selector(nextOpenItem:)), CPViewMinXMargin | CPViewMinYMargin)];
-    [v addSubview:OVM(OTLabel(CGRectMake(x + 350, 668, 230, 34), "Belege: grün korrekt · orange Fehler · blau fehlend · gelb ausgewählt", NO), CPViewMinXMargin | CPViewMinYMargin)];
+    _doneButton = OVM(OTButton(CGRectMake(x, 672, 180, 28), "Brief abschließen", self, @selector(toggleDone:)), CPViewMinYMargin);
+    [rp addSubview:_doneButton];
+    [rp addSubview:OVM(OTButton(CGRectMake(x + 190, 672, 150, 28), "Nächster offener Brief", self, @selector(nextOpenItem:)), CPViewMinYMargin)];
+    [rp addSubview:OVM(OTLabel(CGRectMake(x + 350, 668, 230, 34), "Belege: grün korrekt · orange Fehler · blau fehlend · gelb ausgewählt", NO), CPViewMinYMargin | ws)];
+
+    [vsplit addSubview:lp];
+    [vsplit addSubview:rp];
+    [vsplit setDelegate:self];
+    [v addSubview:vsplit];
+    _letterSplit = vsplit;
+    var savedLetterW = nil;
+    try { savedLetterW = parseFloat(window.localStorage.getItem("ontotrial.validation.lettersplit")); } catch (e) {}
+    window.setTimeout(function() { [vsplit setPosition:(savedLetterW >= 200 ? savedLetterW : 430) ofDividerAtIndex:0]; }, 0);
     return v;
 }
 
@@ -1568,10 +1612,13 @@ function _synDirty()
     if (_itemsLoadingId === anItemId)
         return;      // wird bereits geladen (Auswahl und direkter Aufruf gleichzeitig)
     _itemsLoadingId = anItemId;
-    var me = [self reviewer], cached = _itemCache[anItemId];
+    var me = [self reviewer], cache = _itemCache, cached = cache[anItemId];
     var apply = function(res)
     {
         _itemsLoadingId = nil;
+        // Der angezeigte Brief und sein Cache-Eintrag müssen dasselbe Objekt sein: Bewertungen
+        // landen in res.judgments, und beim erneuten Anzeigen kommt der Brief aus dem Cache.
+        _itemCache[anItemId] = res;
         _item = res;
         _judgments = res.judgments || {};
         _missing = [];
@@ -1591,13 +1638,31 @@ function _synDirty()
     }
     OTGetJSON("/BBB/validation/items/" + anItemId + "?reviewer=" + encodeURIComponent(me), 60.0, function(res, error)
     {
-        if (!res || res.error)
+        // Prüfer oder Datensatz inzwischen gewechselt: Antwort gehört zum alten Stand
+        if (cache !== _itemCache || me !== [self reviewer])
         {
-            _itemsLoadingId = nil;
-            OVAlert("Brief konnte nicht geladen werden: " + (res && res.error ? res.error : "keine Antwort"));
+            if (_itemsLoadingId === anItemId)
+                _itemsLoadingId = nil;
             return;
         }
-        _itemCache[anItemId] = res;
+        var current = (_itemsLoadingId === anItemId);
+        if (!res || res.error)
+        {
+            if (current)
+            {
+                _itemsLoadingId = nil;
+                OVAlert("Brief konnte nicht geladen werden: " + (res && res.error ? res.error : "keine Antwort"));
+            }
+            return;
+        }
+        // inzwischen ein anderer Brief gewählt: nicht anzeigen, höchstens als Vorrat merken,
+        // und nie einen vorhandenen (womöglich schon bewerteten) Eintrag überschreiben
+        if (!current)
+        {
+            if (!_itemCache[anItemId] || _itemCache[anItemId] === "loading")
+                _itemCache[anItemId] = res;
+            return;
+        }
         apply(res);
     });
 }
@@ -2238,6 +2303,7 @@ function _synDirty()
     var itemId = _item.id;
     [self _save:[{ entry_key: "_checklist", judgment: _checklist }] then:function()
     {
+        delete _itemCache[itemId];     // Cache enthält die verblindete Fassung ohne Einträge
         [self loadItem:itemId];
         [self _refreshItemRow];
     }];
@@ -2821,17 +2887,28 @@ function _synDirty()
 
 - (float)splitView:(CPSplitView)aSplitView constrainMinCoordinate:(float)proposedMin ofSubviewAt:(int)index
 {
+    if (aSplitView === _letterSplit)
+        return OVLetterMinWidth;
     return aSplitView === _entriesSplit ? 140.0 : proposedMin;     // Einträge: Tabelle plus zwei Knopfzeilen
 }
 
 - (float)splitView:(CPSplitView)aSplitView constrainMaxCoordinate:(float)proposedMax ofSubviewAt:(int)index
 {
+    if (aSplitView === _letterSplit)
+        return MAX(OVLetterMinWidth, [aSplitView frame].size.width - [aSplitView dividerThickness] - OVTablesMinWidth);
     return aSplitView === _entriesSplit ? [aSplitView frame].size.height - 110.0 : proposedMax;   // Vorschläge: mindestens drei Zeilen
 }
 
 - (void)splitViewDidResizeSubviews:(CPNotification)aNotification
 {
-    if ([aNotification object] !== _entriesSplit)
+    var sv = [aNotification object];
+    if (sv === _letterSplit)
+    {
+        var lp = [[_letterSplit subviews] objectAtIndex:0];
+        try { window.localStorage.setItem("ontotrial.validation.lettersplit", String([lp frame].size.width)); } catch (e) {}
+        return;
+    }
+    if (sv !== _entriesSplit)
         return;
     var top = [[_entriesSplit subviews] objectAtIndex:0];
     try { window.localStorage.setItem("ontotrial.validation.split", String([top frame].size.height)); } catch (e) {}
@@ -2926,16 +3003,21 @@ function _synDirty()
         if (_itemCache[id])
             continue;
         _itemCache[id] = "loading";
-        (function(pid)
+        (function(pid, cache, me)
         {
-            OTGetJSON("/BBB/validation/items/" + pid + "?reviewer=" + encodeURIComponent([self reviewer]), 60.0, function(res, error)
+            OTGetJSON("/BBB/validation/items/" + pid + "?reviewer=" + encodeURIComponent(me), 60.0, function(res, error)
             {
+                // Nur den eigenen Platzhalter ersetzen. Wurde der Brief inzwischen direkt geladen und
+                // angezeigt (und womöglich bewertet), bleibt dessen Eintrag stehen; nach einem Wechsel
+                // von Prüfer oder Datensatz wird die Antwort verworfen.
+                if (cache !== _itemCache || me !== [self reviewer] || _itemCache[pid] !== "loading")
+                    return;
                 if (res && !res.error)
                     _itemCache[pid] = res;
                 else
                     delete _itemCache[pid];
             });
-        })(id);
+        })(id, _itemCache, [self reviewer]);
     }
 }
 
@@ -3812,6 +3894,7 @@ function CRGuess(cols, pattern)
     CPTextView      _commentView;
     CPTextView      _othersView;
     CPTextField     _caseTitle;
+    CPSplitView     _letterSplit;
     id              _sets;
     id              _currentSet;
     id              _cases;
@@ -3891,53 +3974,89 @@ function CRGuess(cols, pattern)
     _casesTable = ct.table;
     [cv addSubview:OVM(ct.scroll, CPViewHeightSizable)];
 
-    // Mitte: Fallinfo, Briefe, Brieftext
-    _caseTitle = OVM(OTLabel(CGRectMake(270, 50, 560, 18), "", YES), CPViewWidthSizable);
-    [cv addSubview:_caseTitle];
-    var info = OVTextArea(CGRectMake(270, 70, 560, 140), YES);
+    // Mitte (Fallinfo, Briefe, Brieftext) und rechts (Urteil, Phenopacket) mit senkrechtem Trenner;
+    // die Breite der Briefspalte wird im Browser gespeichert
+    var split = OVM([[CPSplitView alloc] initWithFrame:CGRectMake(270, 50, 1020, 740)], CPViewWidthSizable | CPViewHeightSizable);
+    [split setVertical:YES];
+    var lp = [[CPView alloc] initWithFrame:CGRectMake(0, 0, 560, 740)];
+    var rp = [[CPView alloc] initWithFrame:CGRectMake(0, 0, 450, 740)];
+    var ws = CPViewWidthSizable;
+
+    _caseTitle = OVM(OTLabel(CGRectMake(0, 0, 560, 18), "", YES), ws);
+    [lp addSubview:_caseTitle];
+    var info = OVTextArea(CGRectMake(0, 20, 560, 140), YES);
     _caseInfoView = info.text;
-    [cv addSubview:OVM(info.scroll, CPViewWidthSizable)];
-    var lt = OVTable(CGRectMake(270, 218, 560, 140), [["date", "Datum", 95], ["source", "Quelle", 70], ["len", "Zeichen", 65], ["win", "Zeitfenster", 90], ["npp", "Einträge", 70]], self);
+    [lp addSubview:OVM(info.scroll, ws)];
+    var lt = OVTable(CGRectMake(0, 168, 560, 140), [["date", "Datum", 95], ["source", "Quelle", 70], ["len", "Zeichen", 65], ["win", "Zeitfenster", 90], ["npp", "Einträge", 70]], self);
     _lettersTable = lt.table;
-    [cv addSubview:OVM(lt.scroll, CPViewWidthSizable)];
+    [lp addSubview:OVM(lt.scroll, ws)];
     _searchField = OVM([CPTextField textFieldWithStringValue:"" placeholder:"Im Brief suchen …" width:200], CPViewMinXMargin);
-    [_searchField setFrame:CGRectMake(585, 364, 200, 24)];
+    [_searchField setFrame:CGRectMake(315, 314, 200, 24)];
     [_searchField setTarget:self];
     [_searchField setAction:@selector(searchInLetter:)];
     [_searchField setDelegate:self];
-    [cv addSubview:_searchField];
-    _searchInfo = OVM(OTLabel(CGRectMake(790, 368, 40, 18), "", NO), CPViewMinXMargin);
-    [cv addSubview:_searchInfo];
-    var tv = OVTextArea(CGRectMake(270, 392, 560, 398), NO);
+    [lp addSubview:_searchField];
+    _searchInfo = OVM(OTLabel(CGRectMake(520, 318, 40, 18), "", NO), CPViewMinXMargin);
+    [lp addSubview:_searchInfo];
+    var tv = OVTextArea(CGRectMake(0, 342, 560, 398), NO);
     _letterView = tv.text;
     [_letterView setRichText:YES];
     [_letterView setFont:[CPFont systemFontOfSize:13.0]];
-    [cv addSubview:OVM(tv.scroll, CPViewWidthSizable | CPViewHeightSizable)];
+    [lp addSubview:OVM(tv.scroll, ws | CPViewHeightSizable)];
 
-    // rechts: Urteil
-    var rx = 840, rm = CPViewMinXMargin;
-    [cv addSubview:OVM(OTLabel(CGRectMake(rx, 50, 450, 18), "Urteil", YES), rm)];
-    _codePopUp = OVM([[CPPopUpButton alloc] initWithFrame:CGRectMake(rx, 70, 450, 26) pullsDown:NO], rm);
-    [cv addSubview:_codePopUp];
-    [cv addSubview:OVM(OTLabel(CGRectMake(rx, 104, 450, 18), "Kommentar", YES), rm)];
-    var cm = OVTextArea(CGRectMake(rx, 124, 450, 120), NO);
+    // rechts: Urteil; Felder und Phenopacket-Tabelle wachsen mit, Knöpfe bleiben links
+    var rx = 0;
+    [rp addSubview:OVM(OTLabel(CGRectMake(rx, 0, 450, 18), "Urteil", YES), ws)];
+    _codePopUp = OVM([[CPPopUpButton alloc] initWithFrame:CGRectMake(rx, 20, 450, 26) pullsDown:NO], ws);
+    [rp addSubview:_codePopUp];
+    [rp addSubview:OVM(OTLabel(CGRectMake(rx, 54, 450, 18), "Kommentar", YES), ws)];
+    var cm = OVTextArea(CGRectMake(rx, 74, 450, 120), NO);
     _commentView = cm.text;
     [_commentView setEditable:YES];
-    [cv addSubview:OVM(cm.scroll, rm)];
-    [cv addSubview:OVM(OTButton(CGRectMake(rx, 252, 140, 26), "Speichern", self, @selector(saveReview:)), rm)];
-    [cv addSubview:OVM(OTButton(CGRectMake(rx + 145, 252, 200, 26), "Fall abschließen, nächster", self, @selector(finishCase:)), rm)];
-    [cv addSubview:OVM(OTButton(CGRectMake(rx + 350, 252, 100, 26), "Wieder öffnen", self, @selector(reopenCase:)), rm)];
-    [cv addSubview:OVM(OTLabel(CGRectMake(rx, 290, 450, 18), "Urteile der Prüfer und Legende", YES), rm)];
-    var ot = OVTextArea(CGRectMake(rx, 310, 450, 150), NO);
+    [rp addSubview:OVM(cm.scroll, ws)];
+    [rp addSubview:OTButton(CGRectMake(rx, 202, 140, 26), "Speichern", self, @selector(saveReview:))];
+    [rp addSubview:OTButton(CGRectMake(rx + 145, 202, 200, 26), "Fall abschließen, nächster", self, @selector(finishCase:))];
+    [rp addSubview:OTButton(CGRectMake(rx + 350, 202, 100, 26), "Wieder öffnen", self, @selector(reopenCase:))];
+    [rp addSubview:OVM(OTLabel(CGRectMake(rx, 240, 450, 18), "Urteile der Prüfer und Legende", YES), ws)];
+    var ot = OVTextArea(CGRectMake(rx, 260, 450, 150), NO);
     _othersView = ot.text;
-    [cv addSubview:OVM(ot.scroll, rm)];
+    [rp addSubview:OVM(ot.scroll, ws)];
     // gespeichertes Phenopacket des gewählten Briefs (Ist-Stand, keine Neuextraktion)
-    _ppTitle = OVM(OTLabel(CGRectMake(rx, 468, 450, 18), "Phenopacket des Briefs (gespeichert)", YES), rm);
-    [cv addSubview:_ppTitle];
-    var pt = OVTable(CGRectMake(rx, 488, 450, 302), [["domain", "Domäne", 72], ["label", "Bezeichnung", 160], ["code", "Code", 90], ["side", "Seite", 36],
+    _ppTitle = OVM(OTLabel(CGRectMake(rx, 418, 450, 18), "Phenopacket des Briefs (gespeichert)", YES), ws);
+    [rp addSubview:_ppTitle];
+    var pt = OVTable(CGRectMake(rx, 438, 450, 302), [["domain", "Domäne", 72], ["label", "Bezeichnung", 160], ["code", "Code", 90], ["side", "Seite", 36],
                                                      ["date", "Datum", 78], ["value", "Wert", 60]], self);
     _ppTable = pt.table;
-    [cv addSubview:OVM(pt.scroll, rm | CPViewHeightSizable)];
+    [rp addSubview:OVM(pt.scroll, ws | CPViewHeightSizable)];
+
+    [split addSubview:lp];
+    [split addSubview:rp];
+    [split setDelegate:self];
+    [cv addSubview:split];
+    _letterSplit = split;
+    var savedW = nil;
+    try { savedW = parseFloat(window.localStorage.getItem("ontotrial.chartreview.lettersplit")); } catch (e) {}
+    window.setTimeout(function() { [split setPosition:(savedW >= CRLetterMinWidth ? savedW : 560) ofDividerAtIndex:0]; }, 0);
+}
+
+- (float)splitView:(CPSplitView)aSplitView constrainMinCoordinate:(float)proposedMin ofSubviewAt:(int)index
+{
+    return aSplitView === _letterSplit ? CRLetterMinWidth : proposedMin;
+}
+
+- (float)splitView:(CPSplitView)aSplitView constrainMaxCoordinate:(float)proposedMax ofSubviewAt:(int)index
+{
+    if (aSplitView !== _letterSplit)
+        return proposedMax;
+    return MAX(CRLetterMinWidth, [aSplitView frame].size.width - [aSplitView dividerThickness] - CRJudgeMinWidth);
+}
+
+- (void)splitViewDidResizeSubviews:(CPNotification)aNotification
+{
+    if ([aNotification object] !== _letterSplit)
+        return;
+    var lp = [[_letterSplit subviews] objectAtIndex:0];
+    try { window.localStorage.setItem("ontotrial.chartreview.lettersplit", String([lp frame].size.width)); } catch (e) {}
 }
 
 - (void)reviewerChanged:(id)sender

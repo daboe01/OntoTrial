@@ -282,7 +282,8 @@ In der Kandidatenliste öffnet das Aktionsmenü der Knopfleiste (Zahnrad) den Ei
 \midrule
 \feld{Datensatz} & Auswahl des Datensatzes; in Klammern der Zweck.\\
 \btn{Neuer Datensatz …} & Neue Stichprobe ziehen oder synthetischen Datensatz anlegen (Kapitel~\ref{kap:datensaetze} und~\ref{kap:synth}).\\
-\btn{Sicherung laden} & Lädt den Datensatz mit Briefen, Extraktionen, allen Bewertungen, KI-Bewertungen und Läufen als JSON-Datei herunter.\\
+\btn{Sicherung (JSON)} & Lädt den Datensatz mit Briefen, Extraktionen, allen Bewertungen, KI-Bewertungen und Läufen als JSON-Datei herunter.\\
+\btn{Rohdaten (ZIP) …} & Brieftexte, Phenopackets, Referenz und Einträge als ZIP für andere Programme, wahlweise mit den Phenopackets aller Läufe (Abschnitt~\ref{sec:rohdatenzip}).\\
 \btn{Chart-Review …} & Öffnet das eigene Fenster für Fall-Listen retrospektiver Studien (Kapitel~\ref{kap:chartreview}).\\
 \feld{Prüfer} & Ihr Name oder Kürzel, mit \taste{Enter} bestätigen. Alle Bewertungen werden unter diesem Namen gespeichert; der Browser merkt sich den Eintrag.\\
 Infozeile & Anzahl der Briefe, Seed, \textsf{gesperrt} oder \textsf{ENTSPERRT}, Stand der Referenz mit Quelle (Ärzte, Pipeline, KI bei alten Datensätzen). Während der Vorbereitung: „wird vorbereitet“ mit dem aktuellen Brief.\\
@@ -368,7 +369,7 @@ Ein validierter Datensatz ist wertvoll. Deshalb gilt:
 \end{itemize}
 
 \begin{tipp}[Sicherung]
-Vor jedem größeren Schritt, insbesondere vor Entsperren, Auftauen oder Löschen, mit \btn{Sicherung laden} eine JSON-Kopie herunterladen (Format \code{ontotrial-validation-1}). Sie enthält Datensatz, Briefe, Extraktionen, Referenz, alle Bewertungen, KI-Bewertungen und Läufe.
+Vor jedem größeren Schritt, insbesondere vor Entsperren, Auftauen oder Löschen, mit \btn{Sicherung (JSON)} eine JSON-Kopie herunterladen (Format \code{ontotrial-validation-1}). Sie enthält Datensatz, Briefe, Extraktionen, Referenz, alle Bewertungen, KI-Bewertungen und Läufe.
 \end{tipp}
 
 \section{Datensatz kopieren}\label{sec:kopieren}
@@ -519,6 +520,8 @@ Referenz ist ausschließlich der \textbf{Brieftext}. Bewertet wird, ob die Extra
   \item[Rechts darunter] \textsf{Im Brief vorhanden, aber nicht extrahiert}: Ensemble-Vorschläge und selbst ergänzte Einträge. Der Trenner zwischen beiden Tabellen lässt sich ziehen; der Browser merkt sich die Position.
   \item[Unten] \btn{Brief abschließen}, \btn{Nächster offener Brief} und die Farblegende der Belege.
 \end{description}
+
+\paragraph{Spaltenbreite.} Zwischen Brieftext und rechter Spalte liegt ein senkrechter Trenner. Nach links gezogen wird der Brief schmaler und Checkliste, Einträge und Vorschläge werden breiter, sodass mehr Spalten (Urteil, Ensemble, andere Prüfer) ohne Querscrollen sichtbar sind. Der Brief bleibt mindestens 220\,px, die rechte Spalte mindestens 580\,px breit. Der Browser merkt sich die Position; beim Vergrößern des Fensters wachsen beide Seiten im gleichen Verhältnis.
 
 \paragraph{Belege im Brief.} Ist das Ensemble sichtbar, sind die Belegstellen im Brieftext farbig hinterlegt: \textcolor{otgruen}{grün} korrekt, \textcolor{otorange}{orange} möglicher Fehler, \textcolor{otblau}{blau} vorgeschlagener fehlender Eintrag, gelb der gerade ausgewählte Eintrag. Beim Auswählen eines Eintrags scrollt der Brief zu seinem Beleg.
 
@@ -1021,6 +1024,30 @@ Konfidenzintervalle (95\,\%) stammen aus einem Cluster-Bootstrap über Briefe mi
 
 \btn{Bewertungen als CSV} liefert eine Zeile je Urteil (Semikolon-getrennt, UTF-8) mit den Spalten \code{set}, \code{position}, \code{item_id}, \code{pseudonym}, \code{stratum}, \code{double_review}, \code{reviewer}, \code{phase} (\code{vor_zweitblick} oder \code{final}), \code{row_type} (\code{eintrag}, \code{ergaenzt}, \code{ergaenzt_geloescht}, \code{checkliste}, \code{ki_entscheidung}), Eintrag (Domäne, Code, Bezeichnung, Seite, Datum, verneint, Wert, eingestreuter Fehler), allen Urteilsfeldern mit richtigen Angaben und Kommentar sowie Kategorie und Abgleich der Checkliste. Damit lassen sich alle Kennzahlen in R nachrechnen.
 
+\section{Briefe und Phenopackets für andere Programme}\label{sec:rohdatenzip}
+
+\btn{Rohdaten (ZIP) …} oben im Fenster fragt, ob die Läufe mitkommen sollen (\btn{Ohne Läufe}, \btn{Mit allen Läufen}), und lädt \code{rohdaten_<Datensatz>.zip} bzw.\ \code{rohdaten_<Datensatz>_mit_laeufen.zip} herunter. Die Dateinamen beginnen mit der vierstelligen Position im Datensatz, gefolgt vom Pseudonym.
+
+\begin{tabularx}{\textwidth}{@{}P{4.2cm}L@{}}
+\toprule
+\textbf{Datei} & \textbf{Inhalt}\\
+\midrule
+\code{README.txt} & Aufbau, Exportzeitpunkt, Zahl der Läufe.\\
+\code{index.csv} & Ein Brief je Zeile: Position, \code{item_id}, Pseudonym, Kandidaten-ID, Quelle, Datum, Schicht, doppelt geprüft, Zahl eingestreuter Fehler, Dateinamen von Brief, Phenopacket und Referenz, Zahl der Einträge.\\
+\code{briefe/} & Brieftext, wie er der Extraktion vorlag (UTF-8).\\
+\code{phenopackets/} & Gespeichertes Phenopacket des Datensatzes (GA4GH Phenopacket v2, JSON); bei eingestreuten Fehlern mit diesen Fehlern.\\
+\code{referenz/} & Eingefrorene Referenz je Brief (nur bei eingefrorener Referenz).\\
+\code{eintraege.csv} & Alle Einträge im Langformat; \code{quelle} ist \code{extraktion}, \code{referenz} oder \code{lauf_<ID>}. Spalten \code{key}, \code{domain}, \code{code}, \code{label}, \code{side}, \code{date}, \code{excluded}, \code{value}, \code{unit}, \code{comparator}, \code{value_text}. Berechnete Werte (sphärisches Äquivalent) fehlen wie in der Bewertung, stehen aber in den Phenopackets.\\
+\code{laeufe.csv}, \code{laeufe/} & Nur mit Läufen: abgeschlossene Läufe mit Modus, Label, Modell, Deep Mode und Zeitpunkten; je Lauf ein Ordner mit den Phenopackets.\\
+\bottomrule
+\end{tabularx}
+
+CSV-Dateien sind semikolongetrennt und UTF-8 mit BOM, Excel und R (\code{readr::read_csv2}) lesen sie direkt. Die Bewertungen der Prüfer stehen nicht im ZIP, sondern in \btn{Bewertungen als CSV}; beide verbinden sich über \code{item_id} und \code{key} bzw.\ \code{entry_key}.
+
+\begin{achtung}[Nicht anonymisiert]
+Das ZIP enthält Brieftexte und Pseudonyme und ist personenbezogen. Nur im Kliniknetz verwenden. Für die Weitergabe nach außen gibt es den anonymisierten Export (Abschnitt~\ref{sec:anonexport}) oder synthetische Datensätze.
+\end{achtung}
+
 \begin{hinweis}[Berichten]
 Für Arbeiten mit Sprachmodellen empfiehlt sich die Darstellung nach TRIPOD-LLM. Pipeline-Stand, Modellversionen, Ensemble-Modelle und Prompt-Versionen (\code{validation_judge}, \code{validation_recall}, \code{validation_verify}) sind im System gespeichert und gehören ins Supplement. Den Zweitblick als eigene Analyse berichten, nicht als Hauptergebnis.
 \end{hinweis}
@@ -1061,7 +1088,7 @@ Die Meldung danach nennt die Zahl der Fälle, wie viele davon Briefe im Bestand 
   \item Oben \feld{Prüfer} eintragen (eigenes Feld, unabhängig vom Validierungsfenster) und die Liste wählen.
   \item Links die Fälle mit PIZ, Auge, Ihrem Urteil und Stand. Ein Klick öffnet den Fall.
   \item Oben die CSV-Spalten des Falls und das Zeitfenster; daneben die Briefe des Patienten mit Datum, Quelle, Länge, „im Zeitfenster“ und Zahl der Phenopacket-Einträge. Der erste Brief im Fenster wird gezeigt.
-  \item Brieftext mit Suche (\feld{Im Brief suchen …}); darunter die gespeicherten Phenopacket-Einträge des Briefs. Ein Klick auf einen Eintrag sucht seine Bezeichnung im Brief.
+  \item Brieftext mit Suche (\feld{Im Brief suchen …}); rechts die gespeicherten Phenopacket-Einträge des Briefs. Ein Klick auf einen Eintrag sucht seine Bezeichnung im Brief. Der senkrechte Trenner zwischen Brief und rechter Spalte lässt sich ziehen; zieht man ihn nach links, werden Urteil, Kommentar und Phenopacket-Tabelle breiter. Der Browser merkt sich die Position.
   \item \feld{Urteil} aus den Codes wählen, \feld{Kommentar} schreiben. \btn{Speichern} sichert zwischendurch, \btn{Fall abschließen, nächster} markiert den Fall als fertig. \btn{Wieder öffnen} hebt das auf.
   \item Der Bereich \textsf{Urteile der Prüfer und Legende} zeigt die Urteile aller Prüfer zu diesem Fall.
 \end{enumerate}
@@ -1889,7 +1916,7 @@ Trigger schützen gesperrte Datensätze und eingefrorene Bewertungen. Die Funkti
 
 \begin{itemize}
   \item Regelmäßig \code{pg_dump} der Hauptdatenbank; bei eigener Minion-Datenbank diese nicht zwingend mitsichern (Jobs sind kurzlebig), aber vor Updates schon.
-  \item Vor riskanten Schritten an einem Datensatz zusätzlich \btn{Sicherung laden} (JSON). Die Datei enthält Briefe und ist personenbezogen.
+  \item Vor riskanten Schritten an einem Datensatz zusätzlich \btn{Sicherung (JSON)}. Die Datei enthält Briefe und ist personenbezogen; das gilt auch für \btn{Rohdaten (ZIP) …}.
   \item \code{.env} getrennt und geschützt sichern.
 \end{itemize}
 
@@ -2041,6 +2068,7 @@ POST & \code{validation/sets/:id/unfreeze} & auftauen (\code{confirm}; nur entsp
 GET & \code{validation/sets/:id/comparable} & Datensätze mit gemeinsamen Briefen und Referenz\\
 GET & \code{validation/sets/:id/compare_reference?other=} & Referenzvergleich; \code{&format=csv} als Datei\\
 POST & \code{validation/sets/:id/baseline} & Basis-Lauf festlegen (\code{run_id})\\
+GET & \code{validation/sets/:id/rawdata.zip} & Rohdaten als ZIP; \code{?runs=1} mit allen abgeschlossenen Läufen\\
 \bottomrule
 \end{longtable}
 
